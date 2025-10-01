@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chesstransformer"
+version = "0.1.0"
+description = "This project is a chess engine that uses transformer models to play chess."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.10.1",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+]
+license = {text = "MIT"}
+authors = [
+    {name = "Thibaut CHAUFFIER", email = "tchauffi@gmail.com"},
+]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Games/Entertainment :: Board Games",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chesstransformer"]
