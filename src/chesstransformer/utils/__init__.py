@@ -4,6 +4,26 @@ from io import BytesIO
 import cairosvg
 
 
+def _create_board_from_moves(moves: list[str]) -> chess.Board:
+    """
+    Create a chess board and apply a sequence of moves.
+
+    Args:
+        moves: List of moves in UCI format (e.g., ['e2e4', 'd7d5'])
+
+    Returns:
+        Chess board with moves applied
+    """
+    board = chess.Board()
+    for move_str in moves:
+        try:
+            move = chess.Move.from_uci(move_str)
+            board.push(move)
+        except ValueError:
+            pass  # Skip invalid moves
+    return board
+
+
 def generate_board_image(moves: list[str], size: int = 400) -> Image.Image:
     """
     Generate a PIL image of a chess board after applying a sequence of moves.
@@ -17,15 +37,7 @@ def generate_board_image(moves: list[str], size: int = 400) -> Image.Image:
     """
     import chess.svg
 
-    board = chess.Board()
-
-    # Apply moves
-    for move_str in moves:
-        try:
-            move = chess.Move.from_uci(move_str)
-            board.push(move)
-        except ValueError:
-            pass  # Skip invalid moves
+    board = _create_board_from_moves(moves)
 
     # Generate SVG using chess library
     svg_data = chess.svg.board(board, size=size)
@@ -49,16 +61,7 @@ def generate_board_ascii(moves: list[str]) -> str:
     Returns:
         String representation of the chess board
     """
-    board = chess.Board()
-
-    # Apply moves
-    for move_str in moves:
-        try:
-            move = chess.Move.from_uci(move_str)
-            board.push(move)
-        except ValueError:
-            pass  # Skip invalid moves
-
+    board = _create_board_from_moves(moves)
     return str(board)
 
 
@@ -75,7 +78,6 @@ def generate_game_gif(moves: list[str], size: int = 400, duration: int = 500) ->
         Bytes of the animated GIF
     """
     frames = []
-    board = chess.Board()
 
     # Initial position
     img = generate_board_image([], size)
@@ -86,7 +88,6 @@ def generate_game_gif(moves: list[str], size: int = 400, duration: int = 500) ->
     for move_str in moves:
         try:
             move = chess.Move.from_uci(move_str)
-            board.push(move)
             moves_so_far.append(move_str)
             img = generate_board_image(moves_so_far, size)
             frames.append(img)
