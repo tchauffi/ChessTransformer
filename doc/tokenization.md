@@ -63,6 +63,6 @@ Here is an example of a tokenized sequence of moves in a chess game using our pr
 
 `<START> e2e4 e7e5 f1c4 b8c6 d1h5 g8f6 h5f7 <1-0> <END>`
 
-[![Played sequence](images/coup_du_berget.gif)]
+[![Played sequence](images/coup_du_berger.gif)]
 
 This sequence represents the moves of a chess game starting with `e2e4`, followed by `e7e5`, and so on, ending with a white win (`1-0`). Each move is separated by a space, and the entire sequence is enclosed between the `<START>` and `<END>` tokens.
