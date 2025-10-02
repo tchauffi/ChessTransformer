@@ -35,7 +35,7 @@ def arg_parser():
     parser.add_argument(
         "--notation",
         type=str,
-        choices=["uci", "algebraic"],
+        choices=["uci", "san"],
         default="uci",
         help="Notation format for moves (default: uci)",
     )
@@ -66,10 +66,21 @@ def main():
         move_sequences = [
             " ".join([move.uci() for move in game.mainline_moves()]) for game in games
         ]
-    else:  # algebraic
+    elif notation == "san":
         move_sequences = [
-            " ".join([game.board().san(move) for move in game.mainline_moves()]) for game in games
+            " ".join(  
+                [  
+                    (lambda board, move: (board.san(move), board.push(move))[0])(  
+                        board, move  
+                    )  
+                    for board in [game.board()]  
+                    for move in game.mainline_moves()  
+                ]  
+            )  
+            for game in games
         ]
+    else:
+        raise ValueError(f"Unsupported notation: {notation}")
 
     print(f"Training tokenizer on {len(move_sequences)} games...")
     tokenizer.train_from_iterator(move_sequences, trainer=trainer)
