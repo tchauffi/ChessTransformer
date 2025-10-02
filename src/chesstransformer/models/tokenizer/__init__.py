@@ -37,14 +37,5 @@ def create_bpe_tokenizer(vocab_size: int = 2000) -> Tokenizer:
         min_frequency=2,
     )
 
-    encoder.post_processor = processors.TemplateProcessing(
-        single="<START> $A <END>",
-        pair="<START> $A <END> $B:1 <END>:1",
-        special_tokens=[
-            ("<START>", encoder.token_to_id("<START>")),
-            ("<END>", encoder.token_to_id("<END>")),
-        ],
-    )
-
     return encoder, trainer
 
