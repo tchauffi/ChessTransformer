@@ -1,7 +1,7 @@
 from tokenizers import Tokenizer
 from tokenizers import models, pre_tokenizers, trainers, processors, normalizers
 
-def create_bpe_tokenizer(vocab_size: int = 2000) -> Tokenizer:
+def create_bpe_tokenizer(vocab_size: int = 2000) -> tuple[Tokenizer, trainers.BpeTrainer]:
     """
     Create a BPE tokenizer for chess moves.
 
