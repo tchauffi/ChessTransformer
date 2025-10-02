@@ -63,11 +63,11 @@ def main():
     
     print(f"Extracting moves in {notation} notation...")
     if notation == "uci":
-        move_sequences = [
+        move_sequences = (
             " ".join([move.uci() for move in game.mainline_moves()]) for game in games
-        ]
+        )
     elif notation == "san":
-        move_sequences = [
+        move_sequences = (
             " ".join(  
                 [  
                     (lambda board, move: (board.san(move), board.push(move))[0])(  
@@ -78,11 +78,11 @@ def main():
                 ]  
             )  
             for game in games
-        ]
+        )
     else:
         raise ValueError(f"Unsupported notation: {notation}")
 
-    print(f"Training tokenizer on {len(move_sequences)} games...")
+    print(f"Training tokenizer on {num_samples} games...")
     tokenizer.train_from_iterator(move_sequences, trainer=trainer)
 
     tokenizer_path = output_dir / f"bpe_tokenizer_vocab{vocab_size}.json"
