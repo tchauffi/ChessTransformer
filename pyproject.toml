@@ -10,8 +10,12 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.10.1",
+    "cairosvg>=2.8.2",
+    "python-chess>=1.999",
+    "tokenizers>=0.22.1",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
+    "zstandard>=0.25.0",
 ]
 license = {text = "MIT"}
 authors = [
@@ -30,3 +34,9 @@ classifiers = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chesstransformer"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.30.1",
+    "ipywidgets>=8.1.7",
+]
