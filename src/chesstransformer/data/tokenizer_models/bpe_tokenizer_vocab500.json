@@ -1,0 +1,232 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<PAD>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "<START>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "<END>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "<1-0>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 4,
+      "content": "<0-1>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 5,
+      "content": "<1/2-1/2>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 6,
+      "content": "<UNK>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": {
+    "type": "Sequence",
+    "normalizers": []
+  },
+  "pre_tokenizer": {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": true,
+    "use_regex": true
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "<START>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<END>",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "<END>": {
+        "id": "<END>",
+        "ids": [
+          2
+        ],
+        "tokens": [
+          "<END>"
+        ]
+      },
+      "<START>": {
+        "id": "<START>",
+        "ids": [
+          1
+        ],
+        "tokens": [
+          "<START>"
+        ]
+      }
+    }
+  },
+  "decoder": null,
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "<UNK>",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": false,
+    "ignore_merges": false,
+    "vocab": {
+      "<PAD>": 0,
+      "<START>": 1,
+      "<END>": 2,
+      "<1-0>": 3,
+      "<0-1>": 4,
+      "<1/2-1/2>": 5,
+      "<UNK>": 6,
+      " ": 7,
+      "#": 8,
+      "+": 9,
+      "-": 10,
+      ".": 11,
+      "/": 12,
+      "1": 13,
+      "2": 14,
+      "3": 15,
+      "4": 16,
+      "5": 17,
+      "6": 18,
+      "7": 19,
+      "8": 20,
+      "B": 21,
+      "K": 22,
+      "N": 23,
+      "O": 24,
+      "Q": 25,
+      "R": 26,
+      "a": 27,
+      "b": 28,
+      "c": 29,
+      "d": 30,
+      "e": 31,
+      "f": 32,
+      "g": 33,
+      "h": 34,
+      "n": 35,
+      "q": 36,
+      "r": 37,
+      "x": 38,
+      "Ġ": 39,
+      "Ġd": 40,
+      "Ġe": 41,
+      "Ġf": 42,
+      "Ġc": 43,
+      "Ġg": 44,
+      "Ġb": 45,
+      "Ġa": 46,
+      "Ġh": 47
+    },
+    "merges": [
+      [
+        "Ġ",
+        "d"
+      ],
+      [
+        "Ġ",
+        "e"
+      ],
+      [
+        "Ġ",
+        "f"
+      ],
+      [
+        "Ġ",
+        "c"
+      ],
+      [
+        "Ġ",
+        "g"
+      ],
+      [
+        "Ġ",
+        "b"
+      ],
+      [
+        "Ġ",
+        "a"
+      ],
+      [
+        "Ġ",
+        "h"
+      ]
+    ]
+  }
+}
