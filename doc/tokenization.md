@@ -47,22 +47,22 @@ This representation is more compact and captures the sequential nature of chess 
 
 **Party outcome**: The tokenization strategy should also consider how to represent the outcome of the game, such as win, loss, or draw. This information can be useful for training the model to understand the consequences of certain moves. The outcome is typically represented as `1-0` for a white win, `0-1` for a black win, and `1/2-1/2` for a draw. In order, to compelment this ending token, we would need a special tocken to indigate the start of the game, such as `<START>` and `<END>` to indicate the end of the game.
 
-**Move separation**: We are going to use the BPE (Byte Pair Encoding) tokenizer from the `tokenizers` library to tokenize the moves. This tokenizer is capable of handling subword tokenization, which is useful for capturing the structure of chess moves. We will use a space character to separate individual moves in a game sequence. For example, a sequence of moves could be represented as `e2e4 e7e5 g1f3 b8c6` in UCI notation or `e4 e5 Nf3 Nc6` in Algebraic notation.
+**Move separation**: We are going to use the BPE (Byte Pair Encoding) tokenizer from the `tokenizers` library to tokenize the moves. This tokenizer is capable of handling subword tokenization, which is useful for capturing the structure of chess moves. To separate individual moves in a game sequence, we will use a special `<STEP>` token between each move. This approach provides a clear delimiter that won't be confused with the move notation itself. For example, a sequence of moves could be represented as `e2e4 <STEP> e7e5 <STEP> g1f3 <STEP> b8c6` in UCI notation.
 
 ## Our tokenization prototype
 
 If we summarize the above considerations, we can define our tokenization strategy as follows:
 - Use UCI notation for representing chess moves (e.g., `e2e4`, `g1f3`).
 - Use special tokens for game start `<START>` and game end `<END>`.
-- Separate individual moves with a space character.
+- Separate individual moves using a special `<STEP>` token.
 - Include special move notations (e.g., `O-O` for castling) and disambiguation (e.g., `Nbd2`).
 - Use BPE tokenizer from the `tokenizers` library for subword tokenization.
 - Represent game outcomes with standard notations (<1-0>, <0-1>, <1/2-1/2>).
 
 Here is an example of a tokenized sequence of moves in a chess game using our proposed strategy:
 
-`<START> e2e4 e7e5 f1c4 b8c6 d1h5 g8f6 h5f7 <1-0> <END>`
+`<START> e2e4 <STEP> e7e5 <STEP> f1c4 <STEP> b8c6 <STEP> d1h5 <STEP> g8f6 <STEP> h5f7 <1-0> <END>`
 
 [![Played sequence](images/coup_du_berger.gif)]
 
-This sequence represents the moves of a chess game starting with `e2e4`, followed by `e7e5`, and so on, ending with a white win (`1-0`). Each move is separated by a space, and the entire sequence is enclosed between the `<START>` and `<END>` tokens.
+This sequence represents the moves of a chess game starting with `e2e4`, followed by `e7e5`, and so on, ending with a white win (`1-0`). Each move is separated by the `<STEP>`token, and the entire sequence is enclosed between the `<START>` and `<END>` tokens.
