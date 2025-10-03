@@ -62,13 +62,14 @@ def main():
     games = extract_games_optimized(dataset_path, num_games=num_samples)
     
     print(f"Extracting moves in {notation} notation...")
+    print("Using <STEP> token to separate moves...")
     if notation == "uci":
         move_sequences = (
-            " ".join([move.uci() for move in game.mainline_moves()]) for game in games
+            "<STEP>".join([move.uci() for move in game.mainline_moves()]) for game in games
         )
     elif notation == "san":
         move_sequences = (
-            " ".join(  
+            "<STEP>".join(  
                 [  
                     (lambda board, move: (board.san(move), board.push(move))[0])(  
                         board, move  
