@@ -2,6 +2,7 @@ from torch.utils.data import Dataset
 import zstandard as zstd
 import chess.pgn
 import io
+import torch
 
 
 def extract_games_optimized(filepath, num_games=1000000, batch_size=1000):
@@ -142,7 +143,10 @@ class LichessDataset(Dataset):
         input_ids = self.encoded_games[start_idx : end_idx - 1]
         target_ids = self.encoded_games[start_idx + 1 : end_idx]
 
-        return input_ids, target_ids
+        input_tensor = torch.tensor(input_ids, dtype=torch.long)
+        target_tensor = torch.tensor(target_ids, dtype=torch.long)
+
+        return input_tensor, target_tensor
 
 
 if __name__ == "__main__":
