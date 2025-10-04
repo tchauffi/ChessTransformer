@@ -3,6 +3,7 @@ import zstandard as zstd
 import chess.pgn
 import io
 
+
 def extract_games_optimized(filepath, num_games=1000000, batch_size=1000):
     """
     Optimized game extraction with progress tracking.
@@ -26,6 +27,10 @@ def extract_games_optimized(filepath, num_games=1000000, batch_size=1000):
             batch_count = 0
 
             while pgn is not None and game_count < num_games:
+                # check if the game ended by a win/loss/draw
+                if pgn.headers.get("Result") not in ["1-0", "0-1", "1/2-1/2"]:
+                    pgn = chess.pgn.read_game(text_stream)
+                    continue
                 games.append(pgn)
                 game_count += 1
                 batch_count += 1
@@ -38,6 +43,7 @@ def extract_games_optimized(filepath, num_games=1000000, batch_size=1000):
 
     print(f"Finished extracting {len(games)} games.")
     return games
+
 
 def encode_game_moves(game, notation="uci", seprator=" <STEP> "):
     """
@@ -64,15 +70,27 @@ def encode_game_moves(game, notation="uci", seprator=" <STEP> "):
         )
     else:
         raise ValueError("Unsupported notation format. Use 'uci' or 'san'.")
-    
-    ending_condition = seprator + {"1-0": "<1-0>", "0-1": "<0-1>", "1/2-1/2": "<1/2-1/2>"}.get(game.headers.get("Result", ""), "")
+
+    ending_condition = seprator + {
+        "1-0": "<1-0>",
+        "0-1": "<0-1>",
+        "1/2-1/2": "<1/2-1/2>",
+    }.get(game.headers.get("Result", ""), "")
     if ending_condition:
         move_sequence += ending_condition
 
     return move_sequence
 
+
 class LichessDataset(Dataset):
-    def __init__(self, dataset_path, tokenizer, notation="uci", context_length=512, nb_games=100000):
+    def __init__(
+        self,
+        dataset_path,
+        tokenizer,
+        notation="uci",
+        context_length=512,
+        nb_games=100000,
+    ):
         """
         Lichess dataset for training chess move prediction models.
 
@@ -99,11 +117,13 @@ class LichessDataset(Dataset):
             self.encoded_games.append(token_ids)
 
         # flatten the list of token ids
-        self.encoded_games = [token_id for game in self.encoded_games for token_id in game]
+        self.encoded_games = [
+            token_id for game in self.encoded_games for token_id in game
+        ]
 
     def __len__(self):
         return len(self.encoded_games) // self.context_length
-    
+
     def __getitem__(self, idx):
         """
         Get a sequence of token IDs for training.
@@ -119,11 +139,12 @@ class LichessDataset(Dataset):
         if end_idx > len(self.encoded_games):
             raise IndexError("Index out of range for the dataset.")
 
-        input_ids = self.encoded_games[start_idx:end_idx - 1]
-        target_ids = self.encoded_games[start_idx + 1:end_idx]
+        input_ids = self.encoded_games[start_idx : end_idx - 1]
+        target_ids = self.encoded_games[start_idx + 1 : end_idx]
 
         return input_ids, target_ids
-    
+
+
 if __name__ == "__main__":
     from pathlib import Path
     import argparse
@@ -140,7 +161,7 @@ if __name__ == "__main__":
         parser.add_argument(
             "--num_games",
             type=int,
-            default=10000+,
+            default=10000,
             help="Number of games to load for testing (default: 1000)",
         )
         parser.add_argument(
@@ -152,7 +173,7 @@ if __name__ == "__main__":
         parser.add_argument(
             "--context_length",
             type=int,
-            default=256,
+            default=512,
             help="Context length for sequences (default: 512)",
         )
         parser.add_argument(
@@ -164,7 +185,7 @@ if __name__ == "__main__":
         )
         args = parser.parse_args()
         return args
-    
+
     args = arg_parser()
     dataset_path = Path(args.dataset_path)
     num_games = args.num_games
@@ -181,7 +202,7 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         notation=notation,
         context_length=context_length,
-        nb_games=num_games
+        nb_games=num_games,
     )
 
     print(f"Dataset loaded with {len(dataset)} games.")
@@ -190,6 +211,4 @@ if __name__ == "__main__":
     print(f"Sample target IDs: {target_ids}")
     print(f"Encoded and stacked {len(dataset.encoded_games)} token IDs.")
 
-
-
-
+    print(f"Decoded sample moves: {tokenizer.decode(input_ids)}")
