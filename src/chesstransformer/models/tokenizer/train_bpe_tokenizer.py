@@ -1,11 +1,13 @@
-
 from pathlib import Path
 import argparse
 
 from chesstransformer.models.tokenizer import create_bpe_tokenizer
 
+
 def arg_parser():
-    parser = argparse.ArgumentParser(description="Train a BPE tokenizer for chess moves.")
+    parser = argparse.ArgumentParser(
+        description="Train a BPE tokenizer for chess moves."
+    )
     parser.add_argument(
         "--vocab_size",
         type=int,
@@ -30,7 +32,7 @@ def arg_parser():
         type=int,
         default=100000,
         help="Number of games to sample for training (default: 100000)",
-    )   
+    )
 
     parser.add_argument(
         "--notation",
@@ -43,8 +45,8 @@ def arg_parser():
     args = parser.parse_args()
     return args
 
-def main():
 
+def main():
     args = arg_parser()
     vocab_size = args.vocab_size
     output_dir = Path(args.output_dir)
@@ -59,25 +61,27 @@ def main():
 
     print(f"Loading dataset from {dataset_path}...")
     from chesstransformer.datasets.lichess import extract_games_optimized
+
     games = extract_games_optimized(dataset_path, num_games=num_samples)
-    
+
     print(f"Extracting moves in {notation} notation...")
     print("Using <STEP> token to separate moves...")
     if notation == "uci":
         move_sequences = (
-            "<STEP>".join([move.uci() for move in game.mainline_moves()]) for game in games
+            "<STEP>".join([move.uci() for move in game.mainline_moves()])
+            for game in games
         )
     elif notation == "san":
         move_sequences = (
-            "<STEP>".join(  
-                [  
-                    (lambda board, move: (board.san(move), board.push(move))[0])(  
-                        board, move  
-                    )  
-                    for board in [game.board()]  
-                    for move in game.mainline_moves()  
-                ]  
-            )  
+            "<STEP>".join(
+                [
+                    (lambda board, move: (board.san(move), board.push(move))[0])(
+                        board, move
+                    )
+                    for board in [game.board()]
+                    for move in game.mainline_moves()
+                ]
+            )
             for game in games
         )
     else:
@@ -91,6 +95,7 @@ def main():
     tokenizer.save(str(tokenizer_path))
 
     print("Tokenizer training complete.")
+
 
 if __name__ == "__main__":
     main()

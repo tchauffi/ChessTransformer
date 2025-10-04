@@ -1,7 +1,10 @@
 from tokenizers import Tokenizer
 from tokenizers import models, pre_tokenizers, trainers, processors, normalizers
 
-def create_bpe_tokenizer(vocab_size: int = 2000) -> tuple[Tokenizer, trainers.BpeTrainer]:
+
+def create_bpe_tokenizer(
+    vocab_size: int = 2000,
+) -> tuple[Tokenizer, trainers.BpeTrainer]:
     """
     Create a BPE tokenizer for chess moves.
 
@@ -28,22 +31,51 @@ def create_bpe_tokenizer(vocab_size: int = 2000) -> tuple[Tokenizer, trainers.Bp
 
     # Initialize a tokenizer with BPE model
     encoder = Tokenizer(models.BPE(unk_token="<UNK>"))
-    encoder.normalizer = normalizers.Sequence([]) # No normalization needed for chess moves
+    encoder.normalizer = normalizers.Sequence(
+        []
+    )  # No normalization needed for chess moves
 
     # remove the white space pre-tokenizer
-    encoder.pre_tokenizer = pre_tokenizers.Whitespace() 
+    encoder.pre_tokenizer = pre_tokenizers.Whitespace()
 
     # Setup trainer with special tokens, including space
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
-        special_tokens=["<PAD>", "<START>", "<END>", "<1-0>", "<0-1>", "<1/2-1/2>", "<UNK>", "<STEP>"],
+        special_tokens=[
+            "<PAD>",
+            "<START>",
+            "<END>",
+            "<1-0>",
+            "<0-1>",
+            "<1/2-1/2>",
+            "<UNK>",
+            "<STEP>",
+        ],
         show_progress=True,
         min_frequency=2,
         initial_alphabet=[
-            "a", "b", "c", "d", "e", "f", "g", "h",
-            "1", "2", "3", "4", "5", "6", "7", "8",
-            "q", "k", "r", "b", "n",  # Piece notations
-        ]
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g",
+            "h",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "q",
+            "k",
+            "r",
+            "b",
+            "n",  # Piece notations
+        ],
     )
 
     # Add post-processing to add special tokens
