@@ -60,7 +60,11 @@ class LichessSimpleUciDataset(Dataset):
         game = self.games[idx]
         token_ids = self.encode_game(game)
         legals_mask = self.get_legal_moves_mask(game)
-        return token_ids, legals_mask
+        target_ids = token_ids[1:] + torch.tensor(-100, dtype=torch.long) # Shifted targets with -100 for padding
+        return {"input_ids": torch.tensor(token_ids, dtype=torch.long),
+                "traget_ids": torch.tensor(target_ids, dtype=torch.long),
+                "legal_moves_mask": legals_mask}
+    
     
     def encode_game(self, game):
         move_list = [move.uci() for move in game.mainline_moves()]
@@ -129,7 +133,7 @@ if __name__ == "__main__":
 
     # Get a game from the dataset
     game_idx = 0
-    token_ids, legals_mask = dataset[game_idx]
+    token_ids, _, legals_mask = dataset[game_idx]
     game = dataset.games[game_idx]
 
     # Get the board at a specific move position
