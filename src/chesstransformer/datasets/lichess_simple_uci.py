@@ -17,6 +17,7 @@ class LichessSimpleUciDataset(Dataset):
         self,
         dataset_path,
         vocab_path=root_path / "data/tokenizer_models/uci_vocab.json",
+        context_length=512,
         num_samples=100_000,
     ):
         """
@@ -25,6 +26,7 @@ class LichessSimpleUciDataset(Dataset):
         self.dataset_path = dataset_path
         self.num_samples = num_samples
         self.vocab_path = vocab_path
+        self.context_length = context_length
         self._load_vocab()
         self.games = self._extract_games()
 
@@ -34,18 +36,24 @@ class LichessSimpleUciDataset(Dataset):
         with open(self.dataset_path, "rb") as f:
             with dctx.stream_reader(f) as reader:
                 text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-                pgn = chess.pgn.read_game(text_stream)
                 game_count = 0
 
-                while pgn is not None and game_count < self.num_samples:
-                    # check if the game ended by a win/loss/draw
+                while game_count < self.num_samples:
+                    pgn = chess.pgn.read_game(text_stream)
+                    if pgn is None:
+                        break
+                    
+                    # Check if the game ended by a win/loss/draw
                     if pgn.headers.get("Result") not in ["1-0", "0-1", "1/2-1/2"]:
-                        pgn = chess.pgn.read_game(text_stream)
                         continue
+                    
                     games.append(pgn)
                     game_count += 1
+                    
+                    if game_count % 10000 == 0:
+                        print(f"Extracted {game_count}/{self.num_samples} games...", end="\r")
 
-            print(f"Finished extracting {len(games)} games.")
+            print(f"\nFinished extracting {len(games)} games.")
             return games
         
     def _load_vocab(self):
@@ -60,16 +68,18 @@ class LichessSimpleUciDataset(Dataset):
         game = self.games[idx]
         token_ids = self.encode_game(game)
         legals_mask = self.get_legal_moves_mask(game)
-        target_ids = token_ids[1:] + torch.tensor(-100, dtype=torch.long) # Shifted targets with -100 for padding
+        target_ids = token_ids[1:] + [-100] # Shifted targets with -100 for padding
         return {"input_ids": torch.tensor(token_ids, dtype=torch.long),
-                "traget_ids": torch.tensor(target_ids, dtype=torch.long),
-                "legal_moves_mask": legals_mask}
+                "target_ids": torch.tensor(target_ids, dtype=torch.long),
+                "legal_moves_mask": legals_mask
+                }
     
     
     def encode_game(self, game):
         move_list = [move.uci() for move in game.mainline_moves()]
+        move_list = ["<START>"] + move_list + ["<END>"]
         token_ids = self.encode_moves(move_list)
-        return torch.tensor(token_ids, dtype=torch.long)
+        return token_ids
     
     def encode_moves(self, moves):
         token_ids = []
@@ -106,6 +116,12 @@ class LichessSimpleUciDataset(Dataset):
             
             # Apply the move to the board for next iteration
             board.push(move)
+
+        # Add mask for <START> and <END> tokens
+        start_end_mask = torch.zeros(len(self.vocab), dtype=torch.float32)
+        start_end_mask[self.token_to_id["<START>"]] = 1.0
+        start_end_mask[self.token_to_id["<END>"]] = 1.0
+        masks = [start_end_mask] + masks + [start_end_mask]
         
         return torch.stack(masks)
     
@@ -113,119 +129,3 @@ class LichessSimpleUciDataset(Dataset):
         id_to_token = {idx: token for token, idx in self.token_to_id.items()}
         moves = [id_to_token.get(tid, "<UNK>") for tid in token_ids if tid in id_to_token]
         return " ".join(moves)
-    
-
-if __name__ == "__main__":
-    import cairosvg
-    from PIL import Image
-
-
-    dataset = LichessSimpleUciDataset(
-        dataset_path=root_path.parents[1] / "data/Lichess Rated Games 2017.pgn.zst",
-        num_samples=10_000,
-    )
-    print(f"Dataset size: {len(dataset)}")
-    sample = dataset[0]
-    print(f"Sample token IDs: {sample}")
-
-    # Visualize the board and legal moves
-    import chess.svg
-
-    # Get a game from the dataset
-    game_idx = 0
-    token_ids, _, legals_mask = dataset[game_idx]
-    game = dataset.games[game_idx]
-
-    # Get the board at a specific move position
-    move_position = 5  # Change this to see different positions
-    board = game.board()
-
-    # Apply moves up to the desired position
-    moves = list(game.mainline_moves())
-    for i in range(min(move_position, len(moves))):
-        board.push(moves[i])
-
-    # Get legal moves from the mask instead of recalculating
-    mask_at_position = legals_mask[move_position] if move_position < len(legals_mask) else None
-    
-    if mask_at_position is not None:
-        # Create inverse vocabulary
-        idx_to_token = {v: k for k, v in dataset.token_to_id.items()}
-        
-        # Get legal move tokens from the mask
-        legal_move_tokens = [idx_to_token[i] for i in range(len(mask_at_position)) if mask_at_position[i] == 1.0]
-        
-        # Convert tokens to chess.Move objects for visualization
-        legal_moves = [chess.Move.from_uci(token) for token in legal_move_tokens if token not in ['<PAD>', '<UNK>', '<SOS>', '<EOS>']]
-        legal_squares = [move.to_square for move in legal_moves]
-
-        # Create SVG visualization with legal move squares highlighted
-        svg = chess.svg.board(
-            board,
-            squares=chess.SquareSet(legal_squares),
-            size=400
-        )
-
-        # Save to file
-        output_path = root_path.parents[1] / "board_visualization.svg"
-        with open(output_path, "w") as f:
-            f.write(svg)
-
-        print(f"\nBoard visualization saved to: {output_path}")
-        print(f"Position after {move_position} moves")
-        print(f"Number of legal moves: {len(legal_moves)}")
-        print(f"Legal moves from mask: {legal_move_tokens}")
-        
-        # Display the board in terminal
-        print(f"\nBoard position after {move_position} moves:")
-        print(board)
-        print(f"\nFEN: {board.fen()}")
-
-    # Create a GIF of 5 moves with legal moves highlighted using dataset masks
-    num_moves_gif = 5
-    board_gif = game.board()
-    moves_list = list(game.mainline_moves())
-    
-    frames = []
-    idx_to_token = {v: k for k, v in dataset.token_to_id.items()}
-    
-    for i in range(min(num_moves_gif + 1, len(moves_list) + 1)):
-        # Get legal moves from the precomputed mask
-        if i < len(legals_mask):
-            mask_current = legals_mask[i]
-            legal_move_tokens_current = [idx_to_token[j] for j in range(len(mask_current)) if mask_current[j] == 1.0]
-            legal_moves_current = [chess.Move.from_uci(token) for token in legal_move_tokens_current if token not in ['<PAD>', '<UNK>', '<SOS>', '<EOS>']]
-            legal_squares_current = [move.to_square for move in legal_moves_current]
-        else:
-            legal_squares_current = []
-        
-        # Create SVG
-        svg_content = chess.svg.board(
-            board_gif,
-            squares=chess.SquareSet(legal_squares_current),
-            size=400
-        )
-        
-        # Convert SVG to PNG using cairosvg
-        png_data = cairosvg.svg2png(bytestring=svg_content.encode('utf-8'))
-        
-        # Open as PIL Image
-        img = Image.open(io.BytesIO(png_data))
-        frames.append(img)
-        
-        # Apply next move if available
-        if i < len(moves_list):
-            board_gif.push(moves_list[i])
-    
-    # Save as GIF
-    gif_path = root_path.parents[1] / "board_animation.gif"
-    frames[0].save(
-        gif_path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=1000,  # 1 second per frame
-        loop=0
-    )
-    
-    print(f"\nGIF animation saved to: {gif_path}")
-print(f"Created {len(frames)} frames showing positions 0-{num_moves_gif}")
