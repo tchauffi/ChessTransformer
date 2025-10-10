@@ -47,6 +47,11 @@ class LichessSimpleUciDataset(Dataset):
                     if pgn.headers.get("Result") not in ["1-0", "0-1", "1/2-1/2"]:
                         continue
                     
+                    # Skip Chess960 games - only use classical chess
+                    variant = pgn.headers.get("Variant", "Standard")
+                    if variant != "Standard":
+                        continue
+                    
                     games.append(pgn)
                     game_count += 1
                     

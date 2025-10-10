@@ -32,6 +32,13 @@ def extract_games_optimized(filepath, num_games=1000000, batch_size=1000):
                 if pgn.headers.get("Result") not in ["1-0", "0-1", "1/2-1/2"]:
                     pgn = chess.pgn.read_game(text_stream)
                     continue
+                
+                # Skip Chess960 games - only use classical chess
+                variant = pgn.headers.get("Variant", "Standard")
+                if variant != "Standard":
+                    pgn = chess.pgn.read_game(text_stream)
+                    continue
+                
                 games.append(pgn)
                 game_count += 1
                 batch_count += 1
