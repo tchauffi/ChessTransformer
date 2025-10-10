@@ -2,7 +2,6 @@ from pathlib import Path
 from datetime import datetime
 
 from tqdm.auto import tqdm
-import numpy as np
 import torch
 import accelerate
 from torch.utils.data import DataLoader
@@ -43,15 +42,15 @@ def main():
     full_dataset = LichessSimpleUciDataset(
         dataset_path= ROOT_PATH.parents[1] / "data/Lichess Rated Games 2017.pgn.zst",
         vocab_path= ROOT_PATH / "data/tokenizer_models/uci_vocab.json",
-        num_samples=500_000,  # Load all available games
+        num_samples=1_000_000,  # Load all available games
     )
 
     vocab_size = len(full_dataset.vocab)
     print(f"Vocabulary size: {vocab_size}")
 
     # Split the dataset into training, validation, and test sets
-    val = int(0.1 * len(full_dataset))
-    test = int(0.1 * len(full_dataset))
+    val = 20_000
+    test = 20_000
     train_size = len(full_dataset) - val - test
     train_dataset, val_dataset, test_dataset = random_split(
         full_dataset, [train_size, val, test],
@@ -85,9 +84,9 @@ def main():
             "legal_moves_mask": legal_moves_mask,
         }
 
-    train_dl = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn, drop_last=True)
-    val_dl = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
-    test_dl = DataLoader(test_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
+    train_dl = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn, drop_last=True)
+    val_dl = DataLoader(val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+    test_dl = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
 
 
     config = {
@@ -110,14 +109,20 @@ def main():
     
     print(f"Starting training run: {run_name}")
 
-    # Initialize accelerator with logging
+    # Gradient accumulation settings
+    gradient_accumulation_steps = 8  # Effective batch size = 16 * 4 = 64
+    
+    # Initialize accelerator with logging and gradient accumulation
     accelerator = accelerate.Accelerator(
         log_with="tensorboard", 
         project_dir=f"logs/{run_name}",
-        mixed_precision='fp16' if torch.cuda.is_available() else 'no'
+        mixed_precision='fp16' if torch.cuda.is_available() else 'no',
+        gradient_accumulation_steps=gradient_accumulation_steps
     )
     device = accelerator.device
     print(f"Using device: {device}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"Effective batch size: {16 * gradient_accumulation_steps}")
     model.to(device)
     
     # Initialize TensorBoard tracker
@@ -132,15 +137,17 @@ def main():
             "weight_decay": 1e-1,
             "num_epochs": 10,
             "batch_size": 16,
+            "gradient_accumulation_steps": 8,
+            "effective_batch_size": 128,
             "warmup_steps": 1000,
         },
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-1)
     
-    # Calculate total training steps
+    # Calculate total training steps (accounting for gradient accumulation)
     num_epochs = 10
-    total_steps = len(train_dl) * num_epochs
+    total_steps = (len(train_dl) // gradient_accumulation_steps) * num_epochs
     warmup_steps = 1000
     
     print(f"Total training steps: {total_steps}")
@@ -171,45 +178,53 @@ def main():
         total_loss = 0.0
         total_llm_loss = 0.0
         total_l2_loss = 0.0
+        
         loader = tqdm(train_dl, desc=f"Epoch {epoch+1}/{num_epochs}")
-        for batch in loader:
-            inputs = batch["input_ids"].to(device)
-            targets = batch["target_ids"].to(device)
-            legal_moves_mask = batch["legal_moves_mask"].to(device)
+        for batch_idx, batch in enumerate(loader):
+            # Accelerate automatically handles gradient accumulation context
+            with accelerator.accumulate(model):
+                inputs = batch["input_ids"].to(device)
+                targets = batch["target_ids"].to(device)
+                legal_moves_mask = batch["legal_moves_mask"].to(device)
 
-            optimizer.zero_grad()
-            logits = model(inputs)
+                logits = model(inputs)
 
-            llm_loss = criterion(logits.flatten(0, 1), targets.flatten())
+                llm_loss = criterion(logits.flatten(0, 1), targets.flatten())
 
-            probas = torch.nn.functional.softmax(logits, dim=-1)
+                probas = torch.nn.functional.softmax(logits, dim=-1)
 
-            ilegal_moves_probas = probas * (1 - legal_moves_mask)
-            l2_loss = torch.sum(ilegal_moves_probas ** 2, dim=-1).mean()
-            loss = llm_loss + l2_loss
+                ilegal_moves_probas = probas * (1 - legal_moves_mask)
+                l2_loss = torch.sum(ilegal_moves_probas ** 2, dim=-1).mean()
+                loss = llm_loss + 10*l2_loss
 
-            loader.set_postfix({"llm_loss": llm_loss.item(), "l2_loss": l2_loss.item(), "total_loss": loss.item()})
+                loader.set_postfix({
+                    "llm_loss": llm_loss.item(), 
+                    "l2_loss": l2_loss.item(), 
+                    "total_loss": loss.item()
+                })
 
-            accelerator.backward(loss)
-            optimizer.step()
-            scheduler.step()  # Update learning rate
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()  # Update learning rate
+                optimizer.zero_grad()
 
-            total_loss += loss.item()
-            total_llm_loss += llm_loss.item()
-            total_l2_loss += l2_loss.item()
-            
-            # Get current learning rate
-            current_lr = scheduler.get_last_lr()[0]
-            
-            # Log step metrics
-            accelerator.log({
-                "train/step_loss": loss.item(),
-                "train/step_llm_loss": llm_loss.item(),
-                "train/step_l2_loss": l2_loss.item(),
-                "train/learning_rate": current_lr,
-            }, step=global_step)
-            
-            global_step += 1
+                total_loss += loss.item()
+                total_llm_loss += llm_loss.item()
+                total_l2_loss += l2_loss.item()
+                
+                # Log step metrics only on sync steps (when gradients are actually applied)
+                if accelerator.sync_gradients:
+                    # Get current learning rate
+                    current_lr = scheduler.get_last_lr()[0]
+                    
+                    accelerator.log({
+                        "train/step_loss": loss.item(),
+                        "train/step_llm_loss": llm_loss.item(),
+                        "train/step_l2_loss": l2_loss.item(),
+                        "train/learning_rate": current_lr,
+                    }, step=global_step)
+                    
+                    global_step += 1
 
         avg_train_loss = total_loss / len(train_dl)
         avg_train_llm_loss = total_llm_loss / len(train_dl)
