@@ -7,13 +7,15 @@ import torch.nn.functional as F
 
 class MultiHeadAttention(nn.Module):
     def __init__(
-        self, d_in, d_out, num_heads, context_length, qkv_bias=False, dropout=0.0
+        self, d_in, d_out, num_heads, context_length, qkv_bias=False, dropout=0.0,
+        mask_future=False
     ):
         super().__init__()
         assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
         self.num_heads = num_heads
         self.d_out = d_out
         self.d_head = d_out // num_heads
+        self.mask_future = mask_future
         self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
@@ -53,9 +55,10 @@ class MultiHeadAttention(nn.Module):
             2, 3
         )  # (batch_size, num_heads, seq_len, seq_len)
 
-        # Apply mask
-        mask_bool = self.mask.bool()[:nb_tockens, :nb_tockens]
-        attention_scores = attention_scores.masked_fill(mask_bool, -torch.inf)
+        if self.mask_future:
+            # Apply mask
+            mask_bool = self.mask.bool()[:nb_tockens, :nb_tockens]
+            attention_scores = attention_scores.masked_fill(mask_bool, -torch.inf)
 
         # Compute attention weights
         attention_weights = F.softmax(attention_scores / keys.shape[-1] ** 0.5, dim=-1)
