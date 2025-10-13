@@ -76,3 +76,8 @@ class PostionTokenizer:
                     board.set_piece_at(square, piece)
                 file += 1
         return board
+
+    @property
+    def vocab_size(self) -> int:
+        """Return the size of the vocabulary."""
+        return len(self.vocab)
