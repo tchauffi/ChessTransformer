@@ -8,7 +8,7 @@ import torch.nn.functional as F
 class MultiHeadAttention(nn.Module):
     def __init__(
         self, d_in, d_out, num_heads, context_length, qkv_bias=False, dropout=0.0,
-        mask_future=False
+        mask_future=True
     ):
         super().__init__()
         assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
