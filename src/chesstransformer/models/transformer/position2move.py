@@ -1,8 +1,8 @@
 import torch 
 from torch import nn
 
-from ..transformer.attention import MultiHeadAttention
-from ..transformer.utils import LayerNorm, GELU
+from chesstransformer.models.transformer.attention import MultiHeadAttention
+from chesstransformer.models.transformer.utils import LayerNorm, GELU
 
 
 class FeedForward(nn.Module):
@@ -92,6 +92,7 @@ class Position2MoveModel(nn.Module):
         """
         Args:
             x: Tensor of shape (batch_size, 64) containing token IDs for each square.
+            is_white: Tensor of shape (batch_size,) indicating if the player to move is white (True) or black (False).
         Returns:
             logits: Tensor of shape (batch_size, move_vocab_size) containing
                     the logits for the next move prediction at each position.
@@ -103,21 +104,26 @@ class Position2MoveModel(nn.Module):
         token_emb = self.token_embedding(x)  # (batch_size, 64, embed_dim)
         pos_emb = self.position_embedding(positions)  # (batch_size, 64, embed_dim)
 
-        if is_white:
-            player_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=x.device)
-        else:
-            player_ids = torch.ones((batch_size, seq_len), dtype=torch.long, device=x.device)
+        player_ids = is_white.long().unsqueeze(1).expand(-1, seq_len)  # (batch_size, 64)
 
         player_emb = self.player_embedding(player_ids)  # (batch_size, 64, embed_dim)
 
-        x = token_emb + pos_emb + player_emb# (batch_size, 64, embed_dim)
+        x = token_emb + pos_emb + player_emb  # (batch_size, 64, embed_dim)
         x = self.dropout(x)
 
         x = self.transformer_blocks(x)  # (batch_size, 64, embed_dim)
         x = self.norm(x)  # (batch_size, 64, embed_dim)
         
-        x = x[:, -1, :]  # Take the representation of the last position
+        # average over the sequence length dimension
+        x = x.mean(dim=1)  # (batch_size, embed_dim)
 
         logits = self.lm_head(x)  # (batch_size, move_vocab_size)
         return logits
 
+if __name__ == "__main__":
+    # Example usage
+    model = Position2MoveModel()
+    dummy_input = torch.randint(0, 13, (2, 64))  # batch_size=2, seq_len=64
+    is_white = torch.tensor([1, 0])  # First sample is white to move, second is black
+    logits = model(dummy_input, is_white)
+    print(logits.shape)  # Should be (2, move_vocab_size)
