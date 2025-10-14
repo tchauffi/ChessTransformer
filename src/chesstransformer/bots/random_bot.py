@@ -10,7 +10,8 @@ class RandomBot:
         if not legal_moves:
             raise ValueError("No legal moves available.")
         # pick a random move
-        return random.choice(legal_moves)
+        move = random.choice(legal_moves)
+        return move.uci(), None
     
 
 if __name__ == "__main__":

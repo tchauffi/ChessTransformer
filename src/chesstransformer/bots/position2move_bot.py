@@ -6,9 +6,10 @@ from safetensors import safe_open
 from chesstransformer.models.transformer.position2move import Position2MoveModel
 from chesstransformer.models.tokenizer import PostionTokenizer, MoveTokenizer
 
+data_foler = Path(__file__).parents[1] / "data"
 
 class Position2MoveBot:
-    def __init__(self, model_path: str, device: str = "cpu"):
+    def __init__(self, model_path: str = str((data_foler / "models/position2moveV1.0/model.safetensors").resolve()), device: str = "cpu"):
         self.device = device
         self.position_tokenizer = PostionTokenizer()
         self.move_tokenizer = MoveTokenizer()
@@ -48,15 +49,12 @@ class Position2MoveBot:
         probs = torch.softmax(masked_logits, dim=-1)
         predicted_move_id = torch.argmax(probs).item()
         proba = probs[predicted_move_id].item()
-        
+
         predicted_move = self.move_tokenizer.decode(predicted_move_id)
         return predicted_move, proba
 
 if __name__ == "__main__":
-    data_foler = Path(__file__).parents[1] / "data"
-    print(f"Data folder: {data_foler}")
-
-    bot = Position2MoveBot(model_path=data_foler / "models/position2moveV1.0/model.safetensors", device="cpu")
+    bot = Position2MoveBot()
 
     board = chess.Board()
 
