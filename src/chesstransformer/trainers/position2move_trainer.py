@@ -24,6 +24,7 @@ import argparse
 import copy
 import random
 import numpy as np
+import json
 
 from tqdm.auto import tqdm
 import torch
@@ -31,6 +32,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, random_split
 import accelerate
 from accelerate.utils import set_seed
+from torch.optim.lr_scheduler import LambdaLR
 
 from chesstransformer.datasets.h5_lichess_dataset import HDF5ChessDataset
 from chesstransformer.models.transformer.position2move import Position2MoveModel
@@ -67,6 +69,32 @@ def compute_loss(logits, moves, legal_moves_mask, beta, legal_move_loss_weight):
     legal_move_cross_entropy = F.cross_entropy(filtered_logits, moves)
     loss = beta * llm_loss + legal_move_loss_weight * legal_move_loss + (1 - beta) * legal_move_cross_entropy
     return loss, llm_loss, legal_move_loss, legal_move_cross_entropy
+
+def save_trainer_state(checkpoint_dir, epoch, global_step, best_val_loss):
+    state = {"epoch": epoch, "global_step": global_step, "best_val_loss": best_val_loss}
+    state_path = Path(checkpoint_dir) / "trainer_state.json"
+    with state_path.open("w", encoding="utf-8") as fp:
+        json.dump(state, fp)
+
+def load_trainer_state(checkpoint_dir):
+    state_path = Path(checkpoint_dir) / "trainer_state.json"
+    if not state_path.exists():
+        return None
+    with state_path.open("r", encoding="utf-8") as fp:
+        return json.load(fp)
+
+def create_linear_warmup_decay_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio):
+    final_lr_ratio = max(0.0, final_lr_ratio)
+    warmup_steps = max(1, warmup_steps)
+    total_steps = max(warmup_steps + 1, total_steps)
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step + 1) / float(warmup_steps)
+        progress = (current_step - warmup_steps + 1) / float(max(1, total_steps - warmup_steps))
+        return 1.0 - (1.0 - final_lr_ratio) * min(1.0, progress)
+
+    return LambdaLR(optimizer, lr_lambda)
 
 def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_max=1e-2, num_steps=100, beta=0.7, legal_move_loss_weight=10.0):
     model.train()
@@ -132,6 +160,9 @@ def main():
     parser.add_argument("--beta", type=float, default=0.7, help="Weight for LLM loss in combined loss function")
     parser.add_argument("--legal-move-loss-weight", type=float, default=10.0, help="Weight for legal move loss in combined loss function")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--warmup-steps", type=int, default=1000, help="Number of warmup steps for LR scheduler")
+    parser.add_argument("--final-lr-ratio", type=float, default=0.01, help="Final LR multiplier after linear decay")
+    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
     args = parser.parse_args()
 
     set_seed(args.random_seed)
@@ -162,7 +193,7 @@ def main():
         "vocab_size": dataset.position_tokenizer.vocab_size,
         "move_vocab_size": dataset.move_tokenizer.vocab_size,
         "embed_dim": 512,
-        "nb_transformer_layers": 6,
+        "nb_transformer_layers": 8,
         "num_heads": 8,
         "dropout": 0.1,
         "kvq_bias": False,
@@ -193,14 +224,14 @@ def main():
             "learning_rate": args.lr,
             "min_elo": args.min_elo,
             "max_elo": args.max_elo,
-            **model_config
+            **model_config,
+            "warmup_steps": args.warmup_steps,
+            "final_lr_ratio": args.final_lr_ratio,
         }
     )
 
     device = accelerator.device
     print(f"Using device: {device}")
-
-    
 
     model = Position2MoveModel(**model_config)
     model.to(device)
@@ -227,12 +258,34 @@ def main():
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
+    total_training_steps = max(1, len(train_loader)) * max(1, args.epochs)
+    scheduler = create_linear_warmup_decay_scheduler(
+        optimizer,
+        warmup_steps=args.warmup_steps,
+        total_steps=total_training_steps,
+        final_lr_ratio=args.final_lr_ratio,
+    )
+    accelerator.register_for_checkpointing(scheduler)
+
+    best_val_loss = float("inf")
+    start_epoch = 1
+    global_step = 0
+    resume_path = Path(args.resume_from) if args.resume_from else None
+    if resume_path:
+        accelerator.load_state(str(resume_path))
+        trainer_state = load_trainer_state(resume_path)
+        if trainer_state:
+            start_epoch = trainer_state.get("epoch", 0) + 1
+            global_step = trainer_state.get("global_step", 0)
+            best_val_loss = trainer_state.get("best_val_loss", float("inf"))
+        if accelerator.is_main_process:
+            print(f"Resumed from checkpoint: {resume_path}")
 
     # Training loop
     best_val_loss = float("inf")
     global_step = 0
     
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         # Training phase
         model.train()
         train_loss = 0.0
@@ -255,6 +308,7 @@ def main():
 
             accelerator.backward(loss)
             optimizer.step()
+            scheduler.step()
 
             batch_size = positions.size(0)
             train_loss += loss.item() * batch_size
@@ -275,6 +329,7 @@ def main():
                 "train/step_llm_loss": llm_loss.item(),
                 "train/step_legal_move_loss": legal_move_loss.item(),
                 "train/step_legal_move_ce": legal_move_cross_entropy.item(),
+                "train/lr": scheduler.get_last_lr()[0],
             }, step=global_step)
             
             global_step += 1
@@ -338,6 +393,7 @@ def main():
             "val/legal_move_ce": val_legal_move_ce,
             "val/accuracy": val_accuracy,
             "epoch": epoch,
+            "train/lr_epoch_end": scheduler.get_last_lr()[0],
         }, step=global_step)
 
         print(f"\nEpoch {epoch}/{args.epochs}:")
@@ -346,14 +402,16 @@ def main():
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_checkpoint_path = checkpoint_dir / "best_model.pt"
+            best_checkpoint_path = checkpoint_dir / "best_model"
             accelerator.save_state(str(best_checkpoint_path))
+            save_trainer_state(best_checkpoint_path, epoch, global_step, best_val_loss)
             print(f"  Saved best model (val_loss: {val_loss:.4f})")
 
         # Periodic checkpoint saving
         if epoch % args.save_every == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch:03d}"
             accelerator.save_state(str(checkpoint_path))
+            save_trainer_state(checkpoint_path, epoch, global_step, best_val_loss)
             print(f"  Saved checkpoint at epoch {epoch}")
 
     # Final test evaluation
