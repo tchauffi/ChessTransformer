@@ -13,6 +13,7 @@ dependencies = [
     "cairosvg>=2.8.2",
     "gradio>=5.49.0",
     "gradio-chessboard>=0.0.10",
+    "h5py>=3.14.0",
     "matplotlib>=3.10.6",
     "python-chess>=1.999",
     "tensorboard>=2.20.0",
