@@ -69,22 +69,33 @@ class BotBenchmark:
         self.max_moves = max_moves
         self.time_limit = time_limit
         self.game_results: List[GameResult] = []
+        self.bot_counter = 0  # Counter for unique bot IDs
     
-    def create_bot(self, bot_type: str, checkpoint_path: Optional[str] = None, **kwargs):
+    def create_bot(self, bot_type: str, checkpoint_path: Optional[str] = None, bot_name: Optional[str] = None, **kwargs):
         """
         Factory method to create bots.
         
         Args:
             bot_type: Type of bot ("position2move", "random")
             checkpoint_path: Path to model checkpoint (for Position2MoveBot)
+            bot_name: Optional custom name for the bot (for tracking multiple instances)
             **kwargs: Additional bot-specific arguments
         """
         if bot_type.lower() == "position2move":
-            return Position2MoveBot()
+            bot = Position2MoveBot()
         elif bot_type.lower() == "random":
-            return RandomBot()
+            bot = RandomBot()
         else:
             raise ValueError(f"Unknown bot type: {bot_type}")
+        
+        # Assign unique identifier
+        if bot_name:
+            bot._benchmark_id = bot_name
+        else:
+            self.bot_counter += 1
+            bot._benchmark_id = f"{bot.__class__.__name__}_{self.bot_counter}"
+        
+        return bot
     
     def play_game(self, white_bot, black_bot, game_id: int, verbose: bool = False) -> GameResult:
         """
@@ -150,8 +161,8 @@ class BotBenchmark:
         
         return GameResult(
             game_id=game_id,
-            white_bot=white_bot.__class__.__name__,
-            black_bot=black_bot.__class__.__name__,
+            white_bot=white_bot._benchmark_id,
+            black_bot=black_bot._benchmark_id,
             result=result,
             num_moves=move_count,
             white_time=white_time,
@@ -197,16 +208,16 @@ class BotBenchmark:
                 print(f"Game {game_id + 1}: {result.white_bot} vs {result.black_bot} = {result.result}")
             
             # Update progress bar with current stats
-            bot1_wins = sum(1 for r in self.game_results if self._bot_won(r, bot1.__class__.__name__))
-            bot2_wins = sum(1 for r in self.game_results if self._bot_won(r, bot2.__class__.__name__))
+            bot1_wins = sum(1 for r in self.game_results if self._bot_won(r, bot1._benchmark_id))
+            bot2_wins = sum(1 for r in self.game_results if self._bot_won(r, bot2._benchmark_id))
             pbar.set_postfix({
-                f"{bot1.__class__.__name__}": bot1_wins,
-                f"{bot2.__class__.__name__}": bot2_wins
+                bot1._benchmark_id: bot1_wins,
+                bot2._benchmark_id: bot2_wins
             })
         
         # Calculate statistics
-        bot1_stats = self._calculate_stats(bot1.__class__.__name__)
-        bot2_stats = self._calculate_stats(bot2.__class__.__name__)
+        bot1_stats = self._calculate_stats(bot1._benchmark_id)
+        bot2_stats = self._calculate_stats(bot2._benchmark_id)
         
         return bot1_stats, bot2_stats
     
@@ -334,11 +345,15 @@ def main():
                        help="Type of first bot")
     parser.add_argument("--bot1-checkpoint", type=str, default=None,
                        help="Checkpoint path for bot1 (if applicable)")
+    parser.add_argument("--bot1-name", type=str, default=None,
+                       help="Custom name for bot1 (useful when comparing same bot types)")
     parser.add_argument("--bot2-type", type=str, required=True,
                        choices=["position2move", "random"],
                        help="Type of second bot")
     parser.add_argument("--bot2-checkpoint", type=str, default=None,
                        help="Checkpoint path for bot2 (if applicable)")
+    parser.add_argument("--bot2-name", type=str, default=None,
+                       help="Custom name for bot2 (useful when comparing same bot types)")
     parser.add_argument("--num-games", type=int, default=100,
                        help="Number of games to play")
     parser.add_argument("--max-moves", type=int, default=500,
@@ -359,10 +374,10 @@ def main():
     
     # Create bots
     print(f"Creating {args.bot1_type} bot...")
-    bot1 = benchmark.create_bot(args.bot1_type, checkpoint_path=args.bot1_checkpoint)
+    bot1 = benchmark.create_bot(args.bot1_type, checkpoint_path=args.bot1_checkpoint, bot_name=args.bot1_name)
     
     print(f"Creating {args.bot2_type} bot...")
-    bot2 = benchmark.create_bot(args.bot2_type, checkpoint_path=args.bot2_checkpoint)
+    bot2 = benchmark.create_bot(args.bot2_type, checkpoint_path=args.bot2_checkpoint, bot_name=args.bot2_name)
     
     # Run benchmark
     print(f"\nRunning benchmark: {args.num_games} games")
