@@ -263,8 +263,8 @@ def main():
             print(f"Best LR found: {best_lr:.6g} (loss {best_loss:.4f})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader
+    model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, test_loader
     )
     total_training_steps = max(1, len(train_loader)) * max(1, args.epochs)
     scheduler = create_linear_warmup_decay_scheduler(
