@@ -1,0 +1,10 @@
+{
+  "vocab_size": 13,
+  "move_vocab_size": 1968,
+  "embed_dim": 512,
+  "nb_transformer_layers": 8,
+  "num_heads": 8,
+  "dropout": 0.1,
+  "kvq_bias": false,
+  "mask_future": false
+}

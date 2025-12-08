@@ -163,6 +163,7 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Number of warmup steps for LR scheduler")
     parser.add_argument("--final-lr-ratio", type=float, default=0.01, help="Final LR multiplier after linear decay")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Maximum gradient norm for clipping (0 to disable)")
     args = parser.parse_args()
 
     set_seed(args.random_seed)
@@ -212,6 +213,12 @@ def main():
     # Create checkpoints directory
     checkpoint_dir = log_path / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
+    
+    # Save model config to JSON
+    config_path = log_path / "model_config.json"
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(model_config, f, indent=2)
+    print(f"Model config saved to: {config_path}")
 
     accelerator = accelerate.Accelerator(log_with="tensorboard", project_dir=str(log_path))
     
@@ -224,6 +231,7 @@ def main():
             "learning_rate": args.lr,
             "min_elo": args.min_elo,
             "max_elo": args.max_elo,
+            "max_grad_norm": args.max_grad_norm,
             **model_config,
             "warmup_steps": args.warmup_steps,
             "final_lr_ratio": args.final_lr_ratio,
@@ -255,8 +263,8 @@ def main():
             print(f"Best LR found: {best_lr:.6g} (loss {best_loss:.4f})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader
+    model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, test_loader
     )
     total_training_steps = max(1, len(train_loader)) * max(1, args.epochs)
     scheduler = create_linear_warmup_decay_scheduler(
@@ -307,6 +315,11 @@ def main():
             )
 
             accelerator.backward(loss)
+            
+            # Gradient clipping
+            if args.max_grad_norm > 0:
+                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            
             optimizer.step()
             scheduler.step()
 

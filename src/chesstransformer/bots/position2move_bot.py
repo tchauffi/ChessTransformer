@@ -9,7 +9,7 @@ from chesstransformer.models.tokenizer import PostionTokenizer, MoveTokenizer
 data_foler = Path(__file__).parents[1] / "data"
 
 class Position2MoveBot:
-    def __init__(self, model_path: str = str((data_foler / "models/position2moveV1.0/model.safetensors").resolve()), device: str = "cpu"):
+    def __init__(self, model_path: str = str((data_foler / "models/V2_model/model.safetensors").resolve()), device: str = "cpu"):
         self.device = device
         self.position_tokenizer = PostionTokenizer()
         self.move_tokenizer = MoveTokenizer()
@@ -47,7 +47,8 @@ class Position2MoveBot:
 
         masked_logits = logits[0] + mask  # Assuming batch size of 1
         probs = torch.softmax(masked_logits, dim=-1)
-        predicted_move_id = torch.argmax(probs).item()
+        # draw the move from the distribution
+        predicted_move_id = torch.multinomial(probs * 0.2, num_samples=1).item()
         proba = probs[predicted_move_id].item()
 
         predicted_move = self.move_tokenizer.decode(predicted_move_id)
