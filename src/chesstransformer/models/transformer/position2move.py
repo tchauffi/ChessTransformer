@@ -1,8 +1,8 @@
 import torch 
 from torch import nn
 
-from chesstransformer.models.transformer.attention import MultiHeadAttention
-from chesstransformer.models.transformer.utils import LayerNorm, GELU
+from chesstransformer.models.transformer.attention import PyTorchMultiHeadAttention
+from chesstransformer.models.transformer.utils import LayerNorm
 
 
 class FeedForward(nn.Module):
@@ -10,7 +10,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(embed_dim, 4 * embed_dim),
-            GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Linear(4 * embed_dim, embed_dim),
         )
 
@@ -29,19 +29,18 @@ class TransformerBlock(nn.Module):
         apply_rope=True
     ):
         super().__init__()
-        self.att = MultiHeadAttention(
+        self.att = PyTorchMultiHeadAttention(
             d_in=embed_dim,
             d_out=embed_dim,
             num_heads=num_heads,
-            context_length=context_length,
             dropout=dropout,
             qkv_bias=qkv_bias,
             mask_future=mask_future,
             apply_rope=apply_rope
         )
         self.feed_forward = FeedForward(embed_dim)
-        self.norm1 = LayerNorm(embed_dim)
-        self.norm2 = LayerNorm(embed_dim)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
         self.dropout_shortcut = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -89,7 +88,7 @@ class Position2MoveModel(nn.Module):
                 apply_rope=rope
             ) for _ in range(nb_transformer_layers)]
         )
-        self.norm = LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
 
         self.lm_head = nn.Linear(embed_dim, move_vocab_size, bias=False)
 
@@ -103,14 +102,16 @@ class Position2MoveModel(nn.Module):
         
         # init the q, k, v, and output projection layers using xavier initialization
         for layer in self.transformer_blocks:
-            if isinstance(layer.att, MultiHeadAttention):
-                torch.nn.init.xavier_uniform_(layer.att.W_query.weight)
-                torch.nn.init.xavier_uniform_(layer.att.W_key.weight)
-                torch.nn.init.xavier_uniform_(layer.att.W_value.weight)
-                torch.nn.init.xavier_uniform_(layer.att.out_proj.weight)
+            if isinstance(layer.att, PyTorchMultiHeadAttention):
+                torch.nn.init.xavier_uniform_(layer.att.qkv.weight)
+                if layer.att.qkv.bias is not None:
+                    torch.nn.init.zeros_(layer.att.qkv.bias)
+                torch.nn.init.xavier_uniform_(layer.att.proj.weight)
+                if layer.att.proj.bias is not None:
+                    torch.nn.init.zeros_(layer.att.proj.bias)
 
         torch.nn.init.xavier_uniform_(self.lm_head.weight)
-        
+
 
     def forward(self, x, is_white):
         """
