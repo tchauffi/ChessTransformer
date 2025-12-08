@@ -25,7 +25,8 @@ class TransformerBlock(nn.Module):
         context_length,
         dropout,
         qkv_bias,
-        mask_future=False
+        mask_future=False,
+        apply_rope=True
     ):
         super().__init__()
         self.att = MultiHeadAttention(
@@ -35,7 +36,8 @@ class TransformerBlock(nn.Module):
             context_length=context_length,
             dropout=dropout,
             qkv_bias=qkv_bias,
-            mask_future=mask_future
+            mask_future=mask_future,
+            apply_rope=apply_rope
         )
         self.feed_forward = FeedForward(embed_dim)
         self.norm1 = LayerNorm(embed_dim)
@@ -67,11 +69,13 @@ class Position2MoveModel(nn.Module):
             num_heads:int=8,
             dropout:float=0.1,
             kvq_bias:bool= False,
-            mask_future:bool=False
+            mask_future:bool=False,
+            rope:bool=True
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.position_embedding = nn.Embedding(64, embed_dim)  # 64 squares
+        if not rope:
+            self.position_embedding = nn.Embedding(64, embed_dim)  # 64 squares
         self.player_embedding = nn.Embedding(2, embed_dim)  # 2 players: white and black
         self.dropout = nn.Dropout(dropout)
         self.transformer_blocks = nn.Sequential(
@@ -81,12 +85,32 @@ class Position2MoveModel(nn.Module):
                 context_length=64,
                 dropout=dropout,
                 qkv_bias=kvq_bias,
-                mask_future=mask_future
+                mask_future=mask_future,
+                apply_rope=rope
             ) for _ in range(nb_transformer_layers)]
         )
         self.norm = LayerNorm(embed_dim)
 
         self.lm_head = nn.Linear(embed_dim, move_vocab_size, bias=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        if hasattr(self, 'position_embedding'):
+            torch.nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.player_embedding.weight, mean=0.0, std=0.02)
+        
+        # init the q, k, v, and output projection layers using xavier initialization
+        for layer in self.transformer_blocks:
+            if isinstance(layer.att, MultiHeadAttention):
+                torch.nn.init.xavier_uniform_(layer.att.W_query.weight)
+                torch.nn.init.xavier_uniform_(layer.att.W_key.weight)
+                torch.nn.init.xavier_uniform_(layer.att.W_value.weight)
+                torch.nn.init.xavier_uniform_(layer.att.out_proj.weight)
+
+        torch.nn.init.xavier_uniform_(self.lm_head.weight)
+        
 
     def forward(self, x, is_white):
         """
@@ -102,7 +126,10 @@ class Position2MoveModel(nn.Module):
 
         positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
         token_emb = self.token_embedding(x)  # (batch_size, 64, embed_dim)
-        pos_emb = self.position_embedding(positions)  # (batch_size, 64, embed_dim)
+        if hasattr(self, 'position_embedding'):
+            pos_emb = self.position_embedding(positions)  # (batch_size, 64, embed_dim)
+        else:
+            pos_emb = torch.zeros_like(token_emb)  # Fallback if RoPE is used
 
         player_ids = is_white.long().unsqueeze(1).expand(-1, seq_len)  # (batch_size, 64)
 
