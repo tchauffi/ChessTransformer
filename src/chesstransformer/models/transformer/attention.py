@@ -4,11 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from chesstransformer.models.transformer.rope import RoPEEmbedding
+
 
 class MultiHeadAttention(nn.Module):
     def __init__(
         self, d_in, d_out, num_heads, context_length, qkv_bias=False, dropout=0.0,
-        mask_future=True
+        mask_future=True, apply_rope=False
     ):
         super().__init__()
         assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
@@ -21,6 +23,11 @@ class MultiHeadAttention(nn.Module):
         self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.out_proj = nn.Linear(d_out, d_out)
         self.dropout = nn.Dropout(dropout)
+        self.apply_rope = apply_rope
+
+        if self.apply_rope:
+            self.rope = RoPEEmbedding(dim=self.d_head, max_position_embeddings=context_length)
+
         self.register_buffer(
             "mask", torch.triu(torch.ones(context_length, context_length), diagonal=1)
         )
@@ -44,14 +51,15 @@ class MultiHeadAttention(nn.Module):
 
         # Reshape for multi-head attention
         keys = keys.view(bz, nb_tockens, self.num_heads, self.d_head).transpose(1, 2)
-        values = values.view(bz, nb_tockens, self.num_heads, self.d_head).transpose(
-            1, 2
-        )
-        querys = queries.view(bz, nb_tockens, self.num_heads, self.d_head).transpose(
-            1, 2
-        )
+        values = values.view(bz, nb_tockens, self.num_heads, self.d_head).transpose(1, 2)
+        queries = queries.view(bz, nb_tockens, self.num_heads, self.d_head).transpose(1, 2)
+
+        if self.apply_rope:
+            keys = self.rope(keys)
+            queries = self.rope(values)
+
         # Compute attention scores
-        attention_scores = querys @ keys.transpose(
+        attention_scores = queries @ keys.transpose(
             2, 3
         )  # (batch_size, num_heads, seq_len, seq_len)
 
