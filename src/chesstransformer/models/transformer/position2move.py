@@ -1,7 +1,7 @@
 import torch 
 from torch import nn
 
-from chesstransformer.models.transformer.attention import PyTorchMultiHeadAttention
+from chesstransformer.models.transformer.attention import GroupedQueryAttention
 
 
 class FeedForward(nn.Module):
@@ -21,6 +21,7 @@ class TransformerBlock(nn.Module):
         self,
         embed_dim,
         num_heads,
+        num_kv_groups,
         context_length,
         dropout,
         qkv_bias,
@@ -28,10 +29,11 @@ class TransformerBlock(nn.Module):
         apply_rope=True
     ):
         super().__init__()
-        self.att = PyTorchMultiHeadAttention(
+        self.att = GroupedQueryAttention(
             d_in=embed_dim,
             d_out=embed_dim,
             num_heads=num_heads,
+            num_kv_groups=num_kv_groups,
             dropout=dropout,
             qkv_bias=qkv_bias,
             mask_future=mask_future,
@@ -65,6 +67,7 @@ class Position2MoveModel(nn.Module):
             embed_dim:int=512,
             nb_transformer_layers:int=8,
             num_heads:int=8,
+            num_kv_groups:int=4,
             dropout:float=0.1,
             kvq_bias:bool= False,
             mask_future:bool=False,
@@ -80,6 +83,7 @@ class Position2MoveModel(nn.Module):
             *[TransformerBlock(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
+                num_kv_groups=num_kv_groups,
                 context_length=64,
                 dropout=dropout,
                 qkv_bias=kvq_bias,
@@ -101,13 +105,17 @@ class Position2MoveModel(nn.Module):
         
         # init the q, k, v, and output projection layers using xavier initialization
         for layer in self.transformer_blocks:
-            if isinstance(layer.att, PyTorchMultiHeadAttention):
-                torch.nn.init.xavier_uniform_(layer.att.qkv.weight)
-                if layer.att.qkv.bias is not None:
-                    torch.nn.init.zeros_(layer.att.qkv.bias)
+            if isinstance(layer.att, GroupedQueryAttention):
+                torch.nn.init.xavier_uniform_(layer.att.q_proj.weight)
+                if layer.att.q_proj.bias is not None:
+                    torch.nn.init.zeros_(layer.att.q_proj.bias)
+                torch.nn.init.xavier_uniform_(layer.att.k_proj.weight)
+                if layer.att.k_proj.bias is not None:
+                    torch.nn.init.zeros_(layer.att.k_proj.bias)
+                torch.nn.init.xavier_uniform_(layer.att.v_proj.weight)
+                if layer.att.v_proj.bias is not None:
+                    torch.nn.init.zeros_(layer.att.v_proj.bias)
                 torch.nn.init.xavier_uniform_(layer.att.proj.weight)
-                if layer.att.proj.bias is not None:
-                    torch.nn.init.zeros_(layer.att.proj.bias)
 
         torch.nn.init.xavier_uniform_(self.lm_head.weight)
 
