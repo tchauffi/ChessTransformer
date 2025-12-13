@@ -120,8 +120,11 @@ def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_ma
         moves = batch["move"].to(device)
         is_white = batch["is_white"].to(device)
         legal_moves_mask = batch["legal_moves_mask"].to(device)
+        castling_rights = batch["castling_rights"].to(device)
+        en_passant_file = batch["en_passant_file"].to(device)
+        halfmove_clock = batch["halfmove_clock"].to(device)
 
-        logits = model(positions, is_white)
+        logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
         loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
             logits, moves, legal_moves_mask, beta, legal_move_loss_weight
         )
@@ -354,8 +357,11 @@ def main():
             moves = batch['move']
             is_white = batch['is_white']
             legal_moves_mask = batch['legal_moves_mask']
+            castling_rights = batch['castling_rights']
+            en_passant_file = batch['en_passant_file']
+            halfmove_clock = batch['halfmove_clock']
 
-            logits = model(positions, is_white)
+            logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
             loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
                 logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight
             )
@@ -419,8 +425,11 @@ def main():
                 moves = batch['move']
                 is_white = batch['is_white']
                 legal_moves_mask = batch['legal_moves_mask']
+                castling_rights = batch['castling_rights']
+                en_passant_file = batch['en_passant_file']
+                halfmove_clock = batch['halfmove_clock']
 
-                logits = model(positions, is_white)
+                logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
                 loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
                     logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight
                 )
@@ -493,8 +502,11 @@ def main():
             moves = batch['move']
             is_white = batch['is_white']
             legal_moves_mask = batch['legal_moves_mask']
+            castling_rights = batch['castling_rights']
+            en_passant_file = batch['en_passant_file']
+            halfmove_clock = batch['halfmove_clock']
 
-            logits = model(positions, is_white)
+            logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
             loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
                 logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight
             )
