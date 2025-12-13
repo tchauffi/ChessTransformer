@@ -2,7 +2,6 @@ import torch
 from torch import nn
 
 from chesstransformer.models.transformer.attention import PyTorchMultiHeadAttention
-from chesstransformer.models.transformer.utils import LayerNorm
 
 
 class FeedForward(nn.Module):

@@ -100,6 +100,7 @@ def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_ma
     model.train()
     device = accelerator.device
     initial_state = copy.deepcopy(model.state_dict())
+    # Use base learning rate for LR finder
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr_min)
     multiplier = (lr_max / lr_min) ** (1 / max(num_steps - 1, 1))
     best_lr = lr_min
@@ -151,7 +152,9 @@ def main():
     parser.add_argument("--max-elo", type=int, default=None, help="Maximum average ELO for filtering games")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for transformers (base LR)")
+    parser.add_argument("--lr-embedding", type=float, default=None, help="Learning rate for embeddings (default: same as --lr)")
+    parser.add_argument("--lr-head", type=float, default=None, help="Learning rate for output head (default: same as --lr)")
     parser.add_argument("--save-every", type=int, default=5, help="Save checkpoint every N epochs")
     parser.add_argument("--lr-find", action="store_true", help="Run learning rate finder before training")
     parser.add_argument("--lr-min", type=float, default=1e-6, help="Minimum LR for finder sweep")
@@ -164,6 +167,7 @@ def main():
     parser.add_argument("--final-lr-ratio", type=float, default=0.01, help="Final LR multiplier after linear decay")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Maximum gradient norm for clipping (0 to disable)")
+    parser.add_argument("--max_examples", type=int, default=None, help="Maximum number of examples to use from the dataset")
     args = parser.parse_args()
 
     set_seed(args.random_seed)
@@ -199,6 +203,7 @@ def main():
         "dropout": 0.1,
         "kvq_bias": False,
         "mask_future": False,
+        "rope": True,  # Use RoPE for positional encoding
     }
 
     # Setup logging
@@ -229,6 +234,8 @@ def main():
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "learning_rate": args.lr,
+            "lr_embedding": args.lr_embedding if args.lr_embedding is not None else args.lr,
+            "lr_head": args.lr_head if args.lr_head is not None else args.lr,
             "min_elo": args.min_elo,
             "max_elo": args.max_elo,
             "max_grad_norm": args.max_grad_norm,
@@ -242,6 +249,7 @@ def main():
     print(f"Using device: {device}")
 
     model = Position2MoveModel(**model_config)
+    model = torch.compile(model)
     model.to(device)
 
     if args.lr_find:
@@ -262,7 +270,45 @@ def main():
         if accelerator.is_main_process:
             print(f"Best LR found: {best_lr:.6g} (loss {best_loss:.4f})")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # Set up discriminative learning rates
+    lr_embedding = args.lr_embedding if args.lr_embedding is not None else args.lr
+    lr_head = args.lr_head if args.lr_head is not None else args.lr
+    lr_transformer = args.lr
+    
+    # Create parameter groups
+    embedding_params = []
+    transformer_params = []
+    head_params = []
+    
+    # Get underlying model (unwrap from accelerator if needed)
+    unwrapped_model = accelerator.unwrap_model(model)
+    
+    # Categorize parameters
+    for name, param in unwrapped_model.named_parameters():
+        if 'embedding' in name:
+            embedding_params.append(param)
+        elif 'lm_head' in name:
+            head_params.append(param)
+        else:
+            transformer_params.append(param)
+    
+    param_groups = [
+        {'params': embedding_params, 'lr': lr_embedding, 'name': 'embeddings'},
+        {'params': transformer_params, 'lr': lr_transformer, 'name': 'transformers'},
+        {'params': head_params, 'lr': lr_head, 'name': 'head'},
+    ]
+    
+    if accelerator.is_main_process:
+        emb_count = sum(p.numel() for p in embedding_params)
+        trans_count = sum(p.numel() for p in transformer_params)
+        head_count = sum(p.numel() for p in head_params)
+        print(f"\nLearning rates:")
+        print(f"  Embeddings:   {lr_embedding:.6g}")
+        print(f"  Transformers: {lr_transformer:.6g}")
+        print(f"  Head:         {lr_head:.6g}")
+        print(f"  Param counts: Emb={emb_count:,}, Trans={trans_count:,}, Head={head_count:,}\n")
+    
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
     model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader, test_loader
     )
@@ -337,13 +383,17 @@ def main():
             })
             
             # Log step-level metrics
-            accelerator.log({
+            current_lrs = scheduler.get_last_lr()
+            log_dict = {
                 "train/step_loss": loss.item(),
                 "train/step_llm_loss": llm_loss.item(),
                 "train/step_legal_move_loss": legal_move_loss.item(),
                 "train/step_legal_move_ce": legal_move_cross_entropy.item(),
-                "train/lr": scheduler.get_last_lr()[0],
-            }, step=global_step)
+                "train/lr_embeddings": current_lrs[0],
+                "train/lr_transformers": current_lrs[1],
+                "train/lr_head": current_lrs[2],
+            }
+            accelerator.log(log_dict, step=global_step)
             
             global_step += 1
 
@@ -406,7 +456,9 @@ def main():
             "val/legal_move_ce": val_legal_move_ce,
             "val/accuracy": val_accuracy,
             "epoch": epoch,
-            "train/lr_epoch_end": scheduler.get_last_lr()[0],
+            "train/lr_embeddings_epoch_end": scheduler.get_last_lr()[0],
+            "train/lr_transformers_epoch_end": scheduler.get_last_lr()[1],
+            "train/lr_head_epoch_end": scheduler.get_last_lr()[2],
         }, step=global_step)
 
         print(f"\nEpoch {epoch}/{args.epochs}:")
