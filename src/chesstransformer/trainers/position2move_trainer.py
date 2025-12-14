@@ -185,8 +185,11 @@ def main():
         min_elo=args.min_elo,
         max_elo=args.max_elo,
     )
-    val_size = int(0.1 * len(dataset))
-    test_size = int(0.1 * len(dataset))
+
+    MAX_VALIDATION_SAMPLES = 10000
+
+    val_size = min(int(0.1 * len(dataset)), MAX_VALIDATION_SAMPLES)
+    test_size = min(int(0.1 * len(dataset)), MAX_VALIDATION_SAMPLES)
     train_size = len(dataset) - val_size - test_size
     train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
 
