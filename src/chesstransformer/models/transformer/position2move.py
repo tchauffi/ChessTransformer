@@ -1,9 +1,52 @@
 import torch 
 from torch import nn
+import torch.nn.functional as F
 
 from chesstransformer.models.transformer.attention import GroupedQueryAttention
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+    
+    More efficient than LayerNorm as it doesn't compute mean.
+    Used in Llama, Mistral, and other modern transformers.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq, dim)
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
+class SwiGLUFeedForward(nn.Module):
+    """SwiGLU Feed-Forward Network.
+    
+    Combines Swish activation with Gated Linear Units.
+    Better performance than standard GELU FFN.
+    Used in Llama 2, PaLM, and other modern transformers.
+    """
+    def __init__(self, embed_dim: int, hidden_dim: int = None, dropout: float = 0.0):
+        super().__init__()
+        # Default hidden_dim is ~2.67x embed_dim (compensates for extra params from gate)
+        hidden_dim = hidden_dim or int(embed_dim * 8 / 3)
+        # Round to nearest multiple of 64 for efficiency
+        hidden_dim = ((hidden_dim + 63) // 64) * 64
+        
+        self.w1 = nn.Linear(embed_dim, hidden_dim, bias=False)  # Up projection
+        self.w2 = nn.Linear(hidden_dim, embed_dim, bias=False)  # Down projection
+        self.w3 = nn.Linear(embed_dim, hidden_dim, bias=False)  # Gate projection
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SwiGLU: w2(SiLU(w1(x)) * w3(x))
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+
+# Keep old FeedForward for backward compatibility
 class FeedForward(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
@@ -26,7 +69,8 @@ class TransformerBlock(nn.Module):
         dropout,
         qkv_bias,
         mask_future=False,
-        apply_rope=True
+        apply_rope=True,
+        use_swiglu=True,
     ):
         super().__init__()
         self.att = GroupedQueryAttention(
@@ -39,9 +83,15 @@ class TransformerBlock(nn.Module):
             mask_future=mask_future,
             apply_rope=apply_rope
         )
-        self.feed_forward = FeedForward(embed_dim)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        # Use SwiGLU by default, fallback to standard FFN
+        if use_swiglu:
+            self.feed_forward = SwiGLUFeedForward(embed_dim, dropout=dropout)
+        else:
+            self.feed_forward = FeedForward(embed_dim)
+        
+        # Use RMSNorm instead of LayerNorm
+        self.norm1 = RMSNorm(embed_dim)
+        self.norm2 = RMSNorm(embed_dim)
         self.dropout_shortcut = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -71,14 +121,26 @@ class Position2MoveModel(nn.Module):
             dropout:float=0.1,
             kvq_bias:bool= False,
             mask_future:bool=False,
-            rope:bool=True
+            rope:bool=True,
+            use_swiglu:bool=True,
+            use_col_row_emb:bool=False,
     ):
         super().__init__()
+        # Learnable CLS token for classification (instead of mean pooling)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        
         # Board piece embeddings
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         if not rope:
             self.position_embedding = nn.Embedding(64, embed_dim)  # 64 squares
         self.player_embedding = nn.Embedding(2, embed_dim)  # 2 players: white and black
+
+        self.use_col_row_emb = use_col_row_emb
+
+        if use_col_row_emb:
+            # Optional column and row embeddings for board squares
+            self.col_embedding = nn.Embedding(8, embed_dim)
+            self.row_embedding = nn.Embedding(8, embed_dim)
         
         # Additional game state embeddings
         # Castling rights: 4 binary flags (white_king, white_queen, black_king, black_queen)
@@ -97,14 +159,16 @@ class Position2MoveModel(nn.Module):
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 num_kv_groups=num_kv_groups,
-                context_length=64 + 3,  # 64 squares + 3 game state tokens
+                context_length=64 + 3 + 1,  # 64 squares + 3 game state tokens + 1 CLS
                 dropout=dropout,
                 qkv_bias=kvq_bias,
                 mask_future=mask_future,
-                apply_rope=rope
+                apply_rope=rope,
+                use_swiglu=use_swiglu,
             ) for _ in range(nb_transformer_layers)]
         )
-        self.norm = nn.LayerNorm(embed_dim)
+        # Final RMSNorm
+        self.norm = RMSNorm(embed_dim)
 
         self.lm_head = nn.Linear(embed_dim, move_vocab_size, bias=False)
 
@@ -114,6 +178,10 @@ class Position2MoveModel(nn.Module):
         torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
         if hasattr(self, 'position_embedding'):
             torch.nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+        if self.use_col_row_emb:
+            torch.nn.init.normal_(self.col_embedding.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(self.row_embedding.weight, mean=0.0, std=0.02)
+
         torch.nn.init.normal_(self.player_embedding.weight, mean=0.0, std=0.02)
         torch.nn.init.normal_(self.castling_embedding.weight, mean=0.0, std=0.02)
         torch.nn.init.normal_(self.en_passant_embedding.weight, mean=0.0, std=0.02)
@@ -132,22 +200,30 @@ class Position2MoveModel(nn.Module):
                 if layer.att.v_proj.bias is not None:
                     torch.nn.init.zeros_(layer.att.v_proj.bias)
                 torch.nn.init.xavier_uniform_(layer.att.proj.weight)
+            
+            # Initialize SwiGLU layers
+            if isinstance(layer.feed_forward, SwiGLUFeedForward):
+                torch.nn.init.xavier_uniform_(layer.feed_forward.w1.weight)
+                torch.nn.init.xavier_uniform_(layer.feed_forward.w2.weight)
+                torch.nn.init.xavier_uniform_(layer.feed_forward.w3.weight)
 
         torch.nn.init.xavier_uniform_(self.lm_head.weight)
 
     def _bucket_halfmove(self, halfmove: torch.Tensor) -> torch.Tensor:
-        """Convert halfmove clock values to bucket indices."""
-        # Buckets: 0, 1-5, 6-10, 11-20, 21-30, 31-40, 41-50, 50+
-        buckets = torch.zeros_like(halfmove)
-        buckets = torch.where(halfmove == 0, 0, buckets)
-        buckets = torch.where((halfmove >= 1) & (halfmove <= 5), 1, buckets)
-        buckets = torch.where((halfmove >= 6) & (halfmove <= 10), 2, buckets)
-        buckets = torch.where((halfmove >= 11) & (halfmove <= 20), 3, buckets)
-        buckets = torch.where((halfmove >= 21) & (halfmove <= 30), 4, buckets)
-        buckets = torch.where((halfmove >= 31) & (halfmove <= 40), 5, buckets)
-        buckets = torch.where((halfmove >= 41) & (halfmove <= 50), 6, buckets)
-        buckets = torch.where(halfmove > 50, 7, buckets)
-        return buckets
+        """Convert halfmove clock values to bucket indices.
+        
+        Buckets: 0, 1-5, 6-10, 11-20, 21-30, 31-40, 41-50, 50+
+        Uses searchsorted to avoid torch.where (better for MPS compilation).
+        """
+        # Define bucket boundaries
+        boundaries = torch.tensor([1, 6, 11, 21, 31, 41, 51], device=halfmove.device)
+        # searchsorted gives us the bucket index directly
+        # Values less than 1 -> bucket 0
+        # Values in [1, 6) -> bucket 1
+        # Values in [6, 11) -> bucket 2, etc.
+        buckets = torch.searchsorted(boundaries, halfmove.float(), right=False)
+        buckets = torch.clamp(buckets, 0, 7)
+        return buckets.long()
 
     def forward(self, x, is_white, castling_rights=None, en_passant_file=None, halfmove_clock=None):
         """
@@ -191,6 +267,13 @@ class Position2MoveModel(nn.Module):
         player_emb = self.player_embedding(player_ids)  # (batch_size, 64, embed_dim)
 
         board_emb = token_emb + pos_emb + player_emb  # (batch_size, 64, embed_dim)
+
+        if self.use_col_row_emb:
+            cols = (positions % 8).long()  # (batch_size, 64)
+            rows = (positions // 8).long()  # (batch_size, 64)
+            col_emb = self.col_embedding(cols)  # (batch_size, 64, embed_dim)
+            row_emb = self.row_embedding(rows)  # (batch_size, 64, embed_dim)
+            board_emb = board_emb + col_emb + row_emb  # (batch_size, 64, embed_dim)
         
         # Create game state tokens
         castling_emb = self.castling_embedding(castling_rights.long())  # (batch_size, embed_dim)
@@ -201,15 +284,18 @@ class Position2MoveModel(nn.Module):
         # Stack game state tokens: (batch_size, 3, embed_dim)
         game_state_tokens = torch.stack([castling_emb, en_passant_emb, halfmove_emb], dim=1)
         
-        # Concatenate board and game state: (batch_size, 67, embed_dim)
-        x = torch.cat([board_emb, game_state_tokens], dim=1)
+        # Expand CLS token for batch: (batch_size, 1, embed_dim)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        
+        # Concatenate: [CLS] + board + game_state: (batch_size, 68, embed_dim)
+        x = torch.cat([cls_tokens, board_emb, game_state_tokens], dim=1)
         x = self.dropout(x)
 
-        x = self.transformer_blocks(x)  # (batch_size, 67, embed_dim)
-        x = self.norm(x)  # (batch_size, 67, embed_dim)
+        x = self.transformer_blocks(x)  # (batch_size, 68, embed_dim)
+        x = self.norm(x)  # (batch_size, 68, embed_dim)
         
-        # Average over all tokens (board + game state)
-        x = x.mean(dim=1)  # (batch_size, embed_dim)
+        # Use CLS token output for classification (instead of mean pooling)
+        x = x[:, 0, :]  # (batch_size, embed_dim)
 
         logits = self.lm_head(x)  # (batch_size, move_vocab_size)
         return logits

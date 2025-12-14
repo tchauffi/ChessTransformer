@@ -203,10 +203,13 @@ def main():
         "embed_dim": 512,
         "nb_transformer_layers": 8,
         "num_heads": 8,
+        "num_kv_groups": 4,  # GQA: 8 heads / 4 groups = 2 heads per KV group
         "dropout": 0.1,
         "kvq_bias": False,
         "mask_future": False,
         "rope": True,  # Use RoPE for positional encoding
+        "use_swiglu": True,  # Use SwiGLU activation (Llama-style)
+        "use_col_row_emb": True,  # Use separate column and row embeddings
     }
 
     # Setup logging
@@ -252,7 +255,18 @@ def main():
     print(f"Using device: {device}")
 
     model = Position2MoveModel(**model_config)
-    model = torch.compile(model)
+    
+    # torch.compile has limited support on MPS backend - disable if compilation fails
+    if device.type == "mps":
+        print("Warning: Skipping torch.compile on MPS device (Mac GPU) due to backend limitations")
+        print("Training will proceed without compilation optimizations")
+    else:
+        try:
+            model = torch.compile(model)
+            print("Model compiled successfully")
+        except Exception as e:
+            print(f"Warning: torch.compile failed ({e}), proceeding without compilation")
+    
     model.to(device)
 
     if args.lr_find:
