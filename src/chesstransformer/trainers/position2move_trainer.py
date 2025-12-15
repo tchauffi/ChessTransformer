@@ -70,8 +70,14 @@ def compute_loss(logits, moves, legal_moves_mask, beta, legal_move_loss_weight):
     loss = beta * llm_loss + legal_move_loss_weight * legal_move_loss + (1 - beta) * legal_move_cross_entropy
     return loss, llm_loss, legal_move_loss, legal_move_cross_entropy
 
-def save_trainer_state(checkpoint_dir, epoch, global_step, best_val_loss):
-    state = {"epoch": epoch, "global_step": global_step, "best_val_loss": best_val_loss}
+def save_trainer_state(checkpoint_dir, epoch, global_step, best_val_loss, scheduler_config=None):
+    state = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_val_loss": best_val_loss,
+    }
+    if scheduler_config:
+        state["scheduler_config"] = scheduler_config
     state_path = Path(checkpoint_dir) / "trainer_state.json"
     with state_path.open("w", encoding="utf-8") as fp:
         json.dump(state, fp)
@@ -82,6 +88,21 @@ def load_trainer_state(checkpoint_dir):
         return None
     with state_path.open("r", encoding="utf-8") as fp:
         return json.load(fp)
+
+def cleanup_old_step_checkpoints(checkpoint_dir, max_checkpoints):
+    """Remove old step checkpoints, keeping only the most recent ones."""
+    checkpoint_path = Path(checkpoint_dir)
+    step_checkpoints = sorted(
+        [d for d in checkpoint_path.iterdir() if d.is_dir() and d.name.startswith("checkpoint_step_")],
+        key=lambda x: int(x.name.split("_")[-1])
+    )
+    
+    # Remove oldest checkpoints if we exceed max_checkpoints
+    while len(step_checkpoints) > max_checkpoints:
+        oldest = step_checkpoints.pop(0)
+        import shutil
+        shutil.rmtree(oldest)
+        print(f"  Removed old checkpoint: {oldest.name}")
 
 def create_linear_warmup_decay_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio):
     final_lr_ratio = max(0.0, final_lr_ratio)
@@ -171,6 +192,9 @@ def main():
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Maximum gradient norm for clipping (0 to disable)")
     parser.add_argument("--max_examples", type=int, default=None, help="Maximum number of examples to use from the dataset")
+    parser.add_argument("--save-steps", type=int, default=5000, help="Save checkpoint every N steps")
+    parser.add_argument("--max-checkpoints", type=int, default=5, help="Maximum number of step checkpoints to keep (excluding best model)")
+    parser.add_argument("--precision", type=str, default="fp16", choices=["bf16", "fp16", "fp32"], help="Precision for training")
     args = parser.parse_args()
 
     set_seed(args.random_seed)
@@ -193,9 +217,9 @@ def main():
     train_size = len(dataset) - val_size - test_size
     train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=12, drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=12)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=12)
 
     print(f"Train samples: {len(train_set)}, Val samples: {len(val_set)}, Test samples: {len(test_set)}")
 
@@ -234,7 +258,10 @@ def main():
         json.dump(model_config, f, indent=2)
     print(f"Model config saved to: {config_path}")
 
-    accelerator = accelerate.Accelerator(log_with="tensorboard", project_dir=str(log_path))
+    precision = args.precision if torch.cuda.is_available() or torch.backends.mps.is_available() else "fp32"
+    print(f"Using precision: {precision}")
+
+    accelerator = accelerate.Accelerator(log_with="tensorboard", project_dir=str(log_path), mixed_precision=precision)
     
     # Initialize trackers
     accelerator.init_trackers(
@@ -251,6 +278,7 @@ def main():
             **model_config,
             "warmup_steps": args.warmup_steps,
             "final_lr_ratio": args.final_lr_ratio,
+            "precision": args.precision,
         }
     )
 
@@ -265,7 +293,7 @@ def main():
         print("Training will proceed without compilation optimizations")
     else:
         try:
-            model = torch.compile(model)
+            model = torch.compile(model, )
             print("Model compiled successfully")
         except Exception as e:
             print(f"Warning: torch.compile failed ({e}), proceeding without compilation")
@@ -332,32 +360,80 @@ def main():
     model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader, test_loader
     )
-    total_training_steps = max(1, len(train_loader)) * max(1, args.epochs)
-    scheduler = create_linear_warmup_decay_scheduler(
-        optimizer,
-        warmup_steps=args.warmup_steps,
-        total_steps=total_training_steps,
-        final_lr_ratio=args.final_lr_ratio,
-    )
-    accelerator.register_for_checkpointing(scheduler)
-
+    
+    # Check if resuming to load scheduler config from checkpoint
     best_val_loss = float("inf")
     start_epoch = 1
     global_step = 0
     resume_path = Path(args.resume_from) if args.resume_from else None
+    trainer_state = None
+    
     if resume_path:
-        accelerator.load_state(str(resume_path))
         trainer_state = load_trainer_state(resume_path)
         if trainer_state:
             start_epoch = trainer_state.get("epoch", 0) + 1
             global_step = trainer_state.get("global_step", 0)
             best_val_loss = trainer_state.get("best_val_loss", float("inf"))
+    
+    # Determine scheduler parameters - use saved config when resuming for consistency
+    has_scheduler_config = trainer_state and "scheduler_config" in trainer_state
+    
+    if has_scheduler_config:
+        saved_config = trainer_state["scheduler_config"]
+        scheduler_warmup_steps = saved_config["warmup_steps"]
+        scheduler_total_steps = saved_config["total_steps"]
+        scheduler_final_lr_ratio = saved_config["final_lr_ratio"]
+        if accelerator.is_main_process:
+            print(f"Using scheduler config from checkpoint: warmup={scheduler_warmup_steps}, total={scheduler_total_steps}, final_lr_ratio={scheduler_final_lr_ratio}")
+    else:
+        scheduler_warmup_steps = args.warmup_steps
+        scheduler_total_steps = max(1, len(train_loader)) * max(1, args.epochs)
+        scheduler_final_lr_ratio = args.final_lr_ratio
+        if resume_path and accelerator.is_main_process:
+            print(f"Old checkpoint without scheduler_config - using new scheduler params: warmup={scheduler_warmup_steps}, total={scheduler_total_steps}")
+    
+    # Store scheduler config for saving in checkpoints
+    scheduler_config = {
+        "warmup_steps": scheduler_warmup_steps,
+        "total_steps": scheduler_total_steps,
+        "final_lr_ratio": scheduler_final_lr_ratio,
+    }
+    
+    scheduler = create_linear_warmup_decay_scheduler(
+        optimizer,
+        warmup_steps=scheduler_warmup_steps,
+        total_steps=scheduler_total_steps,
+        final_lr_ratio=scheduler_final_lr_ratio,
+    )
+    
+    # Always register scheduler for checkpointing (required for load_state to work)
+    accelerator.register_for_checkpointing(scheduler)
+
+    # Load the full accelerator state (model, optimizer, scheduler) if resuming
+    if resume_path:
+        accelerator.load_state(str(resume_path))
+        
+        # For old checkpoints without scheduler_config, the loaded scheduler state 
+        # has a mismatched lr_lambda (old total_steps). We need to recreate it.
+        if not has_scheduler_config:
+            # Recreate scheduler with correct parameters
+            scheduler = create_linear_warmup_decay_scheduler(
+                optimizer,
+                warmup_steps=scheduler_warmup_steps,
+                total_steps=scheduler_total_steps,
+                final_lr_ratio=scheduler_final_lr_ratio,
+            )
+            # Manually advance to the correct step
+            scheduler.last_epoch = global_step - 1  # -1 because step() will increment it
+            scheduler.step()  # This sets it to global_step and computes correct LR
+            if accelerator.is_main_process:
+                current_lrs = scheduler.get_last_lr()
+                print(f"  Recreated scheduler and advanced to step {global_step}")
+                print(f"  Current LRs: emb={current_lrs[0]:.6g}, trans={current_lrs[1]:.6g}, head={current_lrs[2]:.6g}")
+        
         if accelerator.is_main_process:
             print(f"Resumed from checkpoint: {resume_path}")
-
-    # Training loop
-    best_val_loss = float("inf")
-    global_step = 0
+            print(f"  Starting from epoch {start_epoch}, global_step {global_step}, best_val_loss {best_val_loss:.4f}")
     
     for epoch in range(start_epoch, args.epochs + 1):
         # Training phase
@@ -419,6 +495,15 @@ def main():
             accelerator.log(log_dict, step=global_step)
             
             global_step += 1
+            
+            # Save step checkpoint
+            if args.save_steps > 0 and global_step % args.save_steps == 0:
+                step_checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step:07d}"
+                accelerator.save_state(str(step_checkpoint_path))
+                save_trainer_state(step_checkpoint_path, epoch, global_step, best_val_loss, scheduler_config)
+                if accelerator.is_main_process:
+                    print(f"\n  Saved step checkpoint at step {global_step}")
+                    cleanup_old_step_checkpoints(checkpoint_dir, args.max_checkpoints)
 
         # Calculate average training metrics
         train_loss /= len(train_set)
@@ -495,14 +580,14 @@ def main():
             best_val_loss = val_loss
             best_checkpoint_path = checkpoint_dir / "best_model"
             accelerator.save_state(str(best_checkpoint_path))
-            save_trainer_state(best_checkpoint_path, epoch, global_step, best_val_loss)
+            save_trainer_state(best_checkpoint_path, epoch, global_step, best_val_loss, scheduler_config)
             print(f"  Saved best model (val_loss: {val_loss:.4f})")
 
         # Periodic checkpoint saving
         if epoch % args.save_every == 0:
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch:03d}"
             accelerator.save_state(str(checkpoint_path))
-            save_trainer_state(checkpoint_path, epoch, global_step, best_val_loss)
+            save_trainer_state(checkpoint_path, epoch, global_step, best_val_loss, scheduler_config)
             print(f"  Saved checkpoint at epoch {epoch}")
 
     # Final test evaluation
