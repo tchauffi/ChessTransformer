@@ -17,7 +17,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass, asdict
 from tqdm import tqdm
 
-from chesstransformer.bots import Position2MoveBot, RandomBot
+from chesstransformer.bots import Position2MoveBot, LegacyPosition2MoveBot, RandomBot
 
 
 @dataclass
@@ -76,13 +76,21 @@ class BotBenchmark:
         Factory method to create bots.
         
         Args:
-            bot_type: Type of bot ("position2move", "random")
+            bot_type: Type of bot ("position2move", "legacy_position2move", "random")
             checkpoint_path: Path to model checkpoint (for Position2MoveBot)
             bot_name: Optional custom name for the bot (for tracking multiple instances)
             **kwargs: Additional bot-specific arguments
         """
         if bot_type.lower() == "position2move":
-            bot = Position2MoveBot()
+            if checkpoint_path:
+                bot = Position2MoveBot(model_path=checkpoint_path)
+            else:
+                bot = Position2MoveBot()
+        elif bot_type.lower() == "legacy_position2move":
+            if checkpoint_path:
+                bot = LegacyPosition2MoveBot(model_path=checkpoint_path)
+            else:
+                bot = LegacyPosition2MoveBot()
         elif bot_type.lower() == "random":
             bot = RandomBot()
         else:
@@ -341,14 +349,14 @@ def main():
     
     parser = argparse.ArgumentParser(description="Benchmark chess bots")
     parser.add_argument("--bot1-type", type=str, required=True, 
-                       choices=["position2move", "random"],
+                       choices=["position2move", "legacy_position2move", "random"],
                        help="Type of first bot")
     parser.add_argument("--bot1-checkpoint", type=str, default=None,
                        help="Checkpoint path for bot1 (if applicable)")
     parser.add_argument("--bot1-name", type=str, default=None,
                        help="Custom name for bot1 (useful when comparing same bot types)")
     parser.add_argument("--bot2-type", type=str, required=True,
-                       choices=["position2move", "random"],
+                       choices=["position2move", "legacy_position2move", "random"],
                        help="Type of second bot")
     parser.add_argument("--bot2-checkpoint", type=str, default=None,
                        help="Checkpoint path for bot2 (if applicable)")
