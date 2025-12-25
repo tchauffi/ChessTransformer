@@ -13,7 +13,7 @@ interface MoveHistoryEntry {
 }
 
 export default function ChessGame() {
-  const [game, setGame] = useState(new Chess());
+  const [fen, setFen] = useState('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1');
   const [moveHistory, setMoveHistory] = useState<string[]>([]);
   const [gameStatus, setGameStatus] = useState<string>('');
   const [isThinking, setIsThinking] = useState(false);
@@ -52,15 +52,15 @@ export default function ChessGame() {
   };
 
   const makeMove = (sourceSquare: string, targetSquare: string) => {
-    const gameCopy = new Chess(game.fen());
+    const game = new Chess(fen);
     
     // Check if it's the player's turn
-    if (gameCopy.turn() !== playerColor) {
+    if (game.turn() !== playerColor) {
       return false;
     }
     
     try {
-      const move = gameCopy.move({
+      const move = game.move({
         from: sourceSquare,
         to: targetSquare,
         promotion: 'q', // Always promote to queen for simplicity
@@ -70,13 +70,13 @@ export default function ChessGame() {
         return false;
       }
 
-      setGame(gameCopy);
+      setFen(game.fen());
       setMoveHistory(prev => [...prev, move.san]);
-      updateGameStatus(gameCopy);
+      updateGameStatus(game);
 
       // If game is not over, get bot's move
-      if (!gameCopy.isGameOver()) {
-        getBotMove(gameCopy);
+      if (!game.isGameOver()) {
+        getBotMove(game.fen());
       }
 
       return true;
@@ -86,7 +86,7 @@ export default function ChessGame() {
     }
   };
 
-  const getBotMove = async (currentGame: Chess) => {
+  const getBotMove = async (currentFen: string) => {
     setIsThinking(true);
     setError('');
 
@@ -97,7 +97,7 @@ export default function ChessGame() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          fen: currentGame.fen(),
+          fen: currentFen,
         }),
       });
 
@@ -108,20 +108,24 @@ export default function ChessGame() {
       const data = await response.json();
       
       // Convert UCI move to SAN notation before applying
+      // Create a temporary Chess instance to get the SAN notation
+      const tempGame = new Chess(currentFen);
       const from = data.move.substring(0, 2);
       const to = data.move.substring(2, 4);
       const promotionPiece = data.move.length > 4 ? data.move.substring(4) as 'q' | 'r' | 'b' | 'n' : 'q';
-      const moveObj = currentGame.move({ from, to, promotion: promotionPiece });
+      const moveObj = tempGame.move({ from, to, promotion: promotionPiece });
       
       if (!moveObj) {
         throw new Error('Invalid bot move');
       }
       
-      // Apply bot's move using the returned FEN
-      const gameCopy = new Chess(data.fen);
-      setGame(gameCopy);
+      // Update state with the FEN from the API response
+      setFen(data.fen);
       setMoveHistory(prev => [...prev, moveObj.san]);
-      updateGameStatus(gameCopy);
+      
+      // Update game status with the new position
+      const newGame = new Chess(data.fen);
+      updateGameStatus(newGame);
     } catch (err) {
       setError('Failed to get bot move. Please try again.');
       console.error('Error getting bot move:', err);
@@ -131,26 +135,30 @@ export default function ChessGame() {
   };
 
   const startNewGame = async (color: 'w' | 'b') => {
-    const newGame = new Chess();
-    setGame(newGame);
+    const initialFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+    setFen(initialFen);
     setMoveHistory([]);
     setError('');
     setPlayerColor(color);
     setGameStarted(true);
+    
+    const newGame = new Chess(initialFen);
     updateGameStatus(newGame);
     
     // If bot plays white (player chose black), get bot's first move
     if (color === 'b') {
-      getBotMove(newGame);
+      getBotMove(initialFen);
     }
   };
 
   const resetToColorSelection = () => {
     setGameStarted(false);
-    setGame(new Chess());
+    const initialFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+    setFen(initialFen);
     setMoveHistory([]);
     setError('');
-    updateGameStatus(new Chess());
+    const newGame = new Chess(initialFen);
+    updateGameStatus(newGame);
   };
 
   const formatMoveHistory = (): MoveHistoryEntry[] => {
@@ -166,8 +174,9 @@ export default function ChessGame() {
   };
 
   useEffect(() => {
-    updateGameStatus(game);
-  }, []);
+    const chess = new Chess(fen);
+    updateGameStatus(chess);
+  }, [fen]);
 
   // Show color selection screen if game hasn't started
   if (!gameStarted) {
@@ -243,9 +252,10 @@ export default function ChessGame() {
             </div>
             <div className="w-full max-w-[600px] mx-auto">
               <Chessboard
-                position={game.fen()}
+                position={fen}
                 boardOrientation={playerColor === 'w' ? 'white' : 'black'}
                 onPieceDrop={(sourceSquare, targetSquare) => {
+                  const game = new Chess(fen);
                   if (game.isGameOver() || isThinking) {
                     return false;
                   }
@@ -312,9 +322,12 @@ export default function ChessGame() {
               <div className="flex justify-between">
                 <span className="text-gray-600">Turn:</span>
                 <span className="font-semibold">
-                  {game.turn() === playerColor 
-                    ? `${game.turn() === 'w' ? 'White' : 'Black'} (You)` 
-                    : `${game.turn() === 'w' ? 'White' : 'Black'} (Bot)`}
+                  {(() => {
+                    const game = new Chess(fen);
+                    return game.turn() === playerColor 
+                      ? `${game.turn() === 'w' ? 'White' : 'Black'} (You)` 
+                      : `${game.turn() === 'w' ? 'White' : 'Black'} (Bot)`;
+                  })()}
                 </span>
               </div>
               <div className="flex justify-between">
@@ -324,7 +337,10 @@ export default function ChessGame() {
               <div className="flex justify-between">
                 <span className="text-gray-600">Status:</span>
                 <span className="font-semibold">
-                  {game.isGameOver() ? 'Game Over' : 'In Progress'}
+                  {(() => {
+                    const game = new Chess(fen);
+                    return game.isGameOver() ? 'Game Over' : 'In Progress';
+                  })()}
                 </span>
               </div>
             </div>
