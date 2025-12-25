@@ -19,6 +19,8 @@ export default function ChessGame() {
   const [isThinking, setIsThinking] = useState(false);
   const [botType, setBotType] = useState<string>('Loading...');
   const [error, setError] = useState<string>('');
+  const [playerColor, setPlayerColor] = useState<'w' | 'b'>('w'); // 'w' for white, 'b' for black
+  const [gameStarted, setGameStarted] = useState(false);
 
   useEffect(() => {
     // Check API health on mount
@@ -51,6 +53,12 @@ export default function ChessGame() {
 
   const makeMove = (sourceSquare: string, targetSquare: string) => {
     const gameCopy = new Chess(game.fen());
+    
+    // Check if it's the player's turn
+    if (gameCopy.turn() !== playerColor) {
+      return false;
+    }
+    
     try {
       const move = gameCopy.move({
         from: sourceSquare,
@@ -118,15 +126,27 @@ export default function ChessGame() {
     }
   };
 
-  const startNewGame = async () => {
+  const startNewGame = async (color: 'w' | 'b') => {
     const newGame = new Chess();
     setGame(newGame);
     setMoveHistory([]);
     setError('');
+    setPlayerColor(color);
+    setGameStarted(true);
     updateGameStatus(newGame);
     
-    // If bot plays white, get its first move
-    // For this implementation, human always plays white
+    // If bot plays white (player chose black), get bot's first move
+    if (color === 'b') {
+      getBotMove(newGame);
+    }
+  };
+
+  const resetToColorSelection = () => {
+    setGameStarted(false);
+    setGame(new Chess());
+    setMoveHistory([]);
+    setError('');
+    updateGameStatus(new Chess());
   };
 
   const formatMoveHistory = (): MoveHistoryEntry[] => {
@@ -145,12 +165,56 @@ export default function ChessGame() {
     updateGameStatus(game);
   }, []);
 
+  // Show color selection screen if game hasn't started
+  if (!gameStarted) {
+    return (
+      <div className="w-full max-w-4xl mx-auto p-4">
+        <div className="mb-6 text-center">
+          <h1 className="text-4xl font-bold mb-2">ChessTransformer</h1>
+          <p className="text-gray-600">Human vs Bot Testing Interface</p>
+          <p className="text-sm text-gray-500 mt-2">Bot: {botType}</p>
+        </div>
+
+        {error && (
+          <div className="mb-4 p-4 bg-red-100 border border-red-400 text-red-700 rounded">
+            {error}
+          </div>
+        )}
+
+        <div className="bg-white rounded-lg shadow-lg p-8">
+          <h2 className="text-2xl font-semibold mb-6 text-center">Choose Your Color</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <button
+              onClick={() => startNewGame('w')}
+              className="flex flex-col items-center justify-center p-8 bg-white border-4 border-gray-300 rounded-lg hover:border-blue-500 hover:bg-blue-50 transition-all group"
+            >
+              <div className="text-6xl mb-4">♔</div>
+              <h3 className="text-xl font-semibold mb-2 group-hover:text-blue-600">Play as White</h3>
+              <p className="text-gray-600 text-sm">You move first</p>
+            </button>
+            <button
+              onClick={() => startNewGame('b')}
+              className="flex flex-col items-center justify-center p-8 bg-white border-4 border-gray-300 rounded-lg hover:border-blue-500 hover:bg-blue-50 transition-all group"
+            >
+              <div className="text-6xl mb-4">♚</div>
+              <h3 className="text-xl font-semibold mb-2 group-hover:text-blue-600">Play as Black</h3>
+              <p className="text-gray-600 text-sm">Bot moves first</p>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="w-full max-w-7xl mx-auto p-4">
       <div className="mb-6 text-center">
         <h1 className="text-4xl font-bold mb-2">ChessTransformer</h1>
         <p className="text-gray-600">Human vs Bot Testing Interface</p>
         <p className="text-sm text-gray-500 mt-2">Bot: {botType}</p>
+        <p className="text-sm text-gray-600 mt-1">
+          You are playing as {playerColor === 'w' ? 'White' : 'Black'}
+        </p>
       </div>
 
       {error && (
@@ -176,12 +240,9 @@ export default function ChessGame() {
             <div className="w-full max-w-[600px] mx-auto">
               <Chessboard
                 position={game.fen()}
+                boardOrientation={playerColor === 'w' ? 'white' : 'black'}
                 onPieceDrop={(sourceSquare, targetSquare) => {
                   if (game.isGameOver() || isThinking) {
-                    return false;
-                  }
-                  if (game.turn() === 'b') {
-                    // Don't allow moves when it's bot's turn
                     return false;
                   }
                   return makeMove(sourceSquare, targetSquare);
@@ -189,12 +250,18 @@ export default function ChessGame() {
                 boardWidth={Math.min(600, typeof window !== 'undefined' ? window.innerWidth - 40 : 600)}
               />
             </div>
-            <div className="mt-4">
+            <div className="mt-4 flex gap-3">
               <button
-                onClick={startNewGame}
-                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
+                onClick={() => startNewGame(playerColor)}
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
               >
-                New Game
+                New Game (Same Color)
+              </button>
+              <button
+                onClick={resetToColorSelection}
+                className="flex-1 bg-gray-600 hover:bg-gray-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
+              >
+                Change Color
               </button>
             </div>
           </div>
@@ -235,8 +302,16 @@ export default function ChessGame() {
             <h2 className="text-xl font-semibold mb-4">Game Info</h2>
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
+                <span className="text-gray-600">Your Color:</span>
+                <span className="font-semibold">{playerColor === 'w' ? 'White ♔' : 'Black ♚'}</span>
+              </div>
+              <div className="flex justify-between">
                 <span className="text-gray-600">Turn:</span>
-                <span className="font-semibold">{game.turn() === 'w' ? 'White (You)' : 'Black (Bot)'}</span>
+                <span className="font-semibold">
+                  {game.turn() === playerColor 
+                    ? `${game.turn() === 'w' ? 'White' : 'Black'} (You)` 
+                    : `${game.turn() === 'w' ? 'White' : 'Black'} (Bot)`}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-600">Moves:</span>
