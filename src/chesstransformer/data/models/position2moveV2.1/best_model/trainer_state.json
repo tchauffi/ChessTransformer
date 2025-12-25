@@ -1,0 +1,1 @@
+{"epoch": 10, "global_step": 260124, "best_val_loss": 1.5447294692993163, "scheduler_config": {"warmup_steps": 1000, "total_steps": 275310, "final_lr_ratio": 0.01}}

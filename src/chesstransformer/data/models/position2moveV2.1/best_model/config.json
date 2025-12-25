@@ -1,0 +1,14 @@
+{
+  "vocab_size": 13,
+  "move_vocab_size": 1968,
+  "embed_dim": 512,
+  "nb_transformer_layers": 8,
+  "num_heads": 8,
+  "num_kv_groups": 4,
+  "dropout": 0.1,
+  "kvq_bias": false,
+  "mask_future": false,
+  "rope": true,
+  "use_swiglu": true,
+  "use_col_row_emb": true
+}
