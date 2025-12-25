@@ -110,8 +110,8 @@ export default function ChessGame() {
       // Convert UCI move to SAN notation before applying
       const from = data.move.substring(0, 2);
       const to = data.move.substring(2, 4);
-      const promotion = data.move.length > 4 ? data.move.substring(4) : undefined;
-      const moveObj = currentGame.move({ from, to, promotion: promotion as any });
+      const promotionPiece = data.move.length > 4 ? data.move.substring(4) as 'q' | 'r' | 'b' | 'n' : 'q';
+      const moveObj = currentGame.move({ from, to, promotion: promotionPiece });
       
       if (!moveObj) {
         throw new Error('Invalid bot move');
