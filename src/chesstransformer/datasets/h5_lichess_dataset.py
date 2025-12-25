@@ -131,6 +131,27 @@ class HDF5ChessDataset(Dataset):
         # Get turn indicator
         is_white = board.turn  # True for white, False for black
         
+        # Get castling rights as a single integer (0-15)
+        # Bit 0: white kingside, Bit 1: white queenside, Bit 2: black kingside, Bit 3: black queenside
+        castling_rights = 0
+        if board.has_kingside_castling_rights(chess.WHITE):
+            castling_rights |= 1
+        if board.has_queenside_castling_rights(chess.WHITE):
+            castling_rights |= 2
+        if board.has_kingside_castling_rights(chess.BLACK):
+            castling_rights |= 4
+        if board.has_queenside_castling_rights(chess.BLACK):
+            castling_rights |= 8
+        
+        # Get en passant file (0-7 for a-h, 8 for none)
+        if board.has_legal_en_passant():
+            en_passant_file = chess.square_file(board.ep_square)
+        else:
+            en_passant_file = 8  # No en passant
+        
+        # Get halfmove clock (for 50-move rule)
+        halfmove_clock = board.halfmove_clock
+        
         # Get game metadata
         with h5py.File(self.hdf5_path, 'r') as f:
             white_elo = int(f['white_elo'][actual_game_idx])
@@ -141,6 +162,9 @@ class HDF5ChessDataset(Dataset):
             'position': position_tensor,
             'move': next_move_token,
             'is_white': is_white,
+            'castling_rights': castling_rights,
+            'en_passant_file': en_passant_file,
+            'halfmove_clock': halfmove_clock,
             'game_id': actual_game_idx,
             'move_number': move_idx,
             'white_elo': white_elo,
