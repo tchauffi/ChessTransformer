@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.10.1",
     "cairosvg>=2.8.2",
+    "fastapi>=0.115.0",
     "gradio>=5.49.0",
     "gradio-chessboard>=0.0.10",
     "h5py>=3.14.0",
@@ -20,6 +21,7 @@ dependencies = [
     "tokenizers>=0.22.1",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
+    "uvicorn>=0.32.0",
     "zstandard>=0.25.0",
 ]
 license = {text = "MIT"}

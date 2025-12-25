@@ -1,0 +1,72 @@
+# Virtual environments
+.venv
+venv
+env
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+
+# Build outputs
+dist
+build
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Documentation (keep README.md for hatchling)
+doc
+
+# Notebooks
+notebooks
+*.ipynb
+
+# Tests
+tests
+.pytest_cache
+.coverage
+htmlcov
+
+# Misc
+.DS_Store
+*.log
+
+# Large data files (keep tokenizer_models)
+data/*.h5
+data/*.zst
+data/*.csv
+data/models
+
+# Frontend (built separately)
+frontend
+front
+
+# Other logs (except model we need)
+logs/dpo_training
+logs/position2move
+logs/puzzle_training
+logs/rl_dpo
+logs/rl_grpo
+
+# Results and benchmarks
+results
+benchmark_results.json
+
+# Cache
+.mypy_cache
+.ruff_cache
+.mypy_cache
+.ruff_cache
