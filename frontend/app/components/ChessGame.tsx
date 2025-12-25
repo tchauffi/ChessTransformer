@@ -1,10 +1,10 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
-import { Chess } from 'chess.js';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Chess, Square } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 const INITIAL_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
 interface MoveHistoryEntry {
@@ -14,80 +14,142 @@ interface MoveHistoryEntry {
 }
 
 export default function ChessGame() {
-  const [fen, setFen] = useState(INITIAL_FEN);
+  const [game, setGame] = useState(new Chess());
   const [moveHistory, setMoveHistory] = useState<string[]>([]);
-  const [gameStatus, setGameStatus] = useState<string>('');
+  const [gameStatus, setGameStatus] = useState<string>('White to move');
   const [isThinking, setIsThinking] = useState(false);
   const [botType, setBotType] = useState<string>('Loading...');
   const [error, setError] = useState<string>('');
-  const [playerColor, setPlayerColor] = useState<'w' | 'b'>('w'); // 'w' for white, 'b' for black
+  const [playerColor, setPlayerColor] = useState<'w' | 'b'>('w');
   const [gameStarted, setGameStarted] = useState(false);
-  
-  // Memoize current game state to avoid recreating Chess instances during render
-  const currentGame = useMemo(() => new Chess(fen), [fen]);
+  const [selectedSquare, setSelectedSquare] = useState<Square | null>(null);
+  const [lastMove, setLastMove] = useState<{ from: Square; to: Square } | null>(null);
 
   useEffect(() => {
-    // Check API health on mount
     fetch(`${API_BASE_URL}/api/health`)
       .then(res => res.json())
-      .then(data => {
-        setBotType(data.bot_type);
-      })
+      .then(data => setBotType(data.bot_type))
       .catch(err => {
         setError('Failed to connect to the backend. Make sure the API server is running.');
         console.error('API health check failed:', err);
       });
   }, []);
 
-  const updateGameStatus = (chess: Chess) => {
+  const updateGameStatus = useCallback((chess: Chess) => {
     if (chess.isCheckmate()) {
       const winner = chess.turn() === 'w' ? 'Black' : 'White';
-      setGameStatus(`Checkmate! ${winner} wins!`);
+      setGameStatus(`🏆 Checkmate! ${winner} wins!`);
     } else if (chess.isDraw()) {
-      setGameStatus('Game drawn!');
+      setGameStatus('🤝 Game drawn!');
     } else if (chess.isStalemate()) {
-      setGameStatus('Stalemate!');
+      setGameStatus('🤝 Stalemate!');
     } else if (chess.isCheck()) {
-      setGameStatus('Check!');
+      setGameStatus('⚠️ Check!');
     } else {
       const turn = chess.turn() === 'w' ? 'White' : 'Black';
       setGameStatus(`${turn} to move`);
     }
-  };
+  }, []);
 
-  const makeMove = (sourceSquare: string, targetSquare: string) => {
-    const game = new Chess(fen);
+  // Calculate legal moves for selected piece
+  const legalMoves = useMemo(() => {
+    if (!selectedSquare) return [];
+    const moves = game.moves({ square: selectedSquare, verbose: true });
+    return moves.map(m => m.to);
+  }, [game, selectedSquare]);
+
+  // Generate square styles for highlighting
+  const squareStyles = useMemo(() => {
+    const styles: Record<string, React.CSSProperties> = {};
     
-    // Check if it's the player's turn
-    if (game.turn() !== playerColor) {
-      return false;
+    // Highlight selected square
+    if (selectedSquare) {
+      styles[selectedSquare] = {
+        backgroundColor: 'rgba(255, 255, 0, 0.5)',
+      };
     }
+    
+    // Highlight legal move squares
+    legalMoves.forEach(square => {
+      const piece = game.get(square as Square);
+      if (piece) {
+        // Capture move - red circle
+        styles[square] = {
+          background: 'radial-gradient(circle, transparent 60%, rgba(220, 38, 38, 0.5) 60%)',
+        };
+      } else {
+        // Regular move - darker green dot
+        styles[square] = {
+          background: 'radial-gradient(circle, rgba(34, 197, 94, 0.6) 25%, transparent 25%)',
+        };
+      }
+    });
+
+    // Highlight last move
+    if (lastMove) {
+      styles[lastMove.from] = {
+        ...styles[lastMove.from],
+        backgroundColor: 'rgba(250, 204, 21, 0.5)',
+      };
+      styles[lastMove.to] = {
+        ...styles[lastMove.to],
+        backgroundColor: 'rgba(250, 204, 21, 0.5)',
+      };
+    }
+    
+    return styles;
+  }, [selectedSquare, legalMoves, lastMove, game]);
+
+  const onDrop = (sourceSquare: Square, targetSquare: Square): boolean => {
+    if (game.turn() !== playerColor) return false;
     
     try {
       const move = game.move({
         from: sourceSquare,
         to: targetSquare,
-        promotion: 'q', // Always promote to queen for simplicity
+        promotion: 'q',
       });
 
-      if (move === null) {
-        return false;
-      }
+      if (move === null) return false;
 
-      setFen(game.fen());
+      const newGame = new Chess(game.fen());
+      setGame(newGame);
       setMoveHistory(prev => [...prev, move.san]);
-      updateGameStatus(game);
+      setLastMove({ from: sourceSquare, to: targetSquare });
+      setSelectedSquare(null);
+      updateGameStatus(newGame);
 
-      // If game is not over, get bot's move
-      if (!game.isGameOver()) {
-        getBotMove(game.fen());
+      if (!newGame.isGameOver()) {
+        getBotMove(newGame.fen());
       }
 
       return true;
-    } catch (error) {
-      console.error('Invalid move:', error);
+    } catch (err) {
+      console.error('Invalid move:', err);
       return false;
     }
+  };
+
+  const onSquareClick = (square: Square) => {
+    if (isThinking || game.isGameOver()) return;
+    if (game.turn() !== playerColor) return;
+
+    const piece = game.get(square);
+    
+    // If clicking on own piece, select it
+    if (piece && piece.color === playerColor) {
+      setSelectedSquare(square);
+      return;
+    }
+    
+    // If a piece is selected and clicking on a legal move square, make the move
+    if (selectedSquare && legalMoves.includes(square)) {
+      onDrop(selectedSquare, square);
+      return;
+    }
+    
+    // Otherwise deselect
+    setSelectedSquare(null);
   };
 
   const getBotMove = async (currentFen: string) => {
@@ -97,38 +159,25 @@ export default function ChessGame() {
     try {
       const response = await fetch(`${API_BASE_URL}/api/move`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          fen: currentFen,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fen: currentFen }),
       });
 
-      if (!response.ok) {
-        throw new Error('Failed to get bot move');
-      }
+      if (!response.ok) throw new Error('Failed to get bot move');
 
       const data = await response.json();
-      
-      // Convert UCI move to SAN notation before applying
-      // Create a temporary Chess instance to get the SAN notation
       const tempGame = new Chess(currentFen);
-      const from = data.move.substring(0, 2);
-      const to = data.move.substring(2, 4);
+      const from = data.move.substring(0, 2) as Square;
+      const to = data.move.substring(2, 4) as Square;
       const promotionPiece = data.move.length > 4 ? data.move.substring(4) as 'q' | 'r' | 'b' | 'n' : 'q';
       const moveObj = tempGame.move({ from, to, promotion: promotionPiece });
       
-      if (!moveObj) {
-        throw new Error('Invalid bot move');
-      }
+      if (!moveObj) throw new Error('Invalid bot move');
       
-      // Update state with the FEN from the API response
-      setFen(data.fen);
-      setMoveHistory(prev => [...prev, moveObj.san]);
-      
-      // Update game status with the new position
       const newGame = new Chess(data.fen);
+      setGame(newGame);
+      setMoveHistory(prev => [...prev, moveObj.san]);
+      setLastMove({ from, to });
       updateGameStatus(newGame);
     } catch (err) {
       setError('Failed to get bot move. Please try again.');
@@ -139,16 +188,16 @@ export default function ChessGame() {
   };
 
   const startNewGame = async (color: 'w' | 'b') => {
-    setFen(INITIAL_FEN);
+    const newGame = new Chess();
+    setGame(newGame);
     setMoveHistory([]);
     setError('');
     setPlayerColor(color);
     setGameStarted(true);
-    
-    const newGame = new Chess(INITIAL_FEN);
+    setSelectedSquare(null);
+    setLastMove(null);
     updateGameStatus(newGame);
     
-    // If bot plays white (player chose black), get bot's first move
     if (color === 'b') {
       getBotMove(INITIAL_FEN);
     }
@@ -156,10 +205,12 @@ export default function ChessGame() {
 
   const resetToColorSelection = () => {
     setGameStarted(false);
-    setFen(INITIAL_FEN);
+    const newGame = new Chess();
+    setGame(newGame);
     setMoveHistory([]);
     setError('');
-    const newGame = new Chess(INITIAL_FEN);
+    setSelectedSquare(null);
+    setLastMove(null);
     updateGameStatus(newGame);
   };
 
@@ -175,168 +226,289 @@ export default function ChessGame() {
     return formatted;
   };
 
-  useEffect(() => {
-    updateGameStatus(currentGame);
-  }, [currentGame]);
-
-  // Show color selection screen if game hasn't started
+  // Color selection screen
   if (!gameStarted) {
     return (
-      <div className="w-full max-w-4xl mx-auto p-4">
-        <div className="mb-6 text-center">
-          <h1 className="text-4xl font-bold mb-2">ChessTransformer</h1>
-          <p className="text-gray-600">Human vs Bot Testing Interface</p>
-          <p className="text-sm text-gray-500 mt-2">Bot: {botType}</p>
+      <div className="min-h-screen bg-gradient-to-br from-emerald-900 via-green-800 to-emerald-900 relative overflow-hidden">
+        {/* Decorative chess pattern background */}
+        <div className="absolute inset-0 opacity-5">
+          <div className="grid grid-cols-8 h-full">
+            {Array.from({ length: 64 }).map((_, i) => (
+              <div
+                key={i}
+                className={`aspect-square ${
+                  (Math.floor(i / 8) + i) % 2 === 0 ? 'bg-white' : 'bg-transparent'
+                }`}
+              />
+            ))}
+          </div>
         </div>
 
-        {error && (
-          <div className="mb-4 p-4 bg-red-100 border border-red-400 text-red-700 rounded">
-            {error}
+        <div className="relative z-10 min-h-screen flex flex-col items-center justify-center p-4 sm:p-6">
+          {/* Hero Section */}
+          <div className="text-center mb-8 sm:mb-12">
+            <div className="inline-flex items-center justify-center w-20 h-20 sm:w-24 sm:h-24 bg-white/10 backdrop-blur rounded-2xl mb-6 shadow-2xl border border-white/20">
+              <span className="text-5xl sm:text-6xl">♟️</span>
+            </div>
+            <h1 className="text-4xl sm:text-5xl md:text-6xl font-bold text-white mb-4 tracking-tight">
+              ChessTransformer
+            </h1>
+            <p className="text-emerald-200 text-lg sm:text-xl max-w-md mx-auto leading-relaxed">
+              Challenge an AI powered by transformer neural networks
+            </p>
+            
+            {/* Bot Status Badge */}
+            <div className="mt-6 inline-flex items-center gap-3 bg-black/20 backdrop-blur-sm px-5 py-2.5 rounded-full border border-white/10">
+              <span className="relative flex h-3 w-3">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+              </span>
+              <span className="text-emerald-100 font-medium">{botType}</span>
+            </div>
           </div>
-        )}
 
-        <div className="bg-white rounded-lg shadow-lg p-8">
-          <h2 className="text-2xl font-semibold mb-6 text-center">Choose Your Color</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <button
-              onClick={() => startNewGame('w')}
-              className="flex flex-col items-center justify-center p-8 bg-white border-4 border-gray-300 rounded-lg hover:border-blue-500 hover:bg-blue-50 transition-all group"
-            >
-              <div className="text-6xl mb-4">♔</div>
-              <h3 className="text-xl font-semibold mb-2 group-hover:text-blue-600">Play as White</h3>
-              <p className="text-gray-600 text-sm">You move first</p>
-            </button>
-            <button
-              onClick={() => startNewGame('b')}
-              className="flex flex-col items-center justify-center p-8 bg-white border-4 border-gray-300 rounded-lg hover:border-blue-500 hover:bg-blue-50 transition-all group"
-            >
-              <div className="text-6xl mb-4">♚</div>
-              <h3 className="text-xl font-semibold mb-2 group-hover:text-blue-600">Play as Black</h3>
-              <p className="text-gray-600 text-sm">Bot moves first</p>
-            </button>
+          {error && (
+            <div className="mb-8 p-4 bg-red-500/20 border border-red-400/50 text-red-100 rounded-xl backdrop-blur-sm max-w-md w-full text-center">
+              {error}
+            </div>
+          )}
+
+          {/* Color Selection Cards */}
+          <div className="w-full max-w-2xl">
+            <h2 className="text-xl sm:text-2xl font-semibold text-white mb-6 text-center">
+              Choose Your Side
+            </h2>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6 px-4">
+              {/* Play as White */}
+              <button
+                onClick={() => startNewGame('w')}
+                className="group relative bg-gradient-to-br from-white via-gray-50 to-gray-100 rounded-2xl p-6 sm:p-8 shadow-2xl hover:shadow-white/20 transition-all duration-300 hover:scale-[1.02] hover:-translate-y-1 border-4 border-transparent hover:border-yellow-400/50"
+              >
+                <div className="text-center">
+                  <div className="text-6xl sm:text-7xl mb-4 filter drop-shadow-lg transform group-hover:scale-110 transition-transform">
+                    ♔
+                  </div>
+                  <h3 className="text-xl sm:text-2xl font-bold text-gray-800 mb-2">Play White</h3>
+                  <p className="text-gray-500 text-sm sm:text-base">You make the first move</p>
+                </div>
+                <div className="absolute top-3 right-3 bg-yellow-400 text-yellow-900 text-xs font-bold px-2 py-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
+                  1st
+                </div>
+              </button>
+
+              {/* Play as Black */}
+              <button
+                onClick={() => startNewGame('b')}
+                className="group relative bg-gradient-to-br from-gray-800 via-gray-900 to-black rounded-2xl p-6 sm:p-8 shadow-2xl hover:shadow-emerald-500/20 transition-all duration-300 hover:scale-[1.02] hover:-translate-y-1 border-4 border-transparent hover:border-emerald-400/50"
+              >
+                <div className="text-center">
+                  <div className="text-6xl sm:text-7xl mb-4 filter drop-shadow-lg transform group-hover:scale-110 transition-transform">
+                    ♚
+                  </div>
+                  <h3 className="text-xl sm:text-2xl font-bold text-white mb-2">Play Black</h3>
+                  <p className="text-gray-400 text-sm sm:text-base">Bot makes the first move</p>
+                </div>
+                <div className="absolute top-3 right-3 bg-emerald-400 text-emerald-900 text-xs font-bold px-2 py-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
+                  2nd
+                </div>
+              </button>
+            </div>
           </div>
+
+          {/* Features */}
+          <div className="mt-12 flex flex-wrap justify-center gap-6 text-emerald-200/70 text-sm">
+            <div className="flex items-center gap-2">
+              <span>🧠</span>
+              <span>Transformer AI</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span>⚡</span>
+              <span>Real-time moves</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span>🎯</span>
+              <span>Legal move hints</span>
+            </div>
+          </div>
+
+          {/* Footer */}
+          <p className="mt-8 text-emerald-300/40 text-xs sm:text-sm text-center max-w-md">
+            Trained on millions of chess games from Lichess database
+          </p>
         </div>
       </div>
     );
   }
 
+  // Game screen
   return (
-    <div className="w-full max-w-7xl mx-auto p-4">
-      <div className="mb-6 text-center">
-        <h1 className="text-4xl font-bold mb-2">ChessTransformer</h1>
-        <p className="text-gray-600">Human vs Bot Testing Interface</p>
-        <p className="text-sm text-gray-500 mt-2">Bot: {botType}</p>
-        <p className="text-sm text-gray-600 mt-1">
-          You are playing as {playerColor === 'w' ? 'White' : 'Black'}
-        </p>
-      </div>
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+      <div className="max-w-7xl mx-auto p-3 sm:p-4 md:p-6">
+        {/* Header */}
+        <header className="text-center mb-4 sm:mb-6">
+          <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-white mb-1 sm:mb-2">
+            ♟️ ChessTransformer
+          </h1>
+          <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-4 text-xs sm:text-sm">
+            <span className="text-slate-400">Bot: <span className="text-emerald-400 font-medium">{botType}</span></span>
+            <span className="text-slate-600 hidden sm:inline">|</span>
+            <span className="text-slate-400">
+              Playing as <span className="font-medium text-white">{playerColor === 'w' ? '⬜ White' : '⬛ Black'}</span>
+            </span>
+          </div>
+        </header>
 
-      {error && (
-        <div className="mb-4 p-4 bg-red-100 border border-red-400 text-red-700 rounded">
-          {error}
-        </div>
-      )}
+        {error && (
+          <div className="mb-4 p-3 sm:p-4 bg-red-500/20 border border-red-500/50 text-red-200 rounded-xl max-w-xl mx-auto text-sm sm:text-base">
+            {error}
+          </div>
+        )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Chessboard */}
-        <div className="lg:col-span-2">
-          <div className="bg-white rounded-lg shadow-lg p-4">
-            <div className="mb-4 flex justify-between items-center">
-              <div className="text-lg font-semibold">
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr,300px] xl:grid-cols-[1fr,340px] gap-4 sm:gap-6">
+          {/* Board Section */}
+          <div className="bg-slate-800/50 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-4 md:p-6 border border-slate-700/50 shadow-2xl">
+            {/* Status Bar */}
+            <div className="flex items-center justify-between mb-3 sm:mb-4 px-1 sm:px-2">
+              <div className={`text-base sm:text-lg font-semibold ${
+                game.isGameOver() 
+                  ? 'text-yellow-400' 
+                  : game.isCheck() 
+                    ? 'text-red-400' 
+                    : 'text-white'
+              }`}>
                 {gameStatus}
               </div>
               {isThinking && (
-                <div className="text-blue-600 animate-pulse">
-                  Bot is thinking...
+                <div className="flex items-center gap-2 text-emerald-400">
+                  <div className="w-4 h-4 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin"></div>
+                  <span className="text-xs sm:text-sm">Thinking...</span>
                 </div>
               )}
             </div>
-            <div className="w-full max-w-[600px] mx-auto">
-              <Chessboard
-                position={fen}
-                boardOrientation={playerColor === 'w' ? 'white' : 'black'}
-                onPieceDrop={(sourceSquare, targetSquare) => {
-                  if (currentGame.isGameOver() || isThinking) {
-                    return false;
-                  }
-                  return makeMove(sourceSquare, targetSquare);
-                }}
-                boardWidth={Math.min(600, typeof window !== 'undefined' ? window.innerWidth - 40 : 600)}
-              />
+
+            {/* Chess Board - Responsive */}
+            <div className="w-full max-w-[min(100%,600px)] mx-auto">
+              <div className="relative w-full" style={{ paddingBottom: '100%' }}>
+                <div className="absolute inset-0">
+                  <Chessboard
+                    options={{
+                      id: "main-board",
+                      position: game.fen(),
+                      boardOrientation: playerColor === 'w' ? 'white' : 'black',
+                      allowDragging: !isThinking && !game.isGameOver() && game.turn() === playerColor,
+                      squareStyles: squareStyles,
+                      showNotation: true,
+                      animationDurationInMs: 200,
+                      darkSquareStyle: { backgroundColor: '#15803d' },
+                      lightSquareStyle: { backgroundColor: '#f0fdf4' },
+                      canDragPiece: ({ piece }) => {
+                        if (isThinking || game.isGameOver()) return false;
+                        if (game.turn() !== playerColor) return false;
+                        return piece.pieceType[0] === playerColor;
+                      },
+                      onPieceDrag: ({ square }) => {
+                        setSelectedSquare(square as Square);
+                      },
+                      onPieceDrop: ({ sourceSquare, targetSquare }) => {
+                        return onDrop(sourceSquare as Square, targetSquare as Square);
+                      },
+                      onSquareClick: ({ square }) => {
+                        onSquareClick(square as Square);
+                      },
+                    }}
+                  />
+                </div>
+              </div>
             </div>
-            <div className="mt-4 flex gap-3">
+
+            {/* Action Buttons */}
+            <div className="mt-4 sm:mt-6 flex gap-2 sm:gap-3">
               <button
                 onClick={() => startNewGame(playerColor)}
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
+                className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 sm:py-3 px-4 sm:px-6 rounded-lg sm:rounded-xl transition-all text-sm sm:text-base shadow-lg hover:shadow-emerald-500/25"
               >
-                New Game (Same Color)
+                🔄 New Game
               </button>
               <button
                 onClick={resetToColorSelection}
-                className="flex-1 bg-gray-600 hover:bg-gray-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
+                className="flex-1 bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2.5 sm:py-3 px-4 sm:px-6 rounded-lg sm:rounded-xl transition-all text-sm sm:text-base border border-slate-600"
               >
-                Change Color
+                🎨 Change Side
               </button>
             </div>
           </div>
-        </div>
 
-        {/* Move History */}
-        <div className="lg:col-span-1">
-          <div className="bg-white rounded-lg shadow-lg p-4">
-            <h2 className="text-xl font-semibold mb-4">Move History</h2>
-            <div className="max-h-[500px] overflow-y-auto">
-              {formatMoveHistory().length === 0 ? (
-                <p className="text-gray-500 text-center py-4">No moves yet</p>
-              ) : (
-                <table className="w-full text-sm">
-                  <thead className="border-b">
-                    <tr>
-                      <th className="text-left py-2 px-2">#</th>
-                      <th className="text-left py-2 px-2">White</th>
-                      <th className="text-left py-2 px-2">Black</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {formatMoveHistory().map((entry, idx) => (
-                      <tr key={idx} className="border-b hover:bg-gray-50">
-                        <td className="py-2 px-2 text-gray-600">{entry.moveNumber}</td>
-                        <td className="py-2 px-2 font-mono">{entry.white || ''}</td>
-                        <td className="py-2 px-2 font-mono">{entry.black || ''}</td>
+          {/* Side Panel */}
+          <div className="space-y-4">
+            {/* Move History */}
+            <div className="bg-slate-800/50 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-slate-700/50">
+              <h2 className="text-base sm:text-lg font-semibold text-white mb-3 flex items-center gap-2">
+                📜 Moves
+              </h2>
+              <div className="max-h-[200px] sm:max-h-[280px] overflow-y-auto">
+                {formatMoveHistory().length === 0 ? (
+                  <p className="text-slate-500 text-center py-4 text-sm">No moves yet</p>
+                ) : (
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-slate-400 border-b border-slate-700">
+                        <th className="text-left py-2 px-2 w-8">#</th>
+                        <th className="text-left py-2 px-2">White</th>
+                        <th className="text-left py-2 px-2">Black</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+                    </thead>
+                    <tbody>
+                      {formatMoveHistory().map((entry, idx) => (
+                        <tr key={idx} className="text-slate-200 border-b border-slate-700/50 hover:bg-slate-700/30">
+                          <td className="py-1.5 sm:py-2 px-2 text-slate-500">{entry.moveNumber}</td>
+                          <td className="py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm">{entry.white || ''}</td>
+                          <td className="py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm">{entry.black || ''}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
             </div>
-          </div>
 
-          {/* Game Info */}
-          <div className="bg-white rounded-lg shadow-lg p-4 mt-4">
-            <h2 className="text-xl font-semibold mb-4">Game Info</h2>
-            <div className="space-y-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-gray-600">Your Color:</span>
-                <span className="font-semibold">{playerColor === 'w' ? 'White ♔' : 'Black ♚'}</span>
+            {/* Game Info */}
+            <div className="bg-slate-800/50 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-slate-700/50">
+              <h2 className="text-base sm:text-lg font-semibold text-white mb-3">ℹ️ Info</h2>
+              <div className="space-y-2.5 text-sm">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Your Side</span>
+                  <span className="text-white font-medium">
+                    {playerColor === 'w' ? '⬜ White' : '⬛ Black'}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Turn</span>
+                  <span className={`font-medium ${game.turn() === playerColor ? 'text-emerald-400' : 'text-amber-400'}`}>
+                    {game.turn() === playerColor ? '👤 You' : '🤖 Bot'}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Moves</span>
+                  <span className="text-white font-medium">{moveHistory.length}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Status</span>
+                  <span className={`font-medium text-xs px-2 py-0.5 rounded-full ${
+                    game.isGameOver() 
+                      ? 'bg-amber-500/20 text-amber-300' 
+                      : 'bg-emerald-500/20 text-emerald-300'
+                  }`}>
+                    {game.isGameOver() ? 'Game Over' : 'Playing'}
+                  </span>
+                </div>
               </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Turn:</span>
-                <span className="font-semibold">
-                  {currentGame.turn() === playerColor 
-                    ? `${currentGame.turn() === 'w' ? 'White' : 'Black'} (You)` 
-                    : `${currentGame.turn() === 'w' ? 'White' : 'Black'} (Bot)`}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Moves:</span>
-                <span className="font-semibold">{moveHistory.length}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Status:</span>
-                <span className="font-semibold">
-                  {currentGame.isGameOver() ? 'Game Over' : 'In Progress'}
-                </span>
-              </div>
+            </div>
+
+            {/* Help Tip */}
+            <div className="bg-emerald-900/30 rounded-xl p-3 border border-emerald-700/30">
+              <p className="text-emerald-300/80 text-xs text-center">
+                💡 Drag pieces or click to see legal moves
+              </p>
             </div>
           </div>
         </div>
