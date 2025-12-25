@@ -71,7 +71,7 @@ export default function ChessGame() {
       }
 
       setGame(gameCopy);
-      setMoveHistory([...moveHistory, move.san]);
+      setMoveHistory(prev => [...prev, move.san]);
       updateGameStatus(gameCopy);
 
       // If game is not over, get bot's move
@@ -116,7 +116,7 @@ export default function ChessGame() {
       const to = data.move.substring(2, 4);
       const moveObj = currentGame.move({ from, to, promotion: 'q' });
       
-      setMoveHistory([...moveHistory, moveObj.san]);
+      setMoveHistory(prev => [...prev, moveObj.san]);
       updateGameStatus(gameCopy);
     } catch (err) {
       setError('Failed to get bot move. Please try again.');
