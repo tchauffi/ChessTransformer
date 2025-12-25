@@ -107,15 +107,19 @@ export default function ChessGame() {
 
       const data = await response.json();
       
-      // Apply bot's move
-      const gameCopy = new Chess(data.fen);
-      setGame(gameCopy);
-      
-      // Parse the move to SAN notation
+      // Convert UCI move to SAN notation before applying
       const from = data.move.substring(0, 2);
       const to = data.move.substring(2, 4);
-      const moveObj = currentGame.move({ from, to, promotion: 'q' });
+      const promotion = data.move.length > 4 ? data.move.substring(4) : undefined;
+      const moveObj = currentGame.move({ from, to, promotion: promotion as any });
       
+      if (!moveObj) {
+        throw new Error('Invalid bot move');
+      }
+      
+      // Apply bot's move using the returned FEN
+      const gameCopy = new Chess(data.fen);
+      setGame(gameCopy);
       setMoveHistory(prev => [...prev, moveObj.san]);
       updateGameStatus(gameCopy);
     } catch (err) {
