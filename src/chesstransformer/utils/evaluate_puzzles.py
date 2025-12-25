@@ -67,13 +67,29 @@ class PuzzleEvaluator:
         # Get predictions
         with torch.no_grad():
             logits = self.model(position_tensor, is_white)
-            probs = torch.softmax(logits, dim=-1)
+            
+            # Create legal moves mask
+            legal_moves = [m.uci() for m in board.legal_moves]
+            legal_move_indices = []
+            for move_uci in legal_moves:
+                try:
+                    idx = self.move_tokenizer.encode(move_uci)
+                    legal_move_indices.append(idx)
+                except ValueError:
+                    continue
+            
+            # Apply mask to logits (set illegal moves to -inf before softmax)
+            mask = torch.full_like(logits, float('-inf'))
+            if legal_move_indices:
+                mask[0, legal_move_indices] = 0
+                masked_logits = logits + mask
+            
+            probs = torch.softmax(masked_logits, dim=-1)
         
         # Get top-k predictions
         top_probs, top_indices = torch.topk(probs[0], k=top_k)
         
         predictions = []
-        legal_moves = [m.uci() for m in board.legal_moves]
         
         for prob, idx in zip(top_probs.cpu().numpy(), top_indices.cpu().numpy()):
             try:
