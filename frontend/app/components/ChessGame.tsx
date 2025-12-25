@@ -1,0 +1,257 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import { Chess } from 'chess.js';
+import { Chessboard } from 'react-chessboard';
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+
+interface MoveHistoryEntry {
+  moveNumber: number;
+  white?: string;
+  black?: string;
+}
+
+export default function ChessGame() {
+  const [game, setGame] = useState(new Chess());
+  const [moveHistory, setMoveHistory] = useState<string[]>([]);
+  const [gameStatus, setGameStatus] = useState<string>('');
+  const [isThinking, setIsThinking] = useState(false);
+  const [botType, setBotType] = useState<string>('Loading...');
+  const [error, setError] = useState<string>('');
+
+  useEffect(() => {
+    // Check API health on mount
+    fetch(`${API_BASE_URL}/api/health`)
+      .then(res => res.json())
+      .then(data => {
+        setBotType(data.bot_type);
+      })
+      .catch(err => {
+        setError('Failed to connect to the backend. Make sure the API server is running.');
+        console.error('API health check failed:', err);
+      });
+  }, []);
+
+  const updateGameStatus = (chess: Chess) => {
+    if (chess.isCheckmate()) {
+      const winner = chess.turn() === 'w' ? 'Black' : 'White';
+      setGameStatus(`Checkmate! ${winner} wins!`);
+    } else if (chess.isDraw()) {
+      setGameStatus('Game drawn!');
+    } else if (chess.isStalemate()) {
+      setGameStatus('Stalemate!');
+    } else if (chess.isCheck()) {
+      setGameStatus('Check!');
+    } else {
+      const turn = chess.turn() === 'w' ? 'White' : 'Black';
+      setGameStatus(`${turn} to move`);
+    }
+  };
+
+  const makeMove = (sourceSquare: string, targetSquare: string) => {
+    const gameCopy = new Chess(game.fen());
+    try {
+      const move = gameCopy.move({
+        from: sourceSquare,
+        to: targetSquare,
+        promotion: 'q', // Always promote to queen for simplicity
+      });
+
+      if (move === null) {
+        return false;
+      }
+
+      setGame(gameCopy);
+      setMoveHistory([...moveHistory, move.san]);
+      updateGameStatus(gameCopy);
+
+      // If game is not over, get bot's move
+      if (!gameCopy.isGameOver()) {
+        getBotMove(gameCopy);
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Invalid move:', error);
+      return false;
+    }
+  };
+
+  const getBotMove = async (currentGame: Chess) => {
+    setIsThinking(true);
+    setError('');
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/move`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fen: currentGame.fen(),
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to get bot move');
+      }
+
+      const data = await response.json();
+      
+      // Apply bot's move
+      const gameCopy = new Chess(data.fen);
+      setGame(gameCopy);
+      
+      // Parse the move to SAN notation
+      const from = data.move.substring(0, 2);
+      const to = data.move.substring(2, 4);
+      const moveObj = currentGame.move({ from, to, promotion: 'q' });
+      
+      setMoveHistory([...moveHistory, moveObj.san]);
+      updateGameStatus(gameCopy);
+    } catch (err) {
+      setError('Failed to get bot move. Please try again.');
+      console.error('Error getting bot move:', err);
+    } finally {
+      setIsThinking(false);
+    }
+  };
+
+  const startNewGame = async () => {
+    const newGame = new Chess();
+    setGame(newGame);
+    setMoveHistory([]);
+    setError('');
+    updateGameStatus(newGame);
+    
+    // If bot plays white, get its first move
+    // For this implementation, human always plays white
+  };
+
+  const formatMoveHistory = (): MoveHistoryEntry[] => {
+    const formatted: MoveHistoryEntry[] = [];
+    for (let i = 0; i < moveHistory.length; i += 2) {
+      formatted.push({
+        moveNumber: Math.floor(i / 2) + 1,
+        white: moveHistory[i],
+        black: moveHistory[i + 1],
+      });
+    }
+    return formatted;
+  };
+
+  useEffect(() => {
+    updateGameStatus(game);
+  }, []);
+
+  return (
+    <div className="w-full max-w-7xl mx-auto p-4">
+      <div className="mb-6 text-center">
+        <h1 className="text-4xl font-bold mb-2">ChessTransformer</h1>
+        <p className="text-gray-600">Human vs Bot Testing Interface</p>
+        <p className="text-sm text-gray-500 mt-2">Bot: {botType}</p>
+      </div>
+
+      {error && (
+        <div className="mb-4 p-4 bg-red-100 border border-red-400 text-red-700 rounded">
+          {error}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Chessboard */}
+        <div className="lg:col-span-2">
+          <div className="bg-white rounded-lg shadow-lg p-4">
+            <div className="mb-4 flex justify-between items-center">
+              <div className="text-lg font-semibold">
+                {gameStatus}
+              </div>
+              {isThinking && (
+                <div className="text-blue-600 animate-pulse">
+                  Bot is thinking...
+                </div>
+              )}
+            </div>
+            <div className="w-full max-w-[600px] mx-auto">
+              <Chessboard
+                position={game.fen()}
+                onPieceDrop={(sourceSquare, targetSquare) => {
+                  if (game.isGameOver() || isThinking) {
+                    return false;
+                  }
+                  if (game.turn() === 'b') {
+                    // Don't allow moves when it's bot's turn
+                    return false;
+                  }
+                  return makeMove(sourceSquare, targetSquare);
+                }}
+                boardWidth={Math.min(600, typeof window !== 'undefined' ? window.innerWidth - 40 : 600)}
+              />
+            </div>
+            <div className="mt-4">
+              <button
+                onClick={startNewGame}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
+              >
+                New Game
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Move History */}
+        <div className="lg:col-span-1">
+          <div className="bg-white rounded-lg shadow-lg p-4">
+            <h2 className="text-xl font-semibold mb-4">Move History</h2>
+            <div className="max-h-[500px] overflow-y-auto">
+              {formatMoveHistory().length === 0 ? (
+                <p className="text-gray-500 text-center py-4">No moves yet</p>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead className="border-b">
+                    <tr>
+                      <th className="text-left py-2 px-2">#</th>
+                      <th className="text-left py-2 px-2">White</th>
+                      <th className="text-left py-2 px-2">Black</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {formatMoveHistory().map((entry, idx) => (
+                      <tr key={idx} className="border-b hover:bg-gray-50">
+                        <td className="py-2 px-2 text-gray-600">{entry.moveNumber}</td>
+                        <td className="py-2 px-2 font-mono">{entry.white || ''}</td>
+                        <td className="py-2 px-2 font-mono">{entry.black || ''}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+
+          {/* Game Info */}
+          <div className="bg-white rounded-lg shadow-lg p-4 mt-4">
+            <h2 className="text-xl font-semibold mb-4">Game Info</h2>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-gray-600">Turn:</span>
+                <span className="font-semibold">{game.turn() === 'w' ? 'White (You)' : 'Black (Bot)'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">Moves:</span>
+                <span className="font-semibold">{moveHistory.length}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">Status:</span>
+                <span className="font-semibold">
+                  {game.isGameOver() ? 'Game Over' : 'In Progress'}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

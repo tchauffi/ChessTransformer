@@ -326,6 +326,7 @@ source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "cairosvg" },
+    { name = "fastapi" },
     { name = "gradio" },
     { name = "gradio-chessboard" },
     { name = "h5py" },
@@ -335,6 +336,7 @@ dependencies = [
     { name = "tokenizers" },
     { name = "torch" },
     { name = "torchvision" },
+    { name = "uvicorn" },
     { name = "zstandard" },
 ]
 
@@ -348,6 +350,7 @@ dev = [
 requires-dist = [
     { name = "accelerate", specifier = ">=1.10.1" },
     { name = "cairosvg", specifier = ">=2.8.2" },
+    { name = "fastapi", specifier = ">=0.115.0" },
     { name = "gradio", specifier = ">=5.49.0" },
     { name = "gradio-chessboard", specifier = ">=0.0.10" },
     { name = "h5py", specifier = ">=3.14.0" },
@@ -357,6 +360,7 @@ requires-dist = [
     { name = "tokenizers", specifier = ">=0.22.1" },
     { name = "torch", specifier = ">=2.8.0" },
     { name = "torchvision", specifier = ">=0.23.0" },
+    { name = "uvicorn", specifier = ">=0.32.0" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 

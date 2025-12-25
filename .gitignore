@@ -211,3 +211,11 @@ __marimo__/
 **.pgn.zst
 
 logs/
+
+# Node.js and Next.js
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
