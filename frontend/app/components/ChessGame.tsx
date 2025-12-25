@@ -176,9 +176,8 @@ export default function ChessGame() {
   };
 
   useEffect(() => {
-    const chess = new Chess(fen);
-    updateGameStatus(chess);
-  }, [fen]);
+    updateGameStatus(currentGame);
+  }, [currentGame]);
 
   // Show color selection screen if game hasn't started
   if (!gameStarted) {
