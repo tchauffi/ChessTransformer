@@ -156,7 +156,7 @@ class LegacyPosition2MoveBot:
     
     def __init__(
         self, 
-        model_path: str = str((data_folder / "models/V2_model/model.safetensors").resolve()), 
+        model_path: str = str((data_folder / "models/position2moveV2.0/model.safetensors").resolve()), 
         device: str = "cpu"
     ):
         self.device = device

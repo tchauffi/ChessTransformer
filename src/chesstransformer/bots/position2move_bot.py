@@ -9,7 +9,7 @@ from chesstransformer.models.tokenizer import PostionTokenizer, MoveTokenizer
 data_foler = Path(__file__).parents[1] / "data"
 
 class Position2MoveBot:
-    def __init__(self, model_path: str = str((data_foler / "models/V2_model/model.safetensors").resolve()), device: str = "cpu"):
+    def __init__(self, model_path: str = str((data_foler / "models/position2moveV2.1/best_model/model.safetensors").resolve()), device: str = "cpu"):
         self.device = device
         self.position_tokenizer = PostionTokenizer()
         self.move_tokenizer = MoveTokenizer()
