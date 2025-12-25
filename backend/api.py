@@ -182,4 +182,4 @@ async def validate_move(request: ValidateMoveRequest):
 if __name__ == '__main__':
     import uvicorn
     print(f"Starting ChessTransformer API server with {bot_type}")
-    uvicorn.run(app, host='0.0.0.0', port=5000)
+    uvicorn.run(app, host='0.0.0.0', port=5001)

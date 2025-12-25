@@ -37,7 +37,7 @@ uv sync --group dev
 
 A Next.js web application is available for testing the chess bot interactively. See [frontend/README.md](frontend/README.md) for detailed setup and usage instructions.
 
-**Quick Start:**
+**Quick Start (Development):**
 
 1. Start the backend API server:
 ```bash
@@ -54,15 +54,33 @@ npm run dev
 
 3. Open http://localhost:3000 in your browser and start playing!
 
+## Docker Deployment
+
+Deploy the entire application using Docker Compose:
+
+**Development mode:**
+```bash
+docker compose up --build
+```
+
+The application will be available at:
+- Development: Frontend at http://localhost:3000, API at http://localhost:5001
+- Production: Everything at http://localhost (port 80)
+
 ## Project structure
 The project is structured as follows:
 ```
 ChessTransformer/
 ├── backend/                # FastAPI backend server for bot integration
-│   └── api.py             # API endpoints for chess bot
+│   ├── api.py             # API endpoints for chess bot
+│   └── Dockerfile         # Backend container definition
 ├── frontend/               # Next.js web application
 │   ├── app/               # Next.js app directory
+│   ├── Dockerfile         # Frontend container definition
 │   └── README.md          # Frontend documentation
+├── docker-compose.yml      # Development Docker orchestration
+├── docker-compose.prod.yml # Production Docker with Nginx
+├── nginx.conf              # Nginx reverse proxy configuration
 ├── data/                   # Data processing scripts and datasets
 ├── doc/                    # Documentation files
 ├── src/                    # Source code
