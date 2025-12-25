@@ -1,10 +1,11 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Chess } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+const INITIAL_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
 interface MoveHistoryEntry {
   moveNumber: number;
@@ -13,7 +14,7 @@ interface MoveHistoryEntry {
 }
 
 export default function ChessGame() {
-  const [fen, setFen] = useState('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1');
+  const [fen, setFen] = useState(INITIAL_FEN);
   const [moveHistory, setMoveHistory] = useState<string[]>([]);
   const [gameStatus, setGameStatus] = useState<string>('');
   const [isThinking, setIsThinking] = useState(false);
@@ -21,6 +22,9 @@ export default function ChessGame() {
   const [error, setError] = useState<string>('');
   const [playerColor, setPlayerColor] = useState<'w' | 'b'>('w'); // 'w' for white, 'b' for black
   const [gameStarted, setGameStarted] = useState(false);
+  
+  // Memoize current game state to avoid recreating Chess instances during render
+  const currentGame = useMemo(() => new Chess(fen), [fen]);
 
   useEffect(() => {
     // Check API health on mount
@@ -135,29 +139,27 @@ export default function ChessGame() {
   };
 
   const startNewGame = async (color: 'w' | 'b') => {
-    const initialFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-    setFen(initialFen);
+    setFen(INITIAL_FEN);
     setMoveHistory([]);
     setError('');
     setPlayerColor(color);
     setGameStarted(true);
     
-    const newGame = new Chess(initialFen);
+    const newGame = new Chess(INITIAL_FEN);
     updateGameStatus(newGame);
     
     // If bot plays white (player chose black), get bot's first move
     if (color === 'b') {
-      getBotMove(initialFen);
+      getBotMove(INITIAL_FEN);
     }
   };
 
   const resetToColorSelection = () => {
     setGameStarted(false);
-    const initialFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-    setFen(initialFen);
+    setFen(INITIAL_FEN);
     setMoveHistory([]);
     setError('');
-    const newGame = new Chess(initialFen);
+    const newGame = new Chess(INITIAL_FEN);
     updateGameStatus(newGame);
   };
 
@@ -255,8 +257,7 @@ export default function ChessGame() {
                 position={fen}
                 boardOrientation={playerColor === 'w' ? 'white' : 'black'}
                 onPieceDrop={(sourceSquare, targetSquare) => {
-                  const game = new Chess(fen);
-                  if (game.isGameOver() || isThinking) {
+                  if (currentGame.isGameOver() || isThinking) {
                     return false;
                   }
                   return makeMove(sourceSquare, targetSquare);
@@ -322,12 +323,9 @@ export default function ChessGame() {
               <div className="flex justify-between">
                 <span className="text-gray-600">Turn:</span>
                 <span className="font-semibold">
-                  {(() => {
-                    const game = new Chess(fen);
-                    return game.turn() === playerColor 
-                      ? `${game.turn() === 'w' ? 'White' : 'Black'} (You)` 
-                      : `${game.turn() === 'w' ? 'White' : 'Black'} (Bot)`;
-                  })()}
+                  {currentGame.turn() === playerColor 
+                    ? `${currentGame.turn() === 'w' ? 'White' : 'Black'} (You)` 
+                    : `${currentGame.turn() === 'w' ? 'White' : 'Black'} (Bot)`}
                 </span>
               </div>
               <div className="flex justify-between">
@@ -337,10 +335,7 @@ export default function ChessGame() {
               <div className="flex justify-between">
                 <span className="text-gray-600">Status:</span>
                 <span className="font-semibold">
-                  {(() => {
-                    const game = new Chess(fen);
-                    return game.isGameOver() ? 'Game Over' : 'In Progress';
-                  })()}
+                  {currentGame.isGameOver() ? 'Game Over' : 'In Progress'}
                 </span>
               </div>
             </div>
