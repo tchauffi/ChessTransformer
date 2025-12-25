@@ -13,6 +13,57 @@ interface MoveHistoryEntry {
   black?: string;
 }
 
+// Piece values for material calculation
+const PIECE_VALUES: Record<string, number> = {
+  p: 1,
+  n: 3,
+  b: 3,
+  r: 5,
+  q: 9,
+};
+
+// Unicode pieces for display
+const PIECE_SYMBOLS: Record<string, { white: string; black: string }> = {
+  p: { white: '♙', black: '♟' },
+  n: { white: '♘', black: '♞' },
+  b: { white: '♗', black: '♝' },
+  r: { white: '♖', black: '♜' },
+  q: { white: '♕', black: '♛' },
+};
+
+// SVG piece images (chess.com neo theme)
+const PIECE_SVGS: Record<string, { white: string; black: string }> = {
+  p: { 
+    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wp.png',
+    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bp.png'
+  },
+  n: { 
+    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wn.png',
+    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bn.png'
+  },
+  b: { 
+    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wb.png',
+    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bb.png'
+  },
+  r: { 
+    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wr.png',
+    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/br.png'
+  },
+  q: { 
+    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wq.png',
+    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bq.png'
+  },
+};
+
+// Starting piece counts
+const STARTING_PIECES: Record<string, number> = {
+  p: 8,
+  n: 2,
+  b: 2,
+  r: 2,
+  q: 1,
+};
+
 export default function ChessGame() {
   const [game, setGame] = useState(new Chess());
   const [moveHistory, setMoveHistory] = useState<string[]>([]);
@@ -34,6 +85,62 @@ export default function ChessGame() {
         console.error('API health check failed:', err);
       });
   }, []);
+
+  // Calculate captured pieces for each side
+  const capturedPieces = useMemo(() => {
+    const board = game.board().flat();
+    
+    // Count current pieces on board
+    const whitePieces: Record<string, number> = { p: 0, n: 0, b: 0, r: 0, q: 0 };
+    const blackPieces: Record<string, number> = { p: 0, n: 0, b: 0, r: 0, q: 0 };
+    
+    board.forEach(square => {
+      if (square && square.type !== 'k') {
+        if (square.color === 'w') {
+          whitePieces[square.type]++;
+        } else {
+          blackPieces[square.type]++;
+        }
+      }
+    });
+    
+    // Calculate captured (starting - current)
+    const capturedByWhite: string[] = []; // Black pieces captured by white
+    const capturedByBlack: string[] = []; // White pieces captured by black
+    
+    let whiteMaterial = 0;
+    let blackMaterial = 0;
+    
+    Object.keys(STARTING_PIECES).forEach(piece => {
+      const blackCaptured = STARTING_PIECES[piece] - blackPieces[piece];
+      const whiteCaptured = STARTING_PIECES[piece] - whitePieces[piece];
+      
+      // White captured these black pieces
+      for (let i = 0; i < blackCaptured; i++) {
+        capturedByWhite.push(piece);
+        whiteMaterial += PIECE_VALUES[piece];
+      }
+      
+      // Black captured these white pieces
+      for (let i = 0; i < whiteCaptured; i++) {
+        capturedByBlack.push(piece);
+        blackMaterial += PIECE_VALUES[piece];
+      }
+    });
+    
+    // Sort by value (queen, rook, bishop, knight, pawn)
+    const pieceOrder = ['q', 'r', 'b', 'n', 'p'];
+    capturedByWhite.sort((a, b) => pieceOrder.indexOf(a) - pieceOrder.indexOf(b));
+    capturedByBlack.sort((a, b) => pieceOrder.indexOf(a) - pieceOrder.indexOf(b));
+    
+    return {
+      byWhite: capturedByWhite,
+      byBlack: capturedByBlack,
+      whiteMaterial,
+      blackMaterial,
+      advantage: whiteMaterial - blackMaterial,
+    };
+  }, [game]);
 
   const updateGameStatus = useCallback((chess: Chess) => {
     if (chess.isCheckmate()) {
@@ -420,6 +527,36 @@ export default function ChessGame() {
 
             {/* Chess Board - Responsive */}
             <div className="w-full max-w-[min(100%,600px)] mx-auto">
+              {/* Captured pieces - Opponent (top) */}
+              <div className="flex items-center justify-between mb-2 px-1 min-h-[36px] bg-slate-800/60 rounded-lg py-1.5">
+                <div className="flex items-center gap-0.5 flex-wrap px-2">
+                  {(playerColor === 'w' ? capturedPieces.byBlack : capturedPieces.byWhite).map((piece, idx) => (
+                    <img 
+                      key={`top-${piece}-${idx}`} 
+                      src={PIECE_SVGS[piece][playerColor === 'w' ? 'white' : 'black']}
+                      alt={piece}
+                      className="w-6 h-6 sm:w-7 sm:h-7 drop-shadow-md"
+                    />
+                  ))}
+                  {(playerColor === 'w' ? capturedPieces.byBlack : capturedPieces.byWhite).length === 0 && (
+                    <span className="text-slate-600 text-xs">No captures</span>
+                  )}
+                </div>
+                {capturedPieces.advantage !== 0 && (
+                  <span className={`text-xs sm:text-sm font-bold px-2 py-0.5 rounded mr-2 ${
+                    (playerColor === 'w' && capturedPieces.advantage < 0) || 
+                    (playerColor === 'b' && capturedPieces.advantage > 0)
+                      ? 'bg-emerald-500/30 text-emerald-300'
+                      : 'text-slate-600'
+                  }`}>
+                    {playerColor === 'w' 
+                      ? (capturedPieces.advantage < 0 ? `+${Math.abs(capturedPieces.advantage)}` : '')
+                      : (capturedPieces.advantage > 0 ? `+${capturedPieces.advantage}` : '')
+                    }
+                  </span>
+                )}
+              </div>
+              
               <div className="relative w-full" style={{ paddingBottom: '100%' }}>
                 <div className="absolute inset-0">
                   <Chessboard
@@ -450,6 +587,36 @@ export default function ChessGame() {
                     }}
                   />
                 </div>
+              </div>
+              
+              {/* Captured pieces - Player (bottom) */}
+              <div className="flex items-center justify-between mt-2 px-1 min-h-[36px] bg-slate-800/60 rounded-lg py-1.5">
+                <div className="flex items-center gap-0.5 flex-wrap px-2">
+                  {(playerColor === 'w' ? capturedPieces.byWhite : capturedPieces.byBlack).map((piece, idx) => (
+                    <img 
+                      key={`bottom-${piece}-${idx}`} 
+                      src={PIECE_SVGS[piece][playerColor === 'w' ? 'black' : 'white']}
+                      alt={piece}
+                      className="w-6 h-6 sm:w-7 sm:h-7 drop-shadow-md"
+                    />
+                  ))}
+                  {(playerColor === 'w' ? capturedPieces.byWhite : capturedPieces.byBlack).length === 0 && (
+                    <span className="text-slate-600 text-xs">No captures</span>
+                  )}
+                </div>
+                {capturedPieces.advantage !== 0 && (
+                  <span className={`text-xs sm:text-sm font-bold px-2 py-0.5 rounded mr-2 ${
+                    (playerColor === 'w' && capturedPieces.advantage > 0) || 
+                    (playerColor === 'b' && capturedPieces.advantage < 0)
+                      ? 'bg-emerald-500/30 text-emerald-300'
+                      : 'text-slate-600'
+                  }`}>
+                    {playerColor === 'w' 
+                      ? (capturedPieces.advantage > 0 ? `+${capturedPieces.advantage}` : '')
+                      : (capturedPieces.advantage < 0 ? `+${Math.abs(capturedPieces.advantage)}` : '')
+                    }
+                  </span>
+                )}
               </div>
             </div>
 
