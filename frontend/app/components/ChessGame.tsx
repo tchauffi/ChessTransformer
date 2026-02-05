@@ -75,6 +75,9 @@ export default function ChessGame() {
   const [gameStarted, setGameStarted] = useState(false);
   const [selectedSquare, setSelectedSquare] = useState<Square | null>(null);
   const [lastMove, setLastMove] = useState<{ from: Square; to: Square } | null>(null);
+  // Position history for move navigation
+  const [positionHistory, setPositionHistory] = useState<string[]>([INITIAL_FEN]);
+  const [viewingMoveIndex, setViewingMoveIndex] = useState<number>(0); // 0 = start position, then increments
 
   useEffect(() => {
     fetch(`${API_BASE_URL}/api/health`)
@@ -85,6 +88,41 @@ export default function ChessGame() {
         console.error('API health check failed:', err);
       });
   }, []);
+
+  // Keyboard navigation for moves
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!gameStarted) return;
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        goToPreviousMove();
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        goToNextMove();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        goToFirstMove();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        goToLastMove();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [gameStarted, viewingMoveIndex, positionHistory.length]);
+
+  // Navigation functions
+  const goToFirstMove = () => setViewingMoveIndex(0);
+  const goToPreviousMove = () => setViewingMoveIndex(prev => Math.max(0, prev - 1));
+  const goToNextMove = () => setViewingMoveIndex(prev => Math.min(positionHistory.length - 1, prev + 1));
+  const goToLastMove = () => setViewingMoveIndex(positionHistory.length - 1);
+  const goToMove = (index: number) => setViewingMoveIndex(index);
+
+  // Check if viewing current position
+  const isViewingCurrentPosition = viewingMoveIndex === positionHistory.length - 1;
+
+  // Get the position to display on the board
+  const displayedFen = positionHistory[viewingMoveIndex] || game.fen();
 
   // Calculate captured pieces for each side
   const capturedPieces = useMemo(() => {
@@ -209,6 +247,7 @@ export default function ChessGame() {
 
   const onDrop = (sourceSquare: Square, targetSquare: Square): boolean => {
     if (game.turn() !== playerColor) return false;
+    if (!isViewingCurrentPosition) return false; // Can't move if viewing history
     
     try {
       const move = game.move({
@@ -222,6 +261,8 @@ export default function ChessGame() {
       const newGame = new Chess(game.fen());
       setGame(newGame);
       setMoveHistory(prev => [...prev, move.san]);
+      setPositionHistory(prev => [...prev, newGame.fen()]);
+      setViewingMoveIndex(prev => prev + 1);
       setLastMove({ from: sourceSquare, to: targetSquare });
       setSelectedSquare(null);
       updateGameStatus(newGame);
@@ -240,6 +281,7 @@ export default function ChessGame() {
   const onSquareClick = (square: Square) => {
     if (isThinking || game.isGameOver()) return;
     if (game.turn() !== playerColor) return;
+    if (!isViewingCurrentPosition) return; // Can't interact if viewing history
 
     const piece = game.get(square);
     
@@ -284,6 +326,8 @@ export default function ChessGame() {
       const newGame = new Chess(data.fen);
       setGame(newGame);
       setMoveHistory(prev => [...prev, moveObj.san]);
+      setPositionHistory(prev => [...prev, newGame.fen()]);
+      setViewingMoveIndex(prev => prev + 1);
       setLastMove({ from, to });
       updateGameStatus(newGame);
     } catch (err) {
@@ -298,6 +342,8 @@ export default function ChessGame() {
     const newGame = new Chess();
     setGame(newGame);
     setMoveHistory([]);
+    setPositionHistory([INITIAL_FEN]);
+    setViewingMoveIndex(0);
     setError('');
     setPlayerColor(color);
     setGameStarted(true);
@@ -315,6 +361,8 @@ export default function ChessGame() {
     const newGame = new Chess();
     setGame(newGame);
     setMoveHistory([]);
+    setPositionHistory([INITIAL_FEN]);
+    setViewingMoveIndex(0);
     setError('');
     setSelectedSquare(null);
     setLastMove(null);
@@ -562,21 +610,22 @@ export default function ChessGame() {
                   <Chessboard
                     options={{
                       id: "main-board",
-                      position: game.fen(),
+                      position: displayedFen,
                       boardOrientation: playerColor === 'w' ? 'white' : 'black',
-                      allowDragging: !isThinking && !game.isGameOver() && game.turn() === playerColor,
-                      squareStyles: squareStyles,
+                      allowDragging: !isThinking && !game.isGameOver() && game.turn() === playerColor && isViewingCurrentPosition,
+                      squareStyles: isViewingCurrentPosition ? squareStyles : {},
                       showNotation: true,
                       animationDurationInMs: 200,
                       darkSquareStyle: { backgroundColor: '#15803d' },
                       lightSquareStyle: { backgroundColor: '#f0fdf4' },
                       canDragPiece: ({ piece }) => {
+                        if (!isViewingCurrentPosition) return false;
                         if (isThinking || game.isGameOver()) return false;
                         if (game.turn() !== playerColor) return false;
                         return piece.pieceType[0] === playerColor;
                       },
                       onPieceDrag: ({ square }) => {
-                        setSelectedSquare(square as Square);
+                        if (isViewingCurrentPosition) setSelectedSquare(square as Square);
                       },
                       onPieceDrop: ({ sourceSquare, targetSquare }) => {
                         return onDrop(sourceSquare as Square, targetSquare as Square);
@@ -587,6 +636,12 @@ export default function ChessGame() {
                     }}
                   />
                 </div>
+                {/* History viewing overlay */}
+                {!isViewingCurrentPosition && (
+                  <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-amber-500/90 text-black text-xs font-semibold px-3 py-1 rounded-full shadow-lg">
+                    Viewing move {viewingMoveIndex} of {positionHistory.length - 1}
+                  </div>
+                )}
               </div>
               
               {/* Captured pieces - Player (bottom) */}
@@ -618,6 +673,53 @@ export default function ChessGame() {
                   </span>
                 )}
               </div>
+            </div>
+
+            {/* Move Navigation */}
+            <div className="flex items-center justify-center gap-1 sm:gap-2 mt-3 bg-slate-800/60 rounded-lg py-2 px-2">
+              <button
+                onClick={goToFirstMove}
+                disabled={viewingMoveIndex === 0}
+                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                title="Go to start (↑)"
+              >
+                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+                </svg>
+              </button>
+              <button
+                onClick={goToPreviousMove}
+                disabled={viewingMoveIndex === 0}
+                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                title="Previous move (←)"
+              >
+                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                </svg>
+              </button>
+              <span className="text-slate-400 text-xs sm:text-sm px-2 sm:px-3 min-w-[60px] sm:min-w-[80px] text-center">
+                {viewingMoveIndex} / {positionHistory.length - 1}
+              </span>
+              <button
+                onClick={goToNextMove}
+                disabled={viewingMoveIndex === positionHistory.length - 1}
+                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                title="Next move (→)"
+              >
+                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+              <button
+                onClick={goToLastMove}
+                disabled={viewingMoveIndex === positionHistory.length - 1}
+                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                title="Go to current (↓)"
+              >
+                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+                </svg>
+              </button>
             </div>
 
             {/* Action Buttons */}
@@ -657,13 +759,31 @@ export default function ChessGame() {
                       </tr>
                     </thead>
                     <tbody>
-                      {formatMoveHistory().map((entry, idx) => (
-                        <tr key={idx} className="text-slate-200 border-b border-slate-700/50 hover:bg-slate-700/30">
-                          <td className="py-1.5 sm:py-2 px-2 text-slate-500">{entry.moveNumber}</td>
-                          <td className="py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm">{entry.white || ''}</td>
-                          <td className="py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm">{entry.black || ''}</td>
-                        </tr>
-                      ))}
+                      {formatMoveHistory().map((entry, idx) => {
+                        const whiteMoveIndex = idx * 2 + 1;
+                        const blackMoveIndex = idx * 2 + 2;
+                        return (
+                          <tr key={idx} className="text-slate-200 border-b border-slate-700/50">
+                            <td className="py-1.5 sm:py-2 px-2 text-slate-500">{entry.moveNumber}</td>
+                            <td 
+                              className={`py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm cursor-pointer hover:bg-slate-600/50 rounded transition-colors ${
+                                viewingMoveIndex === whiteMoveIndex ? 'bg-emerald-600/40 text-emerald-200' : ''
+                              }`}
+                              onClick={() => entry.white && goToMove(whiteMoveIndex)}
+                            >
+                              {entry.white || ''}
+                            </td>
+                            <td 
+                              className={`py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm cursor-pointer hover:bg-slate-600/50 rounded transition-colors ${
+                                viewingMoveIndex === blackMoveIndex ? 'bg-emerald-600/40 text-emerald-200' : ''
+                              }`}
+                              onClick={() => entry.black && goToMove(blackMoveIndex)}
+                            >
+                              {entry.black || ''}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 )}
@@ -706,7 +826,7 @@ export default function ChessGame() {
             {/* Help Tip */}
             <div className="bg-emerald-900/30 rounded-xl p-3 border border-emerald-700/30">
               <p className="text-emerald-300/80 text-xs text-center">
-                💡 Drag pieces or click to see legal moves
+                💡 Use arrow keys or buttons to navigate moves
               </p>
             </div>
           </div>
