@@ -332,6 +332,7 @@ dependencies = [
     { name = "h5py" },
     { name = "matplotlib" },
     { name = "python-chess" },
+    { name = "stockfish" },
     { name = "tensorboard" },
     { name = "tokenizers" },
     { name = "torch" },
@@ -356,6 +357,7 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.14.0" },
     { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "python-chess", specifier = ">=1.999" },
+    { name = "stockfish", specifier = ">=4.0.6" },
     { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "tokenizers", specifier = ">=0.22.1" },
     { name = "torch", specifier = ">=2.8.0" },
@@ -2080,6 +2082,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a7/a5/d6f429d43394057b67a6b5bbe6eae2f77a6bf7459d961fdb224bf206eee6/starlette-0.48.0.tar.gz", hash = "sha256:7e8cee469a8ab2352911528110ce9088fdc6a37d9876926e73da7ce4aa4c7a46", size = 2652949, upload-time = "2025-09-13T08:41:05.699Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/be/72/2db2f49247d0a18b4f1bb9a5a39a0162869acf235f3a96418363947b3d46/starlette-0.48.0-py3-none-any.whl", hash = "sha256:0764ca97b097582558ecb498132ed0c7d942f233f365b86ba37770e026510659", size = 73736, upload-time = "2025-09-13T08:41:03.869Z" },
+]
+
+[[package]]
+name = "stockfish"
+version = "4.0.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8d/9b/0f6760654e92246fad67832a2deac0f94ce91e145815929707b2629571b4/stockfish-4.0.6.tar.gz", hash = "sha256:d89493be588768d00e8f81dbb5be596a17fc3b06f701c793c65e6f642ccfa144", size = 31416, upload-time = "2026-01-23T06:35:36.489Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/86/cd/cee76429a598fda204d59c0e65c2f51bfa69365d6e7cc887c357d54762ce/stockfish-4.0.6-py3-none-any.whl", hash = "sha256:1ae0ef37d805bc4a195c96d017ed06963bc0e1f533c14e67f01b2f3cf49dd02b", size = 24432, upload-time = "2026-01-23T06:35:34.877Z" },
 ]
 
 [[package]]

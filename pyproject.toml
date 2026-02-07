@@ -17,6 +17,7 @@ dependencies = [
     "h5py>=3.14.0",
     "matplotlib>=3.10.6",
     "python-chess>=1.999",
+    "stockfish>=4.0.6",
     "tensorboard>=2.20.0",
     "tokenizers>=0.22.1",
     "torch>=2.8.0",
