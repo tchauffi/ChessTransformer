@@ -38,6 +38,31 @@ from chesstransformer.datasets.h5_lichess_dataset import HDF5ChessDataset
 from chesstransformer.models.transformer.position2move import Position2MoveModel
 
 
+def result_to_value_target(result, is_white):
+    """Convert game result to value target from the current player's perspective.
+    
+    Args:
+        result: Tensor of game outcomes (0=draw, 1=white win, 2=black win)
+        is_white: Tensor of booleans (True if current player is white)
+    
+    Returns:
+        Tensor of float values in [-1, 1]:
+            +1.0 = current player won
+             0.0 = draw
+            -1.0 = current player lost
+    """
+    # Map: 0 (draw) -> 0.0, 1 (white win) -> +1.0, 2 (black win) -> -1.0
+    value = torch.zeros_like(result, dtype=torch.float32)
+    value[result == 1] = 1.0   # white win
+    value[result == 2] = -1.0  # black win (= white loss)
+    
+    # Flip sign for black's perspective: black winning is +1 for black
+    is_black = ~is_white.bool()
+    value[is_black] = -value[is_black]
+    
+    return value
+
+
 def get_next_run_number(log_dir="logs"):
     """Get the next run number by checking existing run directories."""
     log_path = Path(log_dir)
@@ -61,14 +86,21 @@ def get_next_run_number(log_dir="logs"):
 
     return max(run_numbers) + 1 if run_numbers else 1
 
-def compute_loss(logits, moves, legal_moves_mask, beta, legal_move_loss_weight):
+def compute_loss(logits, moves, legal_moves_mask, beta, legal_move_loss_weight, value=None, value_target=None, value_loss_weight=0.0):
     llm_loss = F.cross_entropy(logits, moves)
     illegal_prob = F.softmax(logits, dim=-1) * (1. - legal_moves_mask.float())
     legal_move_loss = torch.sum(illegal_prob ** 2, dim=-1).mean()
     filtered_logits = torch.where(legal_moves_mask.bool(), logits, -torch.inf)
     legal_move_cross_entropy = F.cross_entropy(filtered_logits, moves)
-    loss = beta * llm_loss + legal_move_loss_weight * legal_move_loss + (1 - beta) * legal_move_cross_entropy
-    return loss, llm_loss, legal_move_loss, legal_move_cross_entropy
+    policy_loss = beta * llm_loss + legal_move_loss_weight * legal_move_loss + (1 - beta) * legal_move_cross_entropy
+    
+    # Value loss (MSE between predicted value and game outcome from current player's perspective)
+    v_loss = torch.tensor(0.0, device=logits.device)
+    if value is not None and value_target is not None and value_loss_weight > 0:
+        v_loss = F.mse_loss(value, value_target)
+    
+    loss = policy_loss + value_loss_weight * v_loss
+    return loss, llm_loss, legal_move_loss, legal_move_cross_entropy, v_loss
 
 def save_trainer_state(checkpoint_dir, epoch, global_step, best_val_loss, scheduler_config=None):
     state = {
@@ -117,7 +149,7 @@ def create_linear_warmup_decay_scheduler(optimizer, warmup_steps, total_steps, f
 
     return LambdaLR(optimizer, lr_lambda)
 
-def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_max=1e-2, num_steps=100, beta=0.7, legal_move_loss_weight=10.0):
+def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_max=1e-2, num_steps=100, beta=0.7, legal_move_loss_weight=10.0, use_value_head=False, value_loss_weight=0.0):
     model.train()
     device = accelerator.device
     initial_state = copy.deepcopy(model.state_dict())
@@ -145,9 +177,20 @@ def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_ma
         en_passant_file = batch["en_passant_file"].to(device)
         halfmove_clock = batch["halfmove_clock"].to(device)
 
-        logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
-        loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
-            logits, moves, legal_moves_mask, beta, legal_move_loss_weight
+        output = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
+        
+        value = None
+        value_target = None
+        if use_value_head:
+            logits, value = output
+            result = batch["result"].to(device)
+            value_target = result_to_value_target(result, is_white)
+        else:
+            logits = output
+
+        loss, llm_loss, legal_move_loss, legal_move_cross_entropy, v_loss = compute_loss(
+            logits, moves, legal_moves_mask, beta, legal_move_loss_weight,
+            value=value, value_target=value_target, value_loss_weight=value_loss_weight,
         )
 
         accelerator.backward(loss)
@@ -195,6 +238,11 @@ def main():
     parser.add_argument("--save-steps", type=int, default=5000, help="Save checkpoint every N steps")
     parser.add_argument("--max-checkpoints", type=int, default=5, help="Maximum number of step checkpoints to keep (excluding best model)")
     parser.add_argument("--precision", type=str, default="fp16", choices=["bf16", "fp16", "fp32"], help="Precision for training")
+    parser.add_argument("--use-value-head", action="store_true", help="Enable value head for position evaluation training")
+    parser.add_argument("--value-loss-weight", type=float, default=1.0, help="Weight for value head loss (default: 1.0)")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"], help="Optimizer: 'adamw' or 'muon' (Muon for 2D weights + AdamW for rest, requires PyTorch >=2.10)")
+    parser.add_argument("--lr-value-head", type=float, default=None, help="Learning rate for value head (default: 10x --lr when fine-tuning with value head, else same as --lr-head)")
+    parser.add_argument("--muon-momentum", type=float, default=0.95, help="Momentum for Muon optimizer (default: 0.95)")
     args = parser.parse_args()
 
     set_seed(args.random_seed)
@@ -237,6 +285,7 @@ def main():
         "rope": True,  # Use RoPE for positional encoding
         "use_swiglu": True,  # Use SwiGLU activation (Llama-style)
         "use_col_row_emb": True,  # Use separate column and row embeddings
+        "use_value_head": args.use_value_head,  # Enable value head for position evaluation
     }
 
     # Setup logging
@@ -263,6 +312,30 @@ def main():
 
     accelerator = accelerate.Accelerator(log_with="tensorboard", project_dir=str(log_path), mixed_precision=precision)
     
+    # Pre-compute discriminative learning rates (needed for tracker config below)
+    use_muon = args.optimizer == "muon"
+    lr_transformer = args.lr  # Muon LR for 2D weights, AdamW LR otherwise
+
+    # When using Muon, AdamW params (embeddings, norms, biases) need a much
+    # smaller LR.  Typical Muon LR ≈ 0.02, typical AdamW LR ≈ 3e-4.
+    # Auto-scale with a 0.015× ratio unless the user explicitly overrides.
+    _muon_adamw_ratio = 0.015  # 0.02 * 0.015 = 3e-4
+    if use_muon:
+        _adamw_default_lr = args.lr * _muon_adamw_ratio
+        lr_embedding = args.lr_embedding if args.lr_embedding is not None else _adamw_default_lr
+        lr_head = args.lr_head if args.lr_head is not None else _adamw_default_lr
+    else:
+        lr_embedding = args.lr_embedding if args.lr_embedding is not None else args.lr
+        lr_head = args.lr_head if args.lr_head is not None else args.lr
+
+    # Value head LR: use explicit flag, or 10x base LR when fine-tuning (value head is randomly initialised)
+    if args.lr_value_head is not None:
+        lr_value_head = args.lr_value_head
+    elif args.use_value_head and args.resume_from:
+        lr_value_head = (args.lr if use_muon else args.lr * 10)  # Muon already fast; don't 10× it
+    else:
+        lr_value_head = lr_head
+
     # Initialize trackers
     accelerator.init_trackers(
         project_name="position2move",
@@ -270,8 +343,8 @@ def main():
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "learning_rate": args.lr,
-            "lr_embedding": args.lr_embedding if args.lr_embedding is not None else args.lr,
-            "lr_head": args.lr_head if args.lr_head is not None else args.lr,
+            "lr_embedding": lr_embedding,
+            "lr_head": lr_head,
             "min_elo": args.min_elo,
             "max_elo": args.max_elo,
             "max_grad_norm": args.max_grad_norm,
@@ -279,6 +352,9 @@ def main():
             "warmup_steps": args.warmup_steps,
             "final_lr_ratio": args.final_lr_ratio,
             "precision": args.precision,
+            "value_loss_weight": args.value_loss_weight if args.use_value_head else 0.0,
+            "optimizer": args.optimizer,
+            "lr_value_head": lr_value_head if args.use_value_head else 0.0,
         }
     )
 
@@ -312,54 +388,193 @@ def main():
             num_steps=args.lr_steps,
             beta=args.beta,
             legal_move_loss_weight=args.legal_move_loss_weight,
+            use_value_head=args.use_value_head,
+            value_loss_weight=args.value_loss_weight if args.use_value_head else 0.0,
         )
         accelerator.log({"lr_finder/best_lr": best_lr, "lr_finder/best_loss": best_loss}, step=0)
         args.lr = best_lr
         if accelerator.is_main_process:
             print(f"Best LR found: {best_lr:.6g} (loss {best_loss:.4f})")
 
-    # Set up discriminative learning rates
-    lr_embedding = args.lr_embedding if args.lr_embedding is not None else args.lr
-    lr_head = args.lr_head if args.lr_head is not None else args.lr
-    lr_transformer = args.lr
-    
-    # Create parameter groups
-    embedding_params = []
-    transformer_params = []
-    head_params = []
-    
     # Get underlying model (unwrap from accelerator if needed)
     unwrapped_model = accelerator.unwrap_model(model)
     
-    # Categorize parameters
-    for name, param in unwrapped_model.named_parameters():
-        if 'embedding' in name:
-            embedding_params.append(param)
-        elif 'lm_head' in name:
-            head_params.append(param)
-        else:
-            transformer_params.append(param)
-    
-    param_groups = [
-        {'params': embedding_params, 'lr': lr_embedding, 'name': 'embeddings'},
-        {'params': transformer_params, 'lr': lr_transformer, 'name': 'transformers'},
-        {'params': head_params, 'lr': lr_head, 'name': 'head'},
-    ]
-    
-    if accelerator.is_main_process:
-        emb_count = sum(p.numel() for p in embedding_params)
-        trans_count = sum(p.numel() for p in transformer_params)
-        head_count = sum(p.numel() for p in head_params)
-        print(f"\nLearning rates:")
-        print(f"  Embeddings:   {lr_embedding:.6g}")
-        print(f"  Transformers: {lr_transformer:.6g}")
-        print(f"  Head:         {lr_head:.6g}")
-        print(f"  Param counts: Emb={emb_count:,}, Trans={trans_count:,}, Head={head_count:,}\n")
-    
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-    model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, test_loader
-    )
+    if use_muon:
+        from torch.optim import Muon
+        # Muon: 2D Linear weights → Muon optimizer
+        # Everything else (embeddings, norms, biases, cls_token, 1D params) → AdamW
+        muon_params = []          # 2D weight matrices for Muon
+        adamw_embedding_params = []  # embeddings → AdamW
+        adamw_head_params = []       # lm_head non-2D → AdamW
+        adamw_value_head_params = [] # value_head non-2D → AdamW (separate LR)
+        adamw_other_params = []      # norms, biases, cls_token → AdamW
+        muon_value_head_params = []  # value_head 2D weights → Muon (separate LR)
+        
+        for name, param in unwrapped_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_2d = param.ndim == 2
+            if 'value_head' in name:
+                if is_2d:
+                    muon_value_head_params.append(param)
+                else:
+                    adamw_value_head_params.append(param)
+            elif 'embedding' in name or 'cls_token' in name:
+                adamw_embedding_params.append(param)
+            elif 'lm_head' in name:
+                if is_2d:
+                    muon_params.append(param)
+                else:
+                    adamw_head_params.append(param)
+            elif is_2d:
+                muon_params.append(param)
+            else:
+                adamw_other_params.append(param)
+        
+        # AdamW for non-Muon params
+        _adamw_norms_lr = _adamw_default_lr  # norms/biases use scaled-down LR
+        adamw_groups = [
+            {'params': adamw_embedding_params, 'lr': lr_embedding, 'name': 'adamw_embeddings'},
+            {'params': adamw_other_params, 'lr': _adamw_norms_lr, 'name': 'adamw_norms_biases'},
+            {'params': adamw_head_params, 'lr': lr_head, 'name': 'adamw_head'},
+        ]
+        if adamw_value_head_params:
+            adamw_groups.append({'params': adamw_value_head_params, 'lr': lr_value_head, 'name': 'adamw_value_head'})
+        adamw_groups = [g for g in adamw_groups if g['params']]
+        
+        # Muon for 2D weight matrices
+        muon_groups = [
+            {'params': muon_params, 'lr': lr_transformer, 'name': 'muon_weights'},
+        ]
+        if muon_value_head_params:
+            muon_groups.append({'params': muon_value_head_params, 'lr': lr_value_head, 'name': 'muon_value_head'})
+        muon_groups = [g for g in muon_groups if g['params']]
+        
+        muon_optimizer = Muon(muon_groups, lr=lr_transformer, momentum=args.muon_momentum)
+        adamw_optimizer = torch.optim.AdamW(adamw_groups, lr=lr_transformer)
+        
+        class DualOptimizer:
+            """Wraps Muon + AdamW so the training loop can call a single optimizer."""
+            def __init__(self, muon_opt, adamw_opt):
+                self.muon = muon_opt
+                self.adamw = adamw_opt
+                # Expose param_groups for LR scheduler (union of both)
+                self.param_groups = muon_opt.param_groups + adamw_opt.param_groups
+            def zero_grad(self, set_to_none=True):
+                self.muon.zero_grad(set_to_none=set_to_none)
+                self.adamw.zero_grad(set_to_none=set_to_none)
+            def step(self, closure=None):
+                self.muon.step(closure)
+                self.adamw.step(closure)
+            def state_dict(self):
+                return {'muon': self.muon.state_dict(), 'adamw': self.adamw.state_dict()}
+            def load_state_dict(self, state_dict):
+                self.muon.load_state_dict(state_dict['muon'])
+                self.adamw.load_state_dict(state_dict['adamw'])
+
+        class DualScheduler:
+            """Wraps two LambdaLR schedulers for Muon + AdamW.
+            
+            get_last_lr() returns a semantically ordered list:
+              [emb_lr, transformer_lr, head_lr, (value_head_lr)]
+            so that logging indices [0],[1],[2] stay consistent with the
+            plain-AdamW path.
+            """
+            def __init__(self, muon_scheduler, adamw_scheduler):
+                self.muon_scheduler = muon_scheduler
+                self.adamw_scheduler = adamw_scheduler
+            def step(self):
+                self.muon_scheduler.step()
+                self.adamw_scheduler.step()
+            def get_last_lr(self):
+                # AdamW groups order: emb, norms/biases, head, (value_head)
+                # Muon groups order: weights, (value_head)
+                # Return semantic order: emb_lr, transformer_lr, head_lr, (value_head_lr)
+                adamw_lrs = self.adamw_scheduler.get_last_lr()
+                muon_lrs = self.muon_scheduler.get_last_lr()
+                # emb comes from adamw[0], transformer from muon[0], head from adamw[2]
+                result = [adamw_lrs[0], muon_lrs[0], adamw_lrs[2] if len(adamw_lrs) > 2 else adamw_lrs[-1]]
+                # If value head exists, average the muon and adamw value_head LRs
+                if len(muon_lrs) > 1:
+                    result.append(muon_lrs[1])
+                elif len(adamw_lrs) > 3:
+                    result.append(adamw_lrs[3])
+                return result
+            @property
+            def last_epoch(self):
+                return self.muon_scheduler.last_epoch
+            @last_epoch.setter
+            def last_epoch(self, value):
+                self.muon_scheduler.last_epoch = value
+                self.adamw_scheduler.last_epoch = value
+            def state_dict(self):
+                return {'muon': self.muon_scheduler.state_dict(), 'adamw': self.adamw_scheduler.state_dict()}
+            def load_state_dict(self, state_dict):
+                self.muon_scheduler.load_state_dict(state_dict['muon'])
+                self.adamw_scheduler.load_state_dict(state_dict['adamw'])
+        
+        optimizer = DualOptimizer(muon_optimizer, adamw_optimizer)
+        
+        if accelerator.is_main_process:
+            muon_count = sum(p.numel() for g in muon_groups for p in g['params'])
+            adamw_count = sum(p.numel() for g in adamw_groups for p in g['params'])
+            print(f"\nOptimizer: Muon + AdamW (hybrid)")
+            print(f"  Muon params (2D weights): {muon_count:,}")
+            print(f"  AdamW params (emb/norm/bias): {adamw_count:,}")
+            print(f"  Muon LR: {lr_transformer:.6g}, momentum: {args.muon_momentum}")
+            print(f"  AdamW LRs: emb={lr_embedding:.6g}, norms={_adamw_norms_lr:.6g}, head={lr_head:.6g}")
+            if args.use_value_head:
+                print(f"  Value head LR: {lr_value_head:.6g}")
+    else:
+        # Standard AdamW with discriminative learning rates
+        embedding_params = []
+        transformer_params = []
+        head_params = []
+        value_head_params = []
+        
+        for name, param in unwrapped_model.named_parameters():
+            if 'embedding' in name:
+                embedding_params.append(param)
+            elif 'value_head' in name:
+                value_head_params.append(param)
+            elif 'lm_head' in name:
+                head_params.append(param)
+            else:
+                transformer_params.append(param)
+        
+        param_groups = [
+            {'params': embedding_params, 'lr': lr_embedding, 'name': 'embeddings'},
+            {'params': transformer_params, 'lr': lr_transformer, 'name': 'transformers'},
+            {'params': head_params, 'lr': lr_head, 'name': 'head'},
+        ]
+        if value_head_params:
+            param_groups.append({'params': value_head_params, 'lr': lr_value_head, 'name': 'value_head'})
+        
+        if accelerator.is_main_process:
+            emb_count = sum(p.numel() for p in embedding_params)
+            trans_count = sum(p.numel() for p in transformer_params)
+            head_count = sum(p.numel() for p in head_params)
+            vh_count = sum(p.numel() for p in value_head_params)
+            print(f"\nOptimizer: AdamW")
+            print(f"  Embeddings:   {lr_embedding:.6g} ({emb_count:,} params)")
+            print(f"  Transformers: {lr_transformer:.6g} ({trans_count:,} params)")
+            print(f"  Head:         {lr_head:.6g} ({head_count:,} params)")
+            if vh_count:
+                print(f"  Value head:   {lr_value_head:.6g} ({vh_count:,} params)")
+        
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    if use_muon:
+        # Accelerate needs real Optimizer objects — prepare each separately
+        model, train_loader, val_loader, test_loader = accelerator.prepare(
+            model, train_loader, val_loader, test_loader
+        )
+        optimizer.muon = accelerator.prepare(optimizer.muon)
+        optimizer.adamw = accelerator.prepare(optimizer.adamw)
+        optimizer.param_groups = optimizer.muon.param_groups + optimizer.adamw.param_groups
+    else:
+        model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
+            model, optimizer, train_loader, val_loader, test_loader
+        )
     
     # Check if resuming to load scheduler config from checkpoint
     best_val_loss = float("inf")
@@ -399,30 +614,94 @@ def main():
         "final_lr_ratio": scheduler_final_lr_ratio,
     }
     
-    scheduler = create_linear_warmup_decay_scheduler(
-        optimizer,
-        warmup_steps=scheduler_warmup_steps,
-        total_steps=scheduler_total_steps,
-        final_lr_ratio=scheduler_final_lr_ratio,
-    )
-    
-    # Always register scheduler for checkpointing (required for load_state to work)
-    accelerator.register_for_checkpointing(scheduler)
+    if use_muon:
+        muon_scheduler = create_linear_warmup_decay_scheduler(
+            optimizer.muon,
+            warmup_steps=scheduler_warmup_steps,
+            total_steps=scheduler_total_steps,
+            final_lr_ratio=scheduler_final_lr_ratio,
+        )
+        adamw_scheduler = create_linear_warmup_decay_scheduler(
+            optimizer.adamw,
+            warmup_steps=scheduler_warmup_steps,
+            total_steps=scheduler_total_steps,
+            final_lr_ratio=scheduler_final_lr_ratio,
+        )
+        scheduler = DualScheduler(muon_scheduler, adamw_scheduler)
+        accelerator.register_for_checkpointing(muon_scheduler)
+        accelerator.register_for_checkpointing(adamw_scheduler)
+    else:
+        scheduler = create_linear_warmup_decay_scheduler(
+            optimizer,
+            warmup_steps=scheduler_warmup_steps,
+            total_steps=scheduler_total_steps,
+            final_lr_ratio=scheduler_final_lr_ratio,
+        )
+        # Always register scheduler for checkpointing (required for load_state to work)
+        accelerator.register_for_checkpointing(scheduler)
 
     # Load the full accelerator state (model, optimizer, scheduler) if resuming
     if resume_path:
-        accelerator.load_state(str(resume_path))
+        # When adding a value head to a checkpoint that was saved without one,
+        # accelerator.load_state() would fail on strict key matching.
+        # In that case, load only the model weights with strict=False so the
+        # new value_head parameters stay randomly initialised.
+        _needs_partial_load = False
+        if args.use_value_head:
+            # Peek at the saved model state to check for value_head keys
+            import glob, os
+            _sf_pattern = os.path.join(str(resume_path), "**", "*.safetensors")
+            _sf_files = glob.glob(_sf_pattern, recursive=True)
+            if _sf_files:
+                from safetensors.torch import load_file as _load_sf
+                _keys = list(_load_sf(_sf_files[0], device="cpu").keys())
+                _needs_partial_load = not any("value_head" in k for k in _keys)
+            else:
+                # Try .bin format
+                _bin_pattern = os.path.join(str(resume_path), "**", "*.bin")
+                _bin_files = glob.glob(_bin_pattern, recursive=True)
+                if _bin_files:
+                    _keys = list(torch.load(_bin_files[0], map_location="cpu", weights_only=True).keys())
+                    _needs_partial_load = not any("value_head" in k for k in _keys)
+
+        if _needs_partial_load:
+            # Load model weights only (strict=False), skip optimizer/scheduler
+            from safetensors.torch import load_file as _load_sf
+            _state = _load_sf(_sf_files[0], device="cpu")
+            _unwrapped = accelerator.unwrap_model(model)
+            missing, unexpected = _unwrapped.load_state_dict(_state, strict=False)
+            if accelerator.is_main_process:
+                print(f"Partial checkpoint load (value head is new):")
+                print(f"  Missing keys (randomly initialised): {missing}")
+                if unexpected:
+                    print(f"  Unexpected keys (ignored): {unexpected}")
+                print(f"  Optimizer and scheduler start fresh.")
+            # Reset resume state — we're not truly resuming, just warm-starting the backbone
+            start_epoch = 1
+            global_step = 0
+            best_val_loss = float("inf")
+        else:
+            accelerator.load_state(str(resume_path))
         
         # For old checkpoints without scheduler_config, the loaded scheduler state 
         # has a mismatched lr_lambda (old total_steps). We need to recreate it.
-        if not has_scheduler_config:
+        if not _needs_partial_load and not has_scheduler_config:
             # Recreate scheduler with correct parameters
-            scheduler = create_linear_warmup_decay_scheduler(
-                optimizer,
-                warmup_steps=scheduler_warmup_steps,
-                total_steps=scheduler_total_steps,
-                final_lr_ratio=scheduler_final_lr_ratio,
-            )
+            if use_muon:
+                muon_scheduler = create_linear_warmup_decay_scheduler(
+                    optimizer.muon, warmup_steps=scheduler_warmup_steps,
+                    total_steps=scheduler_total_steps, final_lr_ratio=scheduler_final_lr_ratio,
+                )
+                adamw_scheduler = create_linear_warmup_decay_scheduler(
+                    optimizer.adamw, warmup_steps=scheduler_warmup_steps,
+                    total_steps=scheduler_total_steps, final_lr_ratio=scheduler_final_lr_ratio,
+                )
+                scheduler = DualScheduler(muon_scheduler, adamw_scheduler)
+            else:
+                scheduler = create_linear_warmup_decay_scheduler(
+                    optimizer, warmup_steps=scheduler_warmup_steps,
+                    total_steps=scheduler_total_steps, final_lr_ratio=scheduler_final_lr_ratio,
+                )
             # Manually advance to the correct step
             scheduler.last_epoch = global_step - 1  # -1 because step() will increment it
             scheduler.step()  # This sets it to global_step and computes correct LR
@@ -442,6 +721,7 @@ def main():
         train_llm_loss = 0.0
         train_legal_move_loss = 0.0
         train_legal_move_ce = 0.0
+        train_value_loss = 0.0
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} - Training", leave=False)
         for batch in progress_bar:
@@ -454,16 +734,40 @@ def main():
             en_passant_file = batch['en_passant_file']
             halfmove_clock = batch['halfmove_clock']
 
-            logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
-            loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
-                logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight
+            output = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
+            
+            value = None
+            value_target = None
+            if args.use_value_head:
+                logits, value = output
+                result = batch['result']
+                value_target = result_to_value_target(result, is_white)
+            else:
+                logits = output
+
+            loss, llm_loss, legal_move_loss, legal_move_cross_entropy, v_loss = compute_loss(
+                logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight,
+                value=value, value_target=value_target,
+                value_loss_weight=args.value_loss_weight if args.use_value_head else 0.0,
             )
 
             accelerator.backward(loss)
             
-            # Gradient clipping
+            # Gradient clipping — skip Muon params (Newton-Schulz already normalises)
             if args.max_grad_norm > 0:
-                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                if use_muon:
+                    # Only clip AdamW parameters (embeddings, norms, biases)
+                    adamw_params = [p for g in optimizer.adamw.param_groups for p in g['params']]
+                    accelerator.clip_grad_norm_(adamw_params, args.max_grad_norm)
+                else:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            
+            # Compute gradient norms for monitoring (every 100 steps to avoid overhead)
+            if global_step % 100 == 0:
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                _grad_norm = total_norm.item()
+            else:
+                _grad_norm = None
             
             optimizer.step()
             scheduler.step()
@@ -473,13 +777,17 @@ def main():
             train_llm_loss += llm_loss.item() * batch_size
             train_legal_move_loss += legal_move_loss.item() * batch_size
             train_legal_move_ce += legal_move_cross_entropy.item() * batch_size
+            train_value_loss += v_loss.item() * batch_size
             
-            progress_bar.set_postfix({
+            postfix = {
                 "loss": loss.item(), 
                 "llm_loss": llm_loss.item(), 
                 "legal_move_loss": legal_move_loss.item(), 
-                "legal_move_ce": legal_move_cross_entropy.item()
-            })
+                "legal_move_ce": legal_move_cross_entropy.item(),
+            }
+            if args.use_value_head:
+                postfix["value_loss"] = v_loss.item()
+            progress_bar.set_postfix(postfix)
             
             # Log step-level metrics
             current_lrs = scheduler.get_last_lr()
@@ -492,6 +800,10 @@ def main():
                 "train/lr_transformers": current_lrs[1],
                 "train/lr_head": current_lrs[2],
             }
+            if args.use_value_head:
+                log_dict["train/step_value_loss"] = v_loss.item()
+            if _grad_norm is not None:
+                log_dict["train/grad_norm"] = _grad_norm
             accelerator.log(log_dict, step=global_step)
             
             global_step += 1
@@ -510,6 +822,7 @@ def main():
         train_llm_loss /= len(train_set)
         train_legal_move_loss /= len(train_set)
         train_legal_move_ce /= len(train_set)
+        train_value_loss /= len(train_set)
 
         # Validation phase
         model.eval()
@@ -517,6 +830,7 @@ def main():
         val_llm_loss = 0.0
         val_legal_move_loss = 0.0
         val_legal_move_ce = 0.0
+        val_value_loss = 0.0
         val_correct = 0
         val_total = 0
         
@@ -531,9 +845,21 @@ def main():
                 en_passant_file = batch['en_passant_file']
                 halfmove_clock = batch['halfmove_clock']
 
-                logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
-                loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
-                    logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight
+                output = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
+                
+                value = None
+                value_target = None
+                if args.use_value_head:
+                    logits, value = output
+                    result = batch['result']
+                    value_target = result_to_value_target(result, is_white)
+                else:
+                    logits = output
+
+                loss, llm_loss, legal_move_loss, legal_move_cross_entropy, v_loss = compute_loss(
+                    logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight,
+                    value=value, value_target=value_target,
+                    value_loss_weight=args.value_loss_weight if args.use_value_head else 0.0,
                 )
 
                 batch_size = positions.size(0)
@@ -541,6 +867,7 @@ def main():
                 val_llm_loss += llm_loss.item() * batch_size
                 val_legal_move_loss += legal_move_loss.item() * batch_size
                 val_legal_move_ce += legal_move_cross_entropy.item() * batch_size
+                val_value_loss += v_loss.item() * batch_size
                 
                 # Calculate accuracy
                 predictions = torch.argmax(logits, dim=-1)
@@ -553,10 +880,11 @@ def main():
         val_llm_loss /= len(val_set)
         val_legal_move_loss /= len(val_set)
         val_legal_move_ce /= len(val_set)
+        val_value_loss /= len(val_set)
         val_accuracy = val_correct / val_total if val_total > 0 else 0.0
 
         # Log epoch-level metrics
-        accelerator.log({
+        epoch_log = {
             "train/epoch_loss": train_loss,
             "train/epoch_llm_loss": train_llm_loss,
             "train/epoch_legal_move_loss": train_legal_move_loss,
@@ -570,10 +898,15 @@ def main():
             "train/lr_embeddings_epoch_end": scheduler.get_last_lr()[0],
             "train/lr_transformers_epoch_end": scheduler.get_last_lr()[1],
             "train/lr_head_epoch_end": scheduler.get_last_lr()[2],
-        }, step=global_step)
+        }
+        if args.use_value_head:
+            epoch_log["train/epoch_value_loss"] = train_value_loss
+            epoch_log["val/value_loss"] = val_value_loss
+        accelerator.log(epoch_log, step=global_step)
 
         print(f"\nEpoch {epoch}/{args.epochs}:")
-        print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Accuracy: {val_accuracy:.4f}")
+        value_info = f" | Val Value Loss: {val_value_loss:.4f}" if args.use_value_head else ""
+        print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Accuracy: {val_accuracy:.4f}{value_info}")
 
         # Save best model
         if val_loss < best_val_loss:
@@ -596,6 +929,7 @@ def main():
     test_loss = 0.0
     test_correct = 0
     test_total = 0
+    test_value_loss = 0.0
     
     with torch.no_grad():
         progress_bar = tqdm(test_loader, desc="Testing", leave=False)
@@ -608,13 +942,26 @@ def main():
             en_passant_file = batch['en_passant_file']
             halfmove_clock = batch['halfmove_clock']
 
-            logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
-            loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
-                logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight
+            output = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
+            
+            value = None
+            value_target = None
+            if args.use_value_head:
+                logits, value = output
+                result = batch['result']
+                value_target = result_to_value_target(result, is_white)
+            else:
+                logits = output
+
+            loss, llm_loss, legal_move_loss, legal_move_cross_entropy, v_loss = compute_loss(
+                logits, moves, legal_moves_mask, args.beta, args.legal_move_loss_weight,
+                value=value, value_target=value_target,
+                value_loss_weight=args.value_loss_weight if args.use_value_head else 0.0,
             )
 
             batch_size = positions.size(0)
             test_loss += loss.item() * batch_size
+            test_value_loss += v_loss.item() * batch_size
             
             predictions = torch.argmax(logits, dim=-1)
             test_correct += (predictions == moves).sum().item()
@@ -622,14 +969,19 @@ def main():
 
     test_loss /= len(test_set)
     test_accuracy = test_correct / test_total if test_total > 0 else 0.0
+    test_value_loss /= len(test_set)
 
-    accelerator.log({
+    test_log = {
         "test/loss": test_loss,
         "test/accuracy": test_accuracy,
-    }, step=global_step)
+    }
+    if args.use_value_head:
+        test_log["test/value_loss"] = test_value_loss
+    accelerator.log(test_log, step=global_step)
 
     print(f"\nTest Results:")
-    print(f"  Test Loss: {test_loss:.4f} | Test Accuracy: {test_accuracy:.4f}")
+    value_info = f" | Test Value Loss: {test_value_loss:.4f}" if args.use_value_head else ""
+    print(f"  Test Loss: {test_loss:.4f} | Test Accuracy: {test_accuracy:.4f}{value_info}")
 
     # End tracking
     accelerator.end_training()
