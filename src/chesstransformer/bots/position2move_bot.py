@@ -33,15 +33,64 @@ class Position2MoveBot:
 
         self.model.eval()
 
+    @property
+    def has_value_head(self) -> bool:
+        """Check if the loaded model has a value head."""
+        return getattr(self.model, 'use_value_head', False)
+
+    def _encode_board(self, board: chess.Board):
+        """Encode board state into model input tensors."""
+        tokens_ids = self.position_tokenizer.encode(board)
+        torch_input = torch.tensor(tokens_ids).unsqueeze(0).long().to(self.device)
+        is_white = torch.tensor([board.turn]).bool().to(self.device)
+
+        # Encode castling rights
+        castling_rights = 0
+        if board.has_kingside_castling_rights(chess.WHITE):
+            castling_rights |= 1
+        if board.has_queenside_castling_rights(chess.WHITE):
+            castling_rights |= 2
+        if board.has_kingside_castling_rights(chess.BLACK):
+            castling_rights |= 4
+        if board.has_queenside_castling_rights(chess.BLACK):
+            castling_rights |= 8
+        castling_tensor = torch.tensor([castling_rights]).long().to(self.device)
+
+        # Encode en passant
+        if board.has_legal_en_passant():
+            ep_file = chess.square_file(board.ep_square)
+        else:
+            ep_file = 8
+        ep_tensor = torch.tensor([ep_file]).long().to(self.device)
+
+        # Halfmove clock
+        halfmove_tensor = torch.tensor([board.halfmove_clock]).long().to(self.device)
+
+        return torch_input, is_white, castling_tensor, ep_tensor, halfmove_tensor
+
+    @torch.no_grad()
+    def value(self, board: chess.Board) -> float:
+        """Evaluate a position from the current player's perspective.
+        
+        Returns:
+            Float in [-1, 1]: +1 = current player winning, 0 = draw, -1 = losing.
+        
+        Raises:
+            RuntimeError: If the model was not loaded with a value head.
+        """
+        if not self.has_value_head:
+            raise RuntimeError("Model does not have a value head. Train with --use-value-head.")
+        
+        torch_input, is_white, castling, ep, halfmove = self._encode_board(board)
+        _, val = self.model(torch_input, is_white, castling, ep, halfmove)
+        return val.item()
+
     @torch.no_grad()
     def predict(self, board: chess.Board):
-        tokens_ids = self.position_tokenizer.encode(board)
-        torch_input = torch.tensor(tokens_ids).unsqueeze(0).long().to(self.device)  # Add batch dimension
+        torch_input, is_white, castling, ep, halfmove = self._encode_board(board)
 
-        is_white = board.turn
-        is_white = torch.tensor([is_white]).bool().to(self.device)  # Add batch dimension
-
-        logits = self.model(torch_input, is_white)
+        output = self.model(torch_input, is_white, castling, ep, halfmove)
+        logits = output[0] if self.has_value_head else output
 
         legal_moves = [m.uci() for m in board.legal_moves]
 
