@@ -71,7 +71,7 @@ class BotBenchmark:
         self.game_results: List[GameResult] = []
         self.bot_counter = 0  # Counter for unique bot IDs
     
-    def create_bot(self, bot_type: str, checkpoint_path: Optional[str] = None, bot_name: Optional[str] = None, **kwargs):
+    def create_bot(self, bot_type: str, checkpoint_path: Optional[str] = None, bot_name: Optional[str] = None, device: str = "cpu", **kwargs):
         """
         Factory method to create bots.
         
@@ -79,18 +79,19 @@ class BotBenchmark:
             bot_type: Type of bot ("position2move", "legacy_position2move", "random")
             checkpoint_path: Path to model checkpoint (for Position2MoveBot)
             bot_name: Optional custom name for the bot (for tracking multiple instances)
+            device: Device for model inference ("cpu", "cuda", "cuda:0", etc.)
             **kwargs: Additional bot-specific arguments
         """
         if bot_type.lower() == "position2move":
             if checkpoint_path:
-                bot = Position2MoveBot(model_path=checkpoint_path)
+                bot = Position2MoveBot(model_path=checkpoint_path, device=device)
             else:
-                bot = Position2MoveBot()
+                bot = Position2MoveBot(device=device)
         elif bot_type.lower() == "legacy_position2move":
             if checkpoint_path:
-                bot = LegacyPosition2MoveBot(model_path=checkpoint_path)
+                bot = LegacyPosition2MoveBot(model_path=checkpoint_path, device=device)
             else:
-                bot = LegacyPosition2MoveBot()
+                bot = LegacyPosition2MoveBot(device=device)
         elif bot_type.lower() == "random":
             bot = RandomBot()
         else:
