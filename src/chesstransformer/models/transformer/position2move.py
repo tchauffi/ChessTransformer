@@ -124,8 +124,11 @@ class Position2MoveModel(nn.Module):
             rope:bool=True,
             use_swiglu:bool=True,
             use_col_row_emb:bool=False,
+            use_value_head:bool=False,
     ):
         super().__init__()
+        self.use_value_head = use_value_head
+
         # Learnable CLS token for classification (instead of mean pooling)
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         
@@ -170,7 +173,20 @@ class Position2MoveModel(nn.Module):
         # Final RMSNorm
         self.norm = RMSNorm(embed_dim)
 
+        # Policy head (move prediction)
         self.lm_head = nn.Linear(embed_dim, move_vocab_size, bias=False)
+
+        # Value head (position evaluation: outputs scalar in [-1, 1])
+        # Predicts expected outcome from the current player's perspective:
+        #   +1 = current player wins, 0 = draw, -1 = current player loses
+        if use_value_head:
+            self.value_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.GELU(approximate="tanh"),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim // 2, 1),
+                nn.Tanh(),
+            )
 
         self._init_weights()
 
@@ -209,6 +225,14 @@ class Position2MoveModel(nn.Module):
 
         torch.nn.init.xavier_uniform_(self.lm_head.weight)
 
+        # Initialize value head if present
+        if self.use_value_head:
+            for module in self.value_head:
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        torch.nn.init.zeros_(module.bias)
+
     def _bucket_halfmove(self, halfmove: torch.Tensor) -> torch.Tensor:
         """Convert halfmove clock values to bucket indices.
         
@@ -239,8 +263,13 @@ class Position2MoveModel(nn.Module):
             halfmove_clock: Tensor of shape (batch_size,) with halfmove clock values (0-100+).
                             If None, defaults to 0.
         Returns:
-            logits: Tensor of shape (batch_size, move_vocab_size) containing
-                    the logits for the next move prediction at each position.
+            If use_value_head is False:
+                logits: Tensor of shape (batch_size, move_vocab_size)
+            If use_value_head is True:
+                tuple of:
+                    logits: Tensor of shape (batch_size, move_vocab_size)
+                    value: Tensor of shape (batch_size,) in range [-1, 1]
+                           representing expected outcome from current player's perspective.
         """
         batch_size, seq_len = x.size()
         assert seq_len == 64, "Input sequence length must be 64 (8x8 chess board)."
@@ -295,9 +324,14 @@ class Position2MoveModel(nn.Module):
         x = self.norm(x)  # (batch_size, 68, embed_dim)
         
         # Use CLS token output for classification (instead of mean pooling)
-        x = x[:, 0, :]  # (batch_size, embed_dim)
+        cls_output = x[:, 0, :]  # (batch_size, embed_dim)
 
-        logits = self.lm_head(x)  # (batch_size, move_vocab_size)
+        logits = self.lm_head(cls_output)  # (batch_size, move_vocab_size)
+
+        if self.use_value_head:
+            value = self.value_head(cls_output).squeeze(-1)  # (batch_size,)
+            return logits, value
+
         return logits
 
 if __name__ == "__main__":
@@ -312,10 +346,16 @@ if __name__ == "__main__":
     en_passant_file = torch.tensor([8, 4])  # First: no EP, Second: EP on file e (4)
     halfmove_clock = torch.tensor([0, 25])  # Halfmove counters
     
-    # Forward pass with all info
+    # Forward pass with all info (policy only)
     logits = model(dummy_input, is_white, castling_rights, en_passant_file, halfmove_clock)
     print("Output shape:", logits.shape)  # Should be (2, move_vocab_size)
     
     # Also works without game state (backward compatible)
     logits_simple = model(dummy_input, is_white)
     print("Output shape (simple):", logits_simple.shape)
+    
+    # With value head
+    model_vh = Position2MoveModel(use_value_head=True)
+    logits, value = model_vh(dummy_input, is_white, castling_rights, en_passant_file, halfmove_clock)
+    print(f"Policy shape: {logits.shape}, Value shape: {value.shape}")  # (2, move_vocab_size), (2,)
+    print(f"Value predictions: {value}")  # Should be in [-1, 1]
