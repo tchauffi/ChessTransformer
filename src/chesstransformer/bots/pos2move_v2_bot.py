@@ -156,7 +156,8 @@ class Pos2MoveV2Bot:
 
     @torch.no_grad()
     def _evaluate(self, board: chess.Board) -> tuple[np.ndarray, float]:
-        fen = board.board_fen() + (" w" if board.turn else " b")
+        ep = chess.square_name(board.ep_square) if board.ep_square else "-"
+        fen = f"{board.board_fen()} {'w' if board.turn else 'b'} {board.castling_xfen() or '-'} {ep}"
         cached = self._tt.get(fen)
         if cached is not None:
             self.tt_hits += 1
@@ -235,7 +236,8 @@ class Pos2MoveV2Bot:
         uncached = []
         for move in moves:
             board.push(move)
-            fen = board.board_fen() + (" w" if board.turn else " b")
+            ep = chess.square_name(board.ep_square) if board.ep_square else "-"
+        fen = f"{board.board_fen()} {'w' if board.turn else 'b'} {board.castling_xfen() or '-'} {ep}"
             if fen not in self._tt and not board.is_game_over(claim_draw=True):
                 pos, player, castling, ep = self._encode_position(board)
                 uncached.append((pos, player, castling, ep, fen))

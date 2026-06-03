@@ -119,11 +119,12 @@ async def get_bot_move(request: MoveRequest):
             raise HTTPException(status_code=400, detail="Game is already over")
 
         move_uci, probability = bot.predict(board)
-        board.push_uci(move_uci)
 
         value = None
         if hasattr(bot, 'get_value'):
             value = bot.get_value(board)
+
+        board.push_uci(move_uci)
 
         return MoveResponse(
             move=move_uci,
