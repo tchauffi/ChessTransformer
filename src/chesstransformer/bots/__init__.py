@@ -1,5 +1,4 @@
-from .position2move_bot import Position2MoveBot
-from .legacy_position2move_bot import LegacyPosition2MoveBot
+from .pos2move_v2_bot import Pos2MoveV2Bot
 from .random_bot import RandomBot
 
-__all__ = ["Position2MoveBot", "LegacyPosition2MoveBot", "RandomBot"]
+__all__ = ["Pos2MoveV2Bot", "RandomBot"]
