@@ -28,6 +28,9 @@ RUN uv sync --frozen --no-dev
 # Copy backend code
 COPY backend/ ./backend/
 
+# Copy default model weights
+COPY data/models/pos2move_v2/ ./data/models/pos2move_v2/
+
 # Expose port
 EXPOSE 5001
 

@@ -49,6 +49,7 @@ data/*.h5
 data/*.zst
 data/*.csv
 data/models
+!data/models/pos2move_v2
 
 # Frontend (built separately)
 frontend
