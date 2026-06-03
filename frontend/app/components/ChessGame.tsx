@@ -83,13 +83,22 @@ export default function ChessGame() {
   const [showEvalBar, setShowEvalBar] = useState<boolean>(true);
 
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/health`)
-      .then(res => res.json())
-      .then(data => setBotType(data.bot_type))
-      .catch(err => {
-        setError('Failed to connect to the backend. Make sure the API server is running.');
-        console.error('API health check failed:', err);
-      });
+    let cancelled = false;
+    const poll = (attempt: number) => {
+      fetch(`${API_BASE_URL}/api/health`)
+        .then(res => res.json())
+        .then(data => { if (!cancelled) setBotType(data.bot_type); })
+        .catch(() => {
+          if (cancelled) return;
+          if (attempt < 20) {
+            setTimeout(() => poll(attempt + 1), 2000);
+          } else {
+            setError('Failed to connect to the backend. Make sure the API server is running.');
+          }
+        });
+    };
+    poll(0);
+    return () => { cancelled = true; };
   }, []);
 
   // Keyboard navigation for moves
