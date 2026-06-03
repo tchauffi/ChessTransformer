@@ -8,11 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import chess
 import os
-import sys
-from pathlib import Path
-
-# Add src directory to path for imports
-sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from chesstransformer.bots import Pos2MoveV2Bot, RandomBot
 
