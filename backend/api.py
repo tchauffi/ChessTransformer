@@ -188,7 +188,7 @@ async def validate_move(request: ValidateMoveRequest):
                 )
             else:
                 return ValidateMoveResponse(valid=False, error="Illegal move")
-        except:
+        except ValueError:
             return ValidateMoveResponse(valid=False, error="Invalid move format")
 
     except Exception as e:
