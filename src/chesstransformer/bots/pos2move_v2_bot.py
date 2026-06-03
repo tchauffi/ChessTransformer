@@ -239,8 +239,8 @@ class Pos2MoveV2Bot:
             ep = chess.square_name(board.ep_square) if board.ep_square else "-"
             fen = f"{board.board_fen()} {'w' if board.turn else 'b'} {board.castling_xfen() or '-'} {ep}"
             if fen not in self._tt and not board.is_game_over(claim_draw=True):
-                pos, player, castling, ep = self._encode_position(board)
-                uncached.append((pos, player, castling, ep, fen))
+                pos, player, castling, ep_file = self._encode_position(board)
+                uncached.append((pos, player, castling, ep_file, fen))
             board.pop()
         if len(uncached) >= 2:
             self._batch_run(uncached)
