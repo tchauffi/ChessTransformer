@@ -369,9 +369,10 @@ export default function ChessGame() {
 
       // Update evaluation from the move response
       if (data.value != null) {
-        // value is from current player's perspective after the bot moved,
-        // convert to white's perspective for the bar
-        const whiteValue = newGame.turn() === 'w' ? data.value : -data.value;
+        // value was evaluated before the bot pushed its move (from the bot's perspective).
+        // After the bot moves, newGame.turn() is the *opponent*. So if turn is 'b',
+        // the bot played white and the value is already white's perspective.
+        const whiteValue = newGame.turn() === 'b' ? data.value : -data.value;
         setEvaluation(whiteValue);
       }
     } catch (err) {
@@ -629,12 +630,12 @@ export default function ChessGame() {
                     {playerColor === 'w' ? '⬛' : '⬜'}
                   </span>
                   <div className="relative w-full flex-1 rounded-sm overflow-hidden bg-slate-600 min-h-[200px]" style={{ aspectRatio: '1/16' }}>
-                    {/* White portion (bottom when playing white) */}
+                    {/* White portion: anchored at bottom when playing white, at top when playing black */}
                     <div
-                      className="absolute bottom-0 left-0 right-0 bg-white transition-all duration-500 ease-out"
+                      className={`absolute ${playerColor === 'w' ? 'bottom-0' : 'top-0'} left-0 right-0 bg-white transition-all duration-500 ease-out`}
                       style={{
                         height: evaluation != null
-                          ? `${((playerColor === 'w' ? evaluation : -evaluation) + 1) / 2 * 100}%`
+                          ? `${(evaluation + 1) / 2 * 100}%`
                           : '50%',
                       }}
                     />
@@ -642,7 +643,7 @@ export default function ChessGame() {
                     <div className="absolute inset-0 flex items-center justify-center">
                       <span
                         className={`text-[10px] sm:text-xs font-bold px-0.5 ${
-                          evaluation != null && (playerColor === 'w' ? evaluation : -evaluation) > 0
+                          evaluation != null && evaluation > 0
                             ? 'text-slate-800'
                             : 'text-slate-200'
                         }`}
