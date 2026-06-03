@@ -9,6 +9,9 @@ services:
       - "5001:5001"
     environment:
       - PYTHONUNBUFFERED=1
+      - MODEL_PATH=/app/model_run/checkpoints/best_model
+    volumes:
+      - ${MODEL_DIR:-./logs/pos2move_v3/run_003_20260416_093914}:/app/model_run:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/api/health')"]

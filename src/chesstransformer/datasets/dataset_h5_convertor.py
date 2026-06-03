@@ -11,9 +11,11 @@ from pathlib import Path
 
 _worker_tokenizer = None
 
+
 def _worker_init():
     global _worker_tokenizer
     _worker_tokenizer = MoveTokenizer()
+
 
 def _process_game_entry(entry):
     global _worker_tokenizer
@@ -28,14 +30,15 @@ def _process_game_entry(entry):
     token_array = np.array(tokens, dtype=np.int16)
     return token_array, entry["white_elo"], entry["black_elo"], entry["result"], len(tokens)
 
+
 class PGNtoHDF5Converter:
     def __init__(self, output_path: str, chunk_size: int = 10000, num_workers: int = None):
         """
         Convert PGN files to HDF5 format storing complete games as UCI move sequences.
-        
+
         This new approach stores games as tokenized move sequences instead of pre-computing
         all board positions, resulting in much more efficient storage.
-        
+
         Args:
             output_path: Path to save the HDF5 file
             chunk_size: Number of games to accumulate before writing (default: 10000)
@@ -45,19 +48,19 @@ class PGNtoHDF5Converter:
         default_workers = (cpu_count() or 1) - 1
         self.num_workers = max(1, num_workers if num_workers is not None else max(1, default_workers))
         self.move_tokenizer = MoveTokenizer()
-    
+
     def convert(self, input_path: str, max_games: int = None):
         """Convert PGN files to HDF5. Input can be a file or folder.
-        
+
         Args:
             input_path: Path to .pgn, .pgn.zst file, or folder containing PGN files
             max_games: Maximum games to process (optional)
         """
         path = Path(input_path)
-        
+
         if not path.exists():
             raise FileNotFoundError(f"Path not found: {input_path}")
-        
+
         if path.is_file():
             # Single file
             self._convert_single_file(path, max_games)
@@ -66,139 +69,139 @@ class PGNtoHDF5Converter:
             self._convert_folder(path, max_games)
         else:
             raise ValueError(f"Invalid input path: {input_path}")
-    
+
     def _convert_folder(self, folder_path: Path, max_games: int = None):
         """Convert all PGN files in a folder to HDF5."""
         # Find all PGN files (both .pgn and .pgn.zst)
-        pgn_files = sorted(list(folder_path.glob('*.pgn')) + list(folder_path.glob('*.pgn.zst')))
-        
+        pgn_files = sorted(list(folder_path.glob("*.pgn")) + list(folder_path.glob("*.pgn.zst")))
+
         if not pgn_files:
             raise ValueError(f"No PGN files found in {folder_path}")
-        
+
         print(f"Found {len(pgn_files)} PGN file(s) in {folder_path}")
         for f in pgn_files:
             print(f"  - {f.name}")
         print()
-        
+
         # Process all files
         total_games = 0
         for pgn_file in pgn_files:
             remaining_games = None if max_games is None else max(0, max_games - total_games)
             if remaining_games == 0:
                 break
-            
+
             print(f"\nProcessing: {pgn_file.name}")
             games_added = self._convert_single_file(pgn_file, remaining_games, append=total_games > 0)
             total_games += games_added
-            
+
             if max_games and total_games >= max_games:
                 print(f"\nReached maximum game limit ({max_games})")
                 break
-        
-        print(f"\n{'='*60}")
+
+        print(f"\n{'=' * 60}")
         print(f"All files processed! Total games: {total_games}")
         print(f"Output: {self.output_path}")
-    
+
     def _convert_single_file(self, pgn_path: Path, max_games: int = None, append: bool = False):
         """Convert a single PGN file to HDF5.
-        
+
         Args:
             pgn_path: Path to .pgn or .pgn.zst file
             max_games: Maximum games to process from this file
             append: Whether to append to existing HDF5 file
-            
+
         Returns:
             Number of games added
         """
-        if pgn_path.suffix == '.zst' or pgn_path.name.endswith('.pgn.zst'):
+        if pgn_path.suffix == ".zst" or pgn_path.name.endswith(".pgn.zst"):
             return self._convert_compressed_file(str(pgn_path), max_games, append)
         else:
             return self._convert_uncompressed_file(str(pgn_path), max_games, append)
-        
+
     def convert_pgn_zst(self, pgn_path: str, max_games: int = None):
         """Deprecated: Use convert() instead. Convert a .pgn.zst file to HDF5 format."""
         return self._convert_compressed_file(pgn_path, max_games, append=False)
-    
+
     def _convert_compressed_file(self, pgn_path: str, max_games: int = None, append: bool = False):
         """Convert a .pgn.zst file to HDF5 format storing game sequences."""
-        
+
         # Temporary storage for batching
         games_batch = []
         white_elo_batch = []
         black_elo_batch = []
         result_batch = []
         num_moves_batch = []
-        
+
         game_count = 0
         total_positions = 0
-        
-        with open(pgn_path, 'rb') as compressed_file:
+
+        with open(pgn_path, "rb") as compressed_file:
             dctx = zstd.ZstdDecompressor()
             with dctx.stream_reader(compressed_file) as reader:
-                text_stream = io.TextIOWrapper(reader, encoding='utf-8')
-                
-                mode = 'a' if append else 'w'
+                text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+
+                mode = "a" if append else "w"
                 with h5py.File(self.output_path, mode) as hdf5_file:
                     # Create or get datasets
-                    if append and 'moves' in hdf5_file:
+                    if append and "moves" in hdf5_file:
                         # Datasets already exist, just reference them
                         pass
                     else:
                         # Create variable-length dataset for move sequences
-                        dt = h5py.vlen_dtype(np.dtype('int16'))
+                        dt = h5py.vlen_dtype(np.dtype("int16"))
                         moves_ds = hdf5_file.create_dataset(
-                        'moves',
-                        shape=(0,),
-                        maxshape=(None,),
-                        dtype=dt,
-                        compression='gzip',
-                        compression_opts=4,
-                        chunks=(self.chunk_size,)
-                    )
-                    
+                            "moves",
+                            shape=(0,),
+                            maxshape=(None,),
+                            dtype=dt,
+                            compression="gzip",
+                            compression_opts=4,
+                            chunks=(self.chunk_size,),
+                        )
+
                     # Create datasets for ELO ratings
                     white_elo_ds = hdf5_file.create_dataset(
-                        'white_elo',
+                        "white_elo",
                         shape=(0,),
                         maxshape=(None,),
-                        dtype='int16',
-                        compression='gzip',
+                        dtype="int16",
+                        compression="gzip",
                         compression_opts=4,
-                        chunks=(self.chunk_size,)
+                        chunks=(self.chunk_size,),
                     )
-                    
+
                     black_elo_ds = hdf5_file.create_dataset(
-                        'black_elo',
+                        "black_elo",
                         shape=(0,),
                         maxshape=(None,),
-                        dtype='int16',
-                        compression='gzip',
+                        dtype="int16",
+                        compression="gzip",
                         compression_opts=4,
-                        chunks=(self.chunk_size,)
+                        chunks=(self.chunk_size,),
                     )
-                    
+
                     # Create dataset for game results (0=draw, 1=white win, 2=black win)
                     result_ds = hdf5_file.create_dataset(
-                        'result',
+                        "result",
                         shape=(0,),
                         maxshape=(None,),
-                        dtype='int8',
-                        compression='gzip',
+                        dtype="int8",
+                        compression="gzip",
                         compression_opts=4,
-                        chunks=(self.chunk_size,)
+                        chunks=(self.chunk_size,),
                     )
-                    
+
                     # Create dataset for number of moves per game (for quick lookup)
                     num_moves_ds = hdf5_file.create_dataset(
-                        'num_moves',
+                        "num_moves",
                         shape=(0,),
                         maxshape=(None,),
-                        dtype='int16',
-                        compression='gzip',
+                        dtype="int16",
+                        compression="gzip",
                         compression_opts=4,
-                        chunks=(self.chunk_size,)
+                        chunks=(self.chunk_size,),
                     )
-                    
+
                     pbar = tqdm(desc="Processing games", unit="games")
                     use_parallel = self.num_workers > 1
                     pool = Pool(processes=self.num_workers, initializer=_worker_init) if use_parallel else None
@@ -239,9 +242,15 @@ class PGNtoHDF5Converter:
                                         white_elo_batch,
                                         black_elo_batch,
                                         result_batch,
-                                        num_moves_batch
+                                        num_moves_batch,
                                     )
-                                    games_batch, white_elo_batch, black_elo_batch, result_batch, num_moves_batch = [], [], [], [], []
+                                    games_batch, white_elo_batch, black_elo_batch, result_batch, num_moves_batch = (
+                                        [],
+                                        [],
+                                        [],
+                                        [],
+                                        [],
+                                    )
                                 if max_games and game_count >= max_games:
                                     reached_limit = True
                         if use_parallel and pending_entries and not (max_games and game_count >= max_games):
@@ -250,48 +259,43 @@ class PGNtoHDF5Converter:
                             )
                         if not use_parallel and games_batch:
                             self._write_batch(
-                                hdf5_file,
-                                games_batch,
-                                white_elo_batch,
-                                black_elo_batch,
-                                result_batch,
-                                num_moves_batch
+                                hdf5_file, games_batch, white_elo_batch, black_elo_batch, result_batch, num_moves_batch
                             )
                     finally:
                         if pool is not None:
                             pool.close()
                             pool.join()
                     pbar.close()
-        
+
         print(f"File conversion complete!")
         print(f"Games from this file: {game_count}")
         print(f"Positions from this file: {total_positions}")
         average_moves = (total_positions / game_count) if game_count else 0.0
         print(f"Average moves per game: {average_moves:.1f}")
         return game_count
-    
+
     def _write_batch(self, hdf5_file, games, white_elos, black_elos, results, num_moves):
         """Write a batch of games to HDF5 file."""
         batch_size = len(games)
-        
+
         # Resize datasets
-        old_size = hdf5_file['moves'].shape[0]
+        old_size = hdf5_file["moves"].shape[0]
         new_size = old_size + batch_size
-        
-        hdf5_file['moves'].resize((new_size,))
-        hdf5_file['white_elo'].resize((new_size,))
-        hdf5_file['black_elo'].resize((new_size,))
-        hdf5_file['result'].resize((new_size,))
-        hdf5_file['num_moves'].resize((new_size,))
-        
+
+        hdf5_file["moves"].resize((new_size,))
+        hdf5_file["white_elo"].resize((new_size,))
+        hdf5_file["black_elo"].resize((new_size,))
+        hdf5_file["result"].resize((new_size,))
+        hdf5_file["num_moves"].resize((new_size,))
+
         # Write data
         for i, game_moves in enumerate(games):
-            hdf5_file['moves'][old_size + i] = game_moves
-        
-        hdf5_file['white_elo'][old_size:new_size] = np.array(white_elos, dtype=np.int16)
-        hdf5_file['black_elo'][old_size:new_size] = np.array(black_elos, dtype=np.int16)
-        hdf5_file['result'][old_size:new_size] = np.array(results, dtype=np.int8)
-        hdf5_file['num_moves'][old_size:new_size] = np.array(num_moves, dtype=np.int16)
+            hdf5_file["moves"][old_size + i] = game_moves
+
+        hdf5_file["white_elo"][old_size:new_size] = np.array(white_elos, dtype=np.int16)
+        hdf5_file["black_elo"][old_size:new_size] = np.array(black_elos, dtype=np.int16)
+        hdf5_file["result"][old_size:new_size] = np.array(results, dtype=np.int8)
+        hdf5_file["num_moves"][old_size:new_size] = np.array(num_moves, dtype=np.int16)
 
     def _prepare_game_entry(self, pgn):
         variant = pgn.headers.get("Variant", "Standard")
@@ -351,60 +355,85 @@ class PGNtoHDF5Converter:
         game_count += len(valid)
         total_positions += sum(num_moves)
         return game_count, total_positions, reached_limit
-    
+
     def _convert_uncompressed_file(self, pgn_path: str, max_games: int = None, append: bool = False):
         """Convert an uncompressed .pgn file to HDF5 format."""
         game_count = 0
         total_positions = 0
-        
-        mode = 'a' if append else 'w'
-        with open(pgn_path, 'r') as pgn_file:
+
+        mode = "a" if append else "w"
+        with open(pgn_path, "r") as pgn_file:
             with h5py.File(self.output_path, mode) as hdf5_file:
                 # Create or get datasets
-                if append and 'moves' in hdf5_file:
+                if append and "moves" in hdf5_file:
                     # Datasets already exist
                     pass
                 else:
                     # Create datasets
-                    dt = h5py.vlen_dtype(np.dtype('int16'))
+                    dt = h5py.vlen_dtype(np.dtype("int16"))
                     hdf5_file.create_dataset(
-                        'moves', shape=(0,), maxshape=(None,), dtype=dt,
-                        compression='gzip', compression_opts=4, chunks=(self.chunk_size,)
+                        "moves",
+                        shape=(0,),
+                        maxshape=(None,),
+                        dtype=dt,
+                        compression="gzip",
+                        compression_opts=4,
+                        chunks=(self.chunk_size,),
                     )
                     hdf5_file.create_dataset(
-                        'white_elo', shape=(0,), maxshape=(None,), dtype='int16',
-                        compression='gzip', compression_opts=4, chunks=(self.chunk_size,)
+                        "white_elo",
+                        shape=(0,),
+                        maxshape=(None,),
+                        dtype="int16",
+                        compression="gzip",
+                        compression_opts=4,
+                        chunks=(self.chunk_size,),
                     )
                     hdf5_file.create_dataset(
-                        'black_elo', shape=(0,), maxshape=(None,), dtype='int16',
-                        compression='gzip', compression_opts=4, chunks=(self.chunk_size,)
+                        "black_elo",
+                        shape=(0,),
+                        maxshape=(None,),
+                        dtype="int16",
+                        compression="gzip",
+                        compression_opts=4,
+                        chunks=(self.chunk_size,),
                     )
                     hdf5_file.create_dataset(
-                        'result', shape=(0,), maxshape=(None,), dtype='int8',
-                        compression='gzip', compression_opts=4, chunks=(self.chunk_size,)
+                        "result",
+                        shape=(0,),
+                        maxshape=(None,),
+                        dtype="int8",
+                        compression="gzip",
+                        compression_opts=4,
+                        chunks=(self.chunk_size,),
                     )
                     hdf5_file.create_dataset(
-                        'num_moves', shape=(0,), maxshape=(None,), dtype='int16',
-                        compression='gzip', compression_opts=4, chunks=(self.chunk_size,)
+                        "num_moves",
+                        shape=(0,),
+                        maxshape=(None,),
+                        dtype="int16",
+                        compression="gzip",
+                        compression_opts=4,
+                        chunks=(self.chunk_size,),
                     )
-                
+
                 pbar = tqdm(desc="Processing games", unit="games")
                 use_parallel = self.num_workers > 1
                 pool = Pool(processes=self.num_workers, initializer=_worker_init) if use_parallel else None
                 pending_entries = []
                 games_batch, white_elo_batch, black_elo_batch, result_batch, num_moves_batch = [], [], [], [], []
                 reached_limit = False
-                
+
                 try:
                     while True:
                         pgn = chess.pgn.read_game(pgn_file)
                         if pgn is None or reached_limit:
                             break
-                        
+
                         entry = self._prepare_game_entry(pgn)
                         if entry is None:
                             continue
-                        
+
                         if use_parallel:
                             pending_entries.append(entry)
                             if len(pending_entries) >= self.chunk_size:
@@ -416,7 +445,7 @@ class PGNtoHDF5Converter:
                             move_tokens = self._encode_moves_sequential(entry["moves"])
                             if move_tokens is None:
                                 continue
-                            
+
                             games_batch.append(np.array(move_tokens, dtype=np.int16))
                             white_elo_batch.append(entry["white_elo"])
                             black_elo_batch.append(entry["black_elo"])
@@ -425,34 +454,43 @@ class PGNtoHDF5Converter:
                             total_positions += len(move_tokens)
                             game_count += 1
                             pbar.update(1)
-                            
+
                             if len(games_batch) >= self.chunk_size:
                                 self._write_batch(
-                                    hdf5_file, games_batch, white_elo_batch,
-                                    black_elo_batch, result_batch, num_moves_batch
+                                    hdf5_file,
+                                    games_batch,
+                                    white_elo_batch,
+                                    black_elo_batch,
+                                    result_batch,
+                                    num_moves_batch,
                                 )
-                                games_batch, white_elo_batch, black_elo_batch, result_batch, num_moves_batch = [], [], [], [], []
-                            
+                                games_batch, white_elo_batch, black_elo_batch, result_batch, num_moves_batch = (
+                                    [],
+                                    [],
+                                    [],
+                                    [],
+                                    [],
+                                )
+
                             if max_games and game_count >= max_games:
                                 reached_limit = True
-                    
+
                     # Process remaining entries
                     if use_parallel and pending_entries and not (max_games and game_count >= max_games):
                         game_count, total_positions, _ = self._process_entries_parallel(
                             pool, pending_entries, hdf5_file, pbar, game_count, total_positions, max_games
                         )
-                    
+
                     if not use_parallel and games_batch:
                         self._write_batch(
-                            hdf5_file, games_batch, white_elo_batch,
-                            black_elo_batch, result_batch, num_moves_batch
+                            hdf5_file, games_batch, white_elo_batch, black_elo_batch, result_batch, num_moves_batch
                         )
                 finally:
                     if pool is not None:
                         pool.close()
                         pool.join()
                 pbar.close()
-        
+
         print(f"File conversion complete!")
         print(f"Games from this file: {game_count}")
         print(f"Positions from this file: {total_positions}")
@@ -464,15 +502,19 @@ class PGNtoHDF5Converter:
 # Usage script
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Convert PGN/PGN.zst file(s) or folder to HDF5')
-    parser.add_argument('--input', type=str, required=True, help='Input .pgn/.pgn.zst file or folder containing PGN files')
-    parser.add_argument('--output', type=str, required=True, help='Output .h5 file')
-    parser.add_argument('--max-games', type=int, default=None, help='Maximum games to process (total across all files)')
-    parser.add_argument('--chunk-size', type=int, default=10000, help='Batch size for writing')
-    parser.add_argument('--num-workers', type=int, default=None, help='Number of worker processes (default: cpu count - 1)')
-    
+
+    parser = argparse.ArgumentParser(description="Convert PGN/PGN.zst file(s) or folder to HDF5")
+    parser.add_argument(
+        "--input", type=str, required=True, help="Input .pgn/.pgn.zst file or folder containing PGN files"
+    )
+    parser.add_argument("--output", type=str, required=True, help="Output .h5 file")
+    parser.add_argument("--max-games", type=int, default=None, help="Maximum games to process (total across all files)")
+    parser.add_argument("--chunk-size", type=int, default=10000, help="Batch size for writing")
+    parser.add_argument(
+        "--num-workers", type=int, default=None, help="Number of worker processes (default: cpu count - 1)"
+    )
+
     args = parser.parse_args()
-    
+
     converter = PGNtoHDF5Converter(args.output, chunk_size=args.chunk_size, num_workers=args.num_workers)
     converter.convert(args.input, max_games=args.max_games)

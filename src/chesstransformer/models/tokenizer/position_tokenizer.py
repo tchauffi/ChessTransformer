@@ -37,9 +37,7 @@ class PostionTokenizer:
             List of token IDs representing the board position
         """
         reordered_board = str(board).split("\n")[::-1]
-        flattened_board = [
-            char for row in reordered_board for char in row if char != " "
-        ]
+        flattened_board = [char for row in reordered_board for char in row if char != " "]
         token_ids = [self.vocab[char] for char in flattened_board]
         return token_ids
 
@@ -51,9 +49,7 @@ class PostionTokenizer:
             A chess.Board object
         """
         chars = [self.inv_vocab[token_id] for token_id in token_ids]
-        rows = ["".join(chars[i * 8 : (i + 1) * 8]) for i in range(8)][
-            ::-1
-        ]  # Reverse to get the correct order
+        rows = ["".join(chars[i * 8 : (i + 1) * 8]) for i in range(8)][::-1]  # Reverse to get the correct order
         board_str = "\n".join(rows)
         board = self._ascii2board(board_str)
         return board

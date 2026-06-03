@@ -9,8 +9,7 @@ from chesstransformer.models.transformer.rope import RoPEEmbedding
 
 class MultiHeadAttention(nn.Module):
     def __init__(
-        self, d_in, d_out, num_heads, context_length, qkv_bias=False, dropout=0.0,
-        mask_future=True, apply_rope=False
+        self, d_in, d_out, num_heads, context_length, qkv_bias=False, dropout=0.0, mask_future=True, apply_rope=False
     ):
         super().__init__()
         assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
@@ -28,9 +27,7 @@ class MultiHeadAttention(nn.Module):
         if self.apply_rope:
             self.rope = RoPEEmbedding(dim=self.d_head, max_position_embeddings=context_length)
 
-        self.register_buffer(
-            "mask", torch.triu(torch.ones(context_length, context_length), diagonal=1)
-        )
+        self.register_buffer("mask", torch.triu(torch.ones(context_length, context_length), diagonal=1))
 
     def forward(self, x):
         """
@@ -59,9 +56,7 @@ class MultiHeadAttention(nn.Module):
             queries = self.rope(values)
 
         # Compute attention scores
-        attention_scores = queries @ keys.transpose(
-            2, 3
-        )  # (batch_size, num_heads, seq_len, seq_len)
+        attention_scores = queries @ keys.transpose(2, 3)  # (batch_size, num_heads, seq_len, seq_len)
 
         if self.mask_future:
             # Apply mask
@@ -79,7 +74,7 @@ class MultiHeadAttention(nn.Module):
         context_vec = context_vec.view(bz, nb_tockens, self.d_out)
         context_vec = self.out_proj(context_vec)
         return context_vec
-    
+
 
 class PyTorchMultiHeadAttention(nn.Module):
     def __init__(self, d_in, d_out, num_heads, dropout=0.0, qkv_bias=False, mask_future=True, apply_rope=False):
@@ -119,10 +114,11 @@ class PyTorchMultiHeadAttention(nn.Module):
             keys = self.rope(keys)
             queries = self.rope(queries)
 
-        use_dropout = 0. if not self.training else self.dropout
+        use_dropout = 0.0 if not self.training else self.dropout
 
         context_vec = nn.functional.scaled_dot_product_attention(
-            queries, keys, values, attn_mask=None, dropout_p=use_dropout, is_causal=self.mask_future)
+            queries, keys, values, attn_mask=None, dropout_p=use_dropout, is_causal=self.mask_future
+        )
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.d_out)
@@ -130,7 +126,8 @@ class PyTorchMultiHeadAttention(nn.Module):
         context_vec = self.proj(context_vec)
 
         return context_vec
-    
+
+
 class GroupedQueryAttention(nn.Module):
     """
     Multi-head self-attention with grouped keys and values.
@@ -154,7 +151,10 @@ class GroupedQueryAttention(nn.Module):
     Returns:
         Output tensor of shape (batch_size, seq_len, d_out)
     """
-    def __init__(self, d_in, d_out, num_heads, num_kv_groups, dropout=0.0, qkv_bias=False, mask_future=True, apply_rope=False):
+
+    def __init__(
+        self, d_in, d_out, num_heads, num_kv_groups, dropout=0.0, qkv_bias=False, mask_future=True, apply_rope=False
+    ):
         super().__init__()
 
         assert d_out % num_heads == 0, "d_out is indivisible by num_heads"
@@ -190,7 +190,6 @@ class GroupedQueryAttention(nn.Module):
         keys_new = keys.view(batch_size, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
         values_new = values.view(batch_size, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
 
-
         keys = keys_new.repeat_interleave(self.group_size, dim=1)
         values = values_new.repeat_interleave(self.group_size, dim=1)
 
@@ -198,21 +197,19 @@ class GroupedQueryAttention(nn.Module):
             keys = self.rope(keys)
             queries = self.rope(queries)
 
-        use_dropout = 0. if not self.training else self.dropout.p
+        use_dropout = 0.0 if not self.training else self.dropout.p
 
         context_vec = F.scaled_dot_product_attention(
-            queries, keys, values, 
-            attn_mask=None, 
-            dropout_p=use_dropout, 
-            is_causal=self.mask_future
+            queries, keys, values, attn_mask=None, dropout_p=use_dropout, is_causal=self.mask_future
         )
-        
+
         context_vec = context_vec.transpose(1, 2).contiguous()
         context_vec = context_vec.view(batch_size, num_tokens, self.d_out)
         context_vec = self.proj(context_vec)
 
         return context_vec
-    
+
+
 if __name__ == "__main__":
     # Simple test
     batch_size = 2

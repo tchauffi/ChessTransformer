@@ -33,9 +33,7 @@ def create_bpe_tokenizer(
 
     # Initialize a tokenizer with BPE model
     encoder = Tokenizer(models.BPE(unk_token="<UNK>"))
-    encoder.normalizer = normalizers.Sequence(
-        []
-    )  # No normalization needed for chess moves
+    encoder.normalizer = normalizers.Sequence([])  # No normalization needed for chess moves
 
     # remove the white space pre-tokenizer
     encoder.pre_tokenizer = pre_tokenizers.Whitespace()
@@ -90,5 +88,6 @@ def create_bpe_tokenizer(
     )
 
     return encoder, trainer
+
 
 __all__ = ["create_bpe_tokenizer", "MoveTokenizer", "PostionTokenizer"]
