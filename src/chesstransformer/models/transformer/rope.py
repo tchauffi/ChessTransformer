@@ -5,6 +5,7 @@ the paper "RoFormer: Enhanced Transformer with Rotary Position Embedding" (Su et
 import torch
 import torch.nn as nn
 
+
 class RoPEEmbedding(nn.Module):
     """Rotary Positional Embedding module.
 
@@ -33,7 +34,7 @@ class RoPEEmbedding(nn.Module):
         position = torch.arange(max_position_embeddings, dtype=torch.float)
         # (max_pos, dim/2)
         idx_theta = torch.einsum("i, j -> i j", position, inv_freq)
-        
+
         # Duplicate for both halves: (max_pos, dim)
         idx_theta2 = torch.cat([idx_theta, idx_theta], dim=-1)
 
@@ -43,7 +44,7 @@ class RoPEEmbedding(nn.Module):
 
     def _neg_half(self, x: torch.Tensor):
         """Rotate tensor by swapping and negating halves.
-        
+
         For RoPE, we need to compute: [-x2, x1] where x = [x1, x2]
         This implements the rotation matrix multiplication efficiently.
 
@@ -57,7 +58,7 @@ class RoPEEmbedding(nn.Module):
         x1 = x[..., :d_2]
         x2 = x[..., d_2:]
         return torch.cat([-x2, x1], dim=-1)
-    
+
     def forward(self, x: torch.Tensor):
         """Apply RoPE to the input tensor.
 
@@ -69,7 +70,7 @@ class RoPEEmbedding(nn.Module):
         """
         # x shape: (batch, num_heads, seq_len, head_dim)
         seq_len = x.shape[2]  # Get seq_len from the correct dimension
-        
+
         # Slice cached values to sequence length: (1, 1, seq_len, dim)
         cos = self.cos_cached[:, :, :seq_len, :].to(x.device)
         sin = self.sin_cached[:, :, :seq_len, :].to(x.device)
@@ -85,14 +86,14 @@ if __name__ == "__main__":
     num_heads = 8
     seq_len = 67  # 64 squares + 3 game state tokens
     head_dim = 64
-    
+
     rope = RoPEEmbedding(dim=head_dim, base=10_000, max_position_embeddings=128)
     x = torch.randn(batch_size, num_heads, seq_len, head_dim)
-    
+
     output = rope(x)
     print(f"Input shape:  {x.shape}")
     print(f"Output shape: {output.shape}")
-    
+
     # Verify positions are encoded differently
     # Two different positions should produce different outputs
     x_same = torch.ones(1, 1, 10, head_dim)

@@ -57,9 +57,7 @@ class GPT2Model(nn.Module):
         self.token_embedding = nn.Embedding(cfg["vocab_size"], cfg["embed_dim"])
         self.position_embedding = nn.Embedding(cfg["context_size"], cfg["embed_dim"])
         self.dropout_embed = nn.Dropout(cfg["dropout"])
-        self.transfomer_blocks = nn.Sequential(
-            *[TransformerBlock(cfg) for _ in range(cfg["num_layers"])]
-        )
+        self.transfomer_blocks = nn.Sequential(*[TransformerBlock(cfg) for _ in range(cfg["num_layers"])])
         self.final_norm = LayerNorm(cfg["embed_dim"])
         self.lm_head = nn.Linear(cfg["embed_dim"], cfg["vocab_size"], bias=False)
 

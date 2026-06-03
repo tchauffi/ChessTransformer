@@ -1,6 +1,7 @@
 import chess
 import random
 
+
 class RandomBot:
     def __init__(self):
         pass
@@ -12,7 +13,7 @@ class RandomBot:
         # pick a random move
         move = random.choice(legal_moves)
         return move.uci(), None
-    
+
 
 if __name__ == "__main__":
     bot = RandomBot()

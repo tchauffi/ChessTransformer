@@ -12,7 +12,7 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/api/health')"]
-      interval: 30s
+      interval: 5s
       timeout: 10s
       retries: 3
       start_period: 60s
@@ -29,7 +29,8 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 networks:

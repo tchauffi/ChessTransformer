@@ -5,9 +5,7 @@ from chesstransformer.models.tokenizer import create_bpe_tokenizer
 
 
 def arg_parser():
-    parser = argparse.ArgumentParser(
-        description="Train a BPE tokenizer for chess moves."
-    )
+    parser = argparse.ArgumentParser(description="Train a BPE tokenizer for chess moves.")
     parser.add_argument(
         "--vocab_size",
         type=int,
@@ -67,17 +65,12 @@ def main():
     print(f"Extracting moves in {notation} notation...")
     print("Using <STEP> token to separate moves...")
     if notation == "uci":
-        move_sequences = (
-            "<STEP>".join([move.uci() for move in game.mainline_moves()])
-            for game in games
-        )
+        move_sequences = ("<STEP>".join([move.uci() for move in game.mainline_moves()]) for game in games)
     elif notation == "san":
         move_sequences = (
             "<STEP>".join(
                 [
-                    (lambda board, move: (board.san(move), board.push(move))[0])(
-                        board, move
-                    )
+                    (lambda board, move: (board.san(move), board.push(move))[0])(board, move)
                     for board in [game.board()]
                     for move in game.mainline_moves()
                 ]

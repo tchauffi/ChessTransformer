@@ -8,12 +8,17 @@ from chesstransformer.models.tokenizer import PostionTokenizer, MoveTokenizer
 
 data_foler = Path(__file__).parents[1] / "data"
 
+
 class Position2MoveBot:
-    def __init__(self, model_path: str = str((data_foler / "models/position2moveV2.1/best_model/model.safetensors").resolve()), device: str = "cpu"):
+    def __init__(
+        self,
+        model_path: str = str((data_foler / "models/position2moveV2.1/best_model/model.safetensors").resolve()),
+        device: str = "cpu",
+    ):
         self.device = device
         self.position_tokenizer = PostionTokenizer()
         self.move_tokenizer = MoveTokenizer()
-        
+
         config_path = Path(model_path).parent / "config.json"
 
         with open(config_path, "r") as f:
@@ -21,14 +26,14 @@ class Position2MoveBot:
 
         # Load model
         self.model = Position2MoveModel(**self.config).to(device)
-        
+
         with safe_open(model_path, framework="pt", device=device) as f:
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
-            
+
             # Handle compiled model prefix (_orig_mod.)
             if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
                 state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-            
+
             self.model.load_state_dict(state_dict)
 
         self.model.eval()
@@ -45,7 +50,7 @@ class Position2MoveBot:
 
         legal_moves = [m.uci() for m in board.legal_moves]
 
-        mask = torch.full((logits.size(-1),), float('-inf')).to(self.device)
+        mask = torch.full((logits.size(-1),), float("-inf")).to(self.device)
         for move in legal_moves:
             move_id = self.move_tokenizer.encode(move)
             mask[move_id] = 0.0
@@ -58,6 +63,7 @@ class Position2MoveBot:
 
         predicted_move = self.move_tokenizer.decode(predicted_move_id)
         return predicted_move, proba
+
 
 if __name__ == "__main__":
     bot = Position2MoveBot()

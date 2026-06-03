@@ -7,7 +7,7 @@ Uses the new efficient HDF5 dataset format with game-based storage and random sa
 
 Usage:
     python src/chesstransformer/trainers/position2move_trainer.py --data data/Lichess2017.h5
-    
+
 Options:
     --data: Path to HDF5 dataset
     --min-elo: Minimum average ELO for filtering games
@@ -44,9 +44,7 @@ def get_next_run_number(log_dir="logs"):
     if not log_path.exists():
         return 1
 
-    existing_runs = [
-        d.name for d in log_path.iterdir() if d.is_dir() and d.name.startswith("run_")
-    ]
+    existing_runs = [d.name for d in log_path.iterdir() if d.is_dir() and d.name.startswith("run_")]
 
     if not existing_runs:
         return 1
@@ -61,14 +59,16 @@ def get_next_run_number(log_dir="logs"):
 
     return max(run_numbers) + 1 if run_numbers else 1
 
+
 def compute_loss(logits, moves, legal_moves_mask, beta, legal_move_loss_weight):
     llm_loss = F.cross_entropy(logits, moves)
-    illegal_prob = F.softmax(logits, dim=-1) * (1. - legal_moves_mask.float())
-    legal_move_loss = torch.sum(illegal_prob ** 2, dim=-1).mean()
+    illegal_prob = F.softmax(logits, dim=-1) * (1.0 - legal_moves_mask.float())
+    legal_move_loss = torch.sum(illegal_prob**2, dim=-1).mean()
     filtered_logits = torch.where(legal_moves_mask.bool(), logits, -torch.inf)
     legal_move_cross_entropy = F.cross_entropy(filtered_logits, moves)
     loss = beta * llm_loss + legal_move_loss_weight * legal_move_loss + (1 - beta) * legal_move_cross_entropy
     return loss, llm_loss, legal_move_loss, legal_move_cross_entropy
+
 
 def save_trainer_state(checkpoint_dir, epoch, global_step, best_val_loss, scheduler_config=None):
     state = {
@@ -82,6 +82,7 @@ def save_trainer_state(checkpoint_dir, epoch, global_step, best_val_loss, schedu
     with state_path.open("w", encoding="utf-8") as fp:
         json.dump(state, fp)
 
+
 def load_trainer_state(checkpoint_dir):
     state_path = Path(checkpoint_dir) / "trainer_state.json"
     if not state_path.exists():
@@ -89,20 +90,23 @@ def load_trainer_state(checkpoint_dir):
     with state_path.open("r", encoding="utf-8") as fp:
         return json.load(fp)
 
+
 def cleanup_old_step_checkpoints(checkpoint_dir, max_checkpoints):
     """Remove old step checkpoints, keeping only the most recent ones."""
     checkpoint_path = Path(checkpoint_dir)
     step_checkpoints = sorted(
         [d for d in checkpoint_path.iterdir() if d.is_dir() and d.name.startswith("checkpoint_step_")],
-        key=lambda x: int(x.name.split("_")[-1])
+        key=lambda x: int(x.name.split("_")[-1]),
     )
-    
+
     # Remove oldest checkpoints if we exceed max_checkpoints
     while len(step_checkpoints) > max_checkpoints:
         oldest = step_checkpoints.pop(0)
         import shutil
+
         shutil.rmtree(oldest)
         print(f"  Removed old checkpoint: {oldest.name}")
+
 
 def create_linear_warmup_decay_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio):
     final_lr_ratio = max(0.0, final_lr_ratio)
@@ -117,7 +121,10 @@ def create_linear_warmup_decay_scheduler(optimizer, warmup_steps, total_steps, f
 
     return LambdaLR(optimizer, lr_lambda)
 
-def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_max=1e-2, num_steps=100, beta=0.7, legal_move_loss_weight=10.0):
+
+def find_best_learning_rate(
+    model, train_loader, accelerator, lr_min=1e-6, lr_max=1e-2, num_steps=100, beta=0.7, legal_move_loss_weight=10.0
+):
     model.train()
     device = accelerator.device
     initial_state = copy.deepcopy(model.state_dict())
@@ -167,6 +174,7 @@ def find_best_learning_rate(model, train_loader, accelerator, lr_min=1e-6, lr_ma
     accelerator.free_memory()
     return best_lr, best_loss
 
+
 def main():
     default_data_path = Path(__file__).parents[2] / "data" / "Lichess2017.h5"
 
@@ -177,24 +185,44 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for transformers (base LR)")
-    parser.add_argument("--lr-embedding", type=float, default=None, help="Learning rate for embeddings (default: same as --lr)")
-    parser.add_argument("--lr-head", type=float, default=None, help="Learning rate for output head (default: same as --lr)")
+    parser.add_argument(
+        "--lr-embedding", type=float, default=None, help="Learning rate for embeddings (default: same as --lr)"
+    )
+    parser.add_argument(
+        "--lr-head", type=float, default=None, help="Learning rate for output head (default: same as --lr)"
+    )
     parser.add_argument("--save-every", type=int, default=5, help="Save checkpoint every N epochs")
     parser.add_argument("--lr-find", action="store_true", help="Run learning rate finder before training")
     parser.add_argument("--lr-min", type=float, default=1e-6, help="Minimum LR for finder sweep")
     parser.add_argument("--lr-max", type=float, default=1e-2, help="Maximum LR for finder sweep")
     parser.add_argument("--lr-steps", type=int, default=100, help="Number of steps for LR finder sweep")
     parser.add_argument("--beta", type=float, default=0.7, help="Weight for LLM loss in combined loss function")
-    parser.add_argument("--legal-move-loss-weight", type=float, default=10.0, help="Weight for legal move loss in combined loss function")
+    parser.add_argument(
+        "--legal-move-loss-weight",
+        type=float,
+        default=10.0,
+        help="Weight for legal move loss in combined loss function",
+    )
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Number of warmup steps for LR scheduler")
     parser.add_argument("--final-lr-ratio", type=float, default=0.01, help="Final LR multiplier after linear decay")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
-    parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Maximum gradient norm for clipping (0 to disable)")
-    parser.add_argument("--max_examples", type=int, default=None, help="Maximum number of examples to use from the dataset")
+    parser.add_argument(
+        "--max-grad-norm", type=float, default=1.0, help="Maximum gradient norm for clipping (0 to disable)"
+    )
+    parser.add_argument(
+        "--max_examples", type=int, default=None, help="Maximum number of examples to use from the dataset"
+    )
     parser.add_argument("--save-steps", type=int, default=5000, help="Save checkpoint every N steps")
-    parser.add_argument("--max-checkpoints", type=int, default=5, help="Maximum number of step checkpoints to keep (excluding best model)")
-    parser.add_argument("--precision", type=str, default="fp16", choices=["bf16", "fp16", "fp32"], help="Precision for training")
+    parser.add_argument(
+        "--max-checkpoints",
+        type=int,
+        default=5,
+        help="Maximum number of step checkpoints to keep (excluding best model)",
+    )
+    parser.add_argument(
+        "--precision", type=str, default="fp16", choices=["bf16", "fp16", "fp32"], help="Precision for training"
+    )
     args = parser.parse_args()
 
     set_seed(args.random_seed)
@@ -243,7 +271,7 @@ def main():
     log_dir = Path("logs") / "position2move"
     log_dir.mkdir(parents=True, exist_ok=True)
     run_number = get_next_run_number(str(log_dir))
-    log_dir_full =  f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir_full = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     log_path = log_dir / log_dir_full
     log_path.mkdir(parents=True, exist_ok=False)
     print(f"Logging to: {log_path}")
@@ -251,7 +279,7 @@ def main():
     # Create checkpoints directory
     checkpoint_dir = log_path / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
-    
+
     # Save model config to JSON
     config_path = log_path / "model_config.json"
     with config_path.open("w", encoding="utf-8") as f:
@@ -262,7 +290,7 @@ def main():
     print(f"Using precision: {precision}")
 
     accelerator = accelerate.Accelerator(log_with="tensorboard", project_dir=str(log_path), mixed_precision=precision)
-    
+
     # Initialize trackers
     accelerator.init_trackers(
         project_name="position2move",
@@ -279,25 +307,27 @@ def main():
             "warmup_steps": args.warmup_steps,
             "final_lr_ratio": args.final_lr_ratio,
             "precision": args.precision,
-        }
+        },
     )
 
     device = accelerator.device
     print(f"Using device: {device}")
 
     model = Position2MoveModel(**model_config)
-    
+
     # torch.compile has limited support on MPS backend - disable if compilation fails
     if device.type == "mps":
         print("Warning: Skipping torch.compile on MPS device (Mac GPU) due to backend limitations")
         print("Training will proceed without compilation optimizations")
     else:
         try:
-            model = torch.compile(model, )
+            model = torch.compile(
+                model,
+            )
             print("Model compiled successfully")
         except Exception as e:
             print(f"Warning: torch.compile failed ({e}), proceeding without compilation")
-    
+
     model.to(device)
 
     if args.lr_find:
@@ -322,30 +352,30 @@ def main():
     lr_embedding = args.lr_embedding if args.lr_embedding is not None else args.lr
     lr_head = args.lr_head if args.lr_head is not None else args.lr
     lr_transformer = args.lr
-    
+
     # Create parameter groups
     embedding_params = []
     transformer_params = []
     head_params = []
-    
+
     # Get underlying model (unwrap from accelerator if needed)
     unwrapped_model = accelerator.unwrap_model(model)
-    
+
     # Categorize parameters
     for name, param in unwrapped_model.named_parameters():
-        if 'embedding' in name:
+        if "embedding" in name:
             embedding_params.append(param)
-        elif 'lm_head' in name:
+        elif "lm_head" in name:
             head_params.append(param)
         else:
             transformer_params.append(param)
-    
+
     param_groups = [
-        {'params': embedding_params, 'lr': lr_embedding, 'name': 'embeddings'},
-        {'params': transformer_params, 'lr': lr_transformer, 'name': 'transformers'},
-        {'params': head_params, 'lr': lr_head, 'name': 'head'},
+        {"params": embedding_params, "lr": lr_embedding, "name": "embeddings"},
+        {"params": transformer_params, "lr": lr_transformer, "name": "transformers"},
+        {"params": head_params, "lr": lr_head, "name": "head"},
     ]
-    
+
     if accelerator.is_main_process:
         emb_count = sum(p.numel() for p in embedding_params)
         trans_count = sum(p.numel() for p in transformer_params)
@@ -355,65 +385,69 @@ def main():
         print(f"  Transformers: {lr_transformer:.6g}")
         print(f"  Head:         {lr_head:.6g}")
         print(f"  Param counts: Emb={emb_count:,}, Trans={trans_count:,}, Head={head_count:,}\n")
-    
+
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
     model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader, test_loader
     )
-    
+
     # Check if resuming to load scheduler config from checkpoint
     best_val_loss = float("inf")
     start_epoch = 1
     global_step = 0
     resume_path = Path(args.resume_from) if args.resume_from else None
     trainer_state = None
-    
+
     if resume_path:
         trainer_state = load_trainer_state(resume_path)
         if trainer_state:
             start_epoch = trainer_state.get("epoch", 0) + 1
             global_step = trainer_state.get("global_step", 0)
             best_val_loss = trainer_state.get("best_val_loss", float("inf"))
-    
+
     # Determine scheduler parameters - use saved config when resuming for consistency
     has_scheduler_config = trainer_state and "scheduler_config" in trainer_state
-    
+
     if has_scheduler_config:
         saved_config = trainer_state["scheduler_config"]
         scheduler_warmup_steps = saved_config["warmup_steps"]
         scheduler_total_steps = saved_config["total_steps"]
         scheduler_final_lr_ratio = saved_config["final_lr_ratio"]
         if accelerator.is_main_process:
-            print(f"Using scheduler config from checkpoint: warmup={scheduler_warmup_steps}, total={scheduler_total_steps}, final_lr_ratio={scheduler_final_lr_ratio}")
+            print(
+                f"Using scheduler config from checkpoint: warmup={scheduler_warmup_steps}, total={scheduler_total_steps}, final_lr_ratio={scheduler_final_lr_ratio}"
+            )
     else:
         scheduler_warmup_steps = args.warmup_steps
         scheduler_total_steps = max(1, len(train_loader)) * max(1, args.epochs)
         scheduler_final_lr_ratio = args.final_lr_ratio
         if resume_path and accelerator.is_main_process:
-            print(f"Old checkpoint without scheduler_config - using new scheduler params: warmup={scheduler_warmup_steps}, total={scheduler_total_steps}")
-    
+            print(
+                f"Old checkpoint without scheduler_config - using new scheduler params: warmup={scheduler_warmup_steps}, total={scheduler_total_steps}"
+            )
+
     # Store scheduler config for saving in checkpoints
     scheduler_config = {
         "warmup_steps": scheduler_warmup_steps,
         "total_steps": scheduler_total_steps,
         "final_lr_ratio": scheduler_final_lr_ratio,
     }
-    
+
     scheduler = create_linear_warmup_decay_scheduler(
         optimizer,
         warmup_steps=scheduler_warmup_steps,
         total_steps=scheduler_total_steps,
         final_lr_ratio=scheduler_final_lr_ratio,
     )
-    
+
     # Always register scheduler for checkpointing (required for load_state to work)
     accelerator.register_for_checkpointing(scheduler)
 
     # Load the full accelerator state (model, optimizer, scheduler) if resuming
     if resume_path:
         accelerator.load_state(str(resume_path))
-        
-        # For old checkpoints without scheduler_config, the loaded scheduler state 
+
+        # For old checkpoints without scheduler_config, the loaded scheduler state
         # has a mismatched lr_lambda (old total_steps). We need to recreate it.
         if not has_scheduler_config:
             # Recreate scheduler with correct parameters
@@ -430,11 +464,11 @@ def main():
                 current_lrs = scheduler.get_last_lr()
                 print(f"  Recreated scheduler and advanced to step {global_step}")
                 print(f"  Current LRs: emb={current_lrs[0]:.6g}, trans={current_lrs[1]:.6g}, head={current_lrs[2]:.6g}")
-        
+
         if accelerator.is_main_process:
             print(f"Resumed from checkpoint: {resume_path}")
             print(f"  Starting from epoch {start_epoch}, global_step {global_step}, best_val_loss {best_val_loss:.4f}")
-    
+
     for epoch in range(start_epoch, args.epochs + 1):
         # Training phase
         model.train()
@@ -442,17 +476,17 @@ def main():
         train_llm_loss = 0.0
         train_legal_move_loss = 0.0
         train_legal_move_ce = 0.0
-        
+
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} - Training", leave=False)
         for batch in progress_bar:
             optimizer.zero_grad()
-            positions = batch['position']
-            moves = batch['move']
-            is_white = batch['is_white']
-            legal_moves_mask = batch['legal_moves_mask']
-            castling_rights = batch['castling_rights']
-            en_passant_file = batch['en_passant_file']
-            halfmove_clock = batch['halfmove_clock']
+            positions = batch["position"]
+            moves = batch["move"]
+            is_white = batch["is_white"]
+            legal_moves_mask = batch["legal_moves_mask"]
+            castling_rights = batch["castling_rights"]
+            en_passant_file = batch["en_passant_file"]
+            halfmove_clock = batch["halfmove_clock"]
 
             logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
             loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
@@ -460,11 +494,11 @@ def main():
             )
 
             accelerator.backward(loss)
-            
+
             # Gradient clipping
             if args.max_grad_norm > 0:
                 accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            
+
             optimizer.step()
             scheduler.step()
 
@@ -473,14 +507,16 @@ def main():
             train_llm_loss += llm_loss.item() * batch_size
             train_legal_move_loss += legal_move_loss.item() * batch_size
             train_legal_move_ce += legal_move_cross_entropy.item() * batch_size
-            
-            progress_bar.set_postfix({
-                "loss": loss.item(), 
-                "llm_loss": llm_loss.item(), 
-                "legal_move_loss": legal_move_loss.item(), 
-                "legal_move_ce": legal_move_cross_entropy.item()
-            })
-            
+
+            progress_bar.set_postfix(
+                {
+                    "loss": loss.item(),
+                    "llm_loss": llm_loss.item(),
+                    "legal_move_loss": legal_move_loss.item(),
+                    "legal_move_ce": legal_move_cross_entropy.item(),
+                }
+            )
+
             # Log step-level metrics
             current_lrs = scheduler.get_last_lr()
             log_dict = {
@@ -493,9 +529,9 @@ def main():
                 "train/lr_head": current_lrs[2],
             }
             accelerator.log(log_dict, step=global_step)
-            
+
             global_step += 1
-            
+
             # Save step checkpoint
             if args.save_steps > 0 and global_step % args.save_steps == 0:
                 step_checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step:07d}"
@@ -519,17 +555,17 @@ def main():
         val_legal_move_ce = 0.0
         val_correct = 0
         val_total = 0
-        
+
         with torch.no_grad():
             progress_bar = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} - Validation", leave=False)
             for batch in progress_bar:
-                positions = batch['position']
-                moves = batch['move']
-                is_white = batch['is_white']
-                legal_moves_mask = batch['legal_moves_mask']
-                castling_rights = batch['castling_rights']
-                en_passant_file = batch['en_passant_file']
-                halfmove_clock = batch['halfmove_clock']
+                positions = batch["position"]
+                moves = batch["move"]
+                is_white = batch["is_white"]
+                legal_moves_mask = batch["legal_moves_mask"]
+                castling_rights = batch["castling_rights"]
+                en_passant_file = batch["en_passant_file"]
+                halfmove_clock = batch["halfmove_clock"]
 
                 logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
                 loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
@@ -541,12 +577,12 @@ def main():
                 val_llm_loss += llm_loss.item() * batch_size
                 val_legal_move_loss += legal_move_loss.item() * batch_size
                 val_legal_move_ce += legal_move_cross_entropy.item() * batch_size
-                
+
                 # Calculate accuracy
                 predictions = torch.argmax(logits, dim=-1)
                 val_correct += (predictions == moves).sum().item()
                 val_total += batch_size
-                
+
                 progress_bar.set_postfix({"val_loss": loss.item()})
 
         val_loss /= len(val_set)
@@ -556,21 +592,24 @@ def main():
         val_accuracy = val_correct / val_total if val_total > 0 else 0.0
 
         # Log epoch-level metrics
-        accelerator.log({
-            "train/epoch_loss": train_loss,
-            "train/epoch_llm_loss": train_llm_loss,
-            "train/epoch_legal_move_loss": train_legal_move_loss,
-            "train/epoch_legal_move_ce": train_legal_move_ce,
-            "val/loss": val_loss,
-            "val/llm_loss": val_llm_loss,
-            "val/legal_move_loss": val_legal_move_loss,
-            "val/legal_move_ce": val_legal_move_ce,
-            "val/accuracy": val_accuracy,
-            "epoch": epoch,
-            "train/lr_embeddings_epoch_end": scheduler.get_last_lr()[0],
-            "train/lr_transformers_epoch_end": scheduler.get_last_lr()[1],
-            "train/lr_head_epoch_end": scheduler.get_last_lr()[2],
-        }, step=global_step)
+        accelerator.log(
+            {
+                "train/epoch_loss": train_loss,
+                "train/epoch_llm_loss": train_llm_loss,
+                "train/epoch_legal_move_loss": train_legal_move_loss,
+                "train/epoch_legal_move_ce": train_legal_move_ce,
+                "val/loss": val_loss,
+                "val/llm_loss": val_llm_loss,
+                "val/legal_move_loss": val_legal_move_loss,
+                "val/legal_move_ce": val_legal_move_ce,
+                "val/accuracy": val_accuracy,
+                "epoch": epoch,
+                "train/lr_embeddings_epoch_end": scheduler.get_last_lr()[0],
+                "train/lr_transformers_epoch_end": scheduler.get_last_lr()[1],
+                "train/lr_head_epoch_end": scheduler.get_last_lr()[2],
+            },
+            step=global_step,
+        )
 
         print(f"\nEpoch {epoch}/{args.epochs}:")
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Accuracy: {val_accuracy:.4f}")
@@ -596,17 +635,17 @@ def main():
     test_loss = 0.0
     test_correct = 0
     test_total = 0
-    
+
     with torch.no_grad():
         progress_bar = tqdm(test_loader, desc="Testing", leave=False)
         for batch in progress_bar:
-            positions = batch['position']
-            moves = batch['move']
-            is_white = batch['is_white']
-            legal_moves_mask = batch['legal_moves_mask']
-            castling_rights = batch['castling_rights']
-            en_passant_file = batch['en_passant_file']
-            halfmove_clock = batch['halfmove_clock']
+            positions = batch["position"]
+            moves = batch["move"]
+            is_white = batch["is_white"]
+            legal_moves_mask = batch["legal_moves_mask"]
+            castling_rights = batch["castling_rights"]
+            en_passant_file = batch["en_passant_file"]
+            halfmove_clock = batch["halfmove_clock"]
 
             logits = model(positions, is_white, castling_rights, en_passant_file, halfmove_clock)
             loss, llm_loss, legal_move_loss, legal_move_cross_entropy = compute_loss(
@@ -615,7 +654,7 @@ def main():
 
             batch_size = positions.size(0)
             test_loss += loss.item() * batch_size
-            
+
             predictions = torch.argmax(logits, dim=-1)
             test_correct += (predictions == moves).sum().item()
             test_total += batch_size
@@ -623,10 +662,13 @@ def main():
     test_loss /= len(test_set)
     test_accuracy = test_correct / test_total if test_total > 0 else 0.0
 
-    accelerator.log({
-        "test/loss": test_loss,
-        "test/accuracy": test_accuracy,
-    }, step=global_step)
+    accelerator.log(
+        {
+            "test/loss": test_loss,
+            "test/accuracy": test_accuracy,
+        },
+        step=global_step,
+    )
 
     print(f"\nTest Results:")
     print(f"  Test Loss: {test_loss:.4f} | Test Accuracy: {test_accuracy:.4f}")

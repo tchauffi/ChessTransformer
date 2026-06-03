@@ -78,15 +78,27 @@ export default function ChessGame() {
   // Position history for move navigation
   const [positionHistory, setPositionHistory] = useState<string[]>([INITIAL_FEN]);
   const [viewingMoveIndex, setViewingMoveIndex] = useState<number>(0); // 0 = start position, then increments
+  // Evaluation bar
+  const [evaluation, setEvaluation] = useState<number | null>(null); // value in [-1, 1] from white's perspective
+  const [showEvalBar, setShowEvalBar] = useState<boolean>(true);
 
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/health`)
-      .then(res => res.json())
-      .then(data => setBotType(data.bot_type))
-      .catch(err => {
-        setError('Failed to connect to the backend. Make sure the API server is running.');
-        console.error('API health check failed:', err);
-      });
+    let cancelled = false;
+    const poll = (attempt: number) => {
+      fetch(`${API_BASE_URL}/api/health`)
+        .then(res => res.json())
+        .then(data => { if (!cancelled) setBotType(data.bot_type); })
+        .catch(() => {
+          if (cancelled) return;
+          if (attempt < 20) {
+            setTimeout(() => poll(attempt + 1), 2000);
+          } else {
+            setError('Failed to connect to the backend. Make sure the API server is running.');
+          }
+        });
+    };
+    poll(0);
+    return () => { cancelled = true; };
   }, []);
 
   // Keyboard navigation for moves
@@ -267,6 +279,9 @@ export default function ChessGame() {
       setSelectedSquare(null);
       updateGameStatus(newGame);
 
+      // Fetch evaluation for position after player's move
+      fetchEvaluation(newGame.fen());
+
       if (!newGame.isGameOver()) {
         getBotMove(newGame.fen());
       }
@@ -301,6 +316,27 @@ export default function ChessGame() {
     setSelectedSquare(null);
   };
 
+  const fetchEvaluation = async (fen: string) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fen }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.value != null) {
+          // value is from the current player's perspective; convert to white's
+          const turn = fen.split(' ')[1];
+          const whiteValue = turn === 'w' ? data.value : -data.value;
+          setEvaluation(whiteValue);
+        }
+      }
+    } catch {
+      // Silently fail — eval bar is optional
+    }
+  };
+
   const getBotMove = async (currentFen: string) => {
     setIsThinking(true);
     setError('');
@@ -330,6 +366,15 @@ export default function ChessGame() {
       setViewingMoveIndex(prev => prev + 1);
       setLastMove({ from, to });
       updateGameStatus(newGame);
+
+      // Update evaluation from the move response
+      if (data.value != null) {
+        // value was evaluated before the bot pushed its move (from the bot's perspective).
+        // After the bot moves, newGame.turn() is the *opponent*. So if turn is 'b',
+        // the bot played white and the value is already white's perspective.
+        const whiteValue = newGame.turn() === 'b' ? data.value : -data.value;
+        setEvaluation(whiteValue);
+      }
     } catch (err) {
       setError('Failed to get bot move. Please try again.');
       console.error('Error getting bot move:', err);
@@ -349,6 +394,7 @@ export default function ChessGame() {
     setGameStarted(true);
     setSelectedSquare(null);
     setLastMove(null);
+    setEvaluation(null);
     updateGameStatus(newGame);
     
     if (color === 'b') {
@@ -366,6 +412,7 @@ export default function ChessGame() {
     setError('');
     setSelectedSquare(null);
     setLastMove(null);
+    setEvaluation(null);
     updateGameStatus(newGame);
   };
 
@@ -573,8 +620,49 @@ export default function ChessGame() {
               )}
             </div>
 
-            {/* Chess Board - Responsive */}
-            <div className="w-full max-w-[min(100%,600px)] mx-auto">
+            {/* Chess Board with Eval Bar - Responsive */}
+            <div className="flex gap-2 justify-center">
+              {/* Evaluation Bar */}
+              {showEvalBar && (
+                <div className="flex flex-col items-center w-6 sm:w-7 shrink-0">
+                  {/* Label top: black or white depending on orientation */}
+                  <span className="text-[10px] text-slate-500 mb-1">
+                    {playerColor === 'w' ? '⬛' : '⬜'}
+                  </span>
+                  <div className="relative w-full flex-1 rounded-sm overflow-hidden bg-slate-600 min-h-[200px]" style={{ aspectRatio: '1/16' }}>
+                    {/* White portion: anchored at bottom when playing white, at top when playing black */}
+                    <div
+                      className={`absolute ${playerColor === 'w' ? 'bottom-0' : 'top-0'} left-0 right-0 bg-white transition-all duration-500 ease-out`}
+                      style={{
+                        height: evaluation != null
+                          ? `${(evaluation + 1) / 2 * 100}%`
+                          : '50%',
+                      }}
+                    />
+                    {/* Numeric label */}
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <span
+                        className={`text-[10px] sm:text-xs font-bold px-0.5 ${
+                          evaluation != null && evaluation > 0
+                            ? 'text-slate-800'
+                            : 'text-slate-200'
+                        }`}
+                      >
+                        {evaluation != null
+                          ? (evaluation > 0 ? '+' : '') + evaluation.toFixed(2)
+                          : '0'}
+                      </span>
+                    </div>
+                  </div>
+                  {/* Label bottom */}
+                  <span className="text-[10px] text-slate-500 mt-1">
+                    {playerColor === 'w' ? '⬜' : '⬛'}
+                  </span>
+                </div>
+              )}
+
+              {/* Board */}
+              <div className="w-full max-w-[min(100%,600px)]">
               {/* Captured pieces - Opponent (top) */}
               <div className="flex items-center justify-between mb-2 px-1 min-h-[36px] bg-slate-800/60 rounded-lg py-1.5">
                 <div className="flex items-center gap-0.5 flex-wrap px-2">
@@ -673,6 +761,7 @@ export default function ChessGame() {
                   </span>
                 )}
               </div>
+            </div>
             </div>
 
             {/* Move Navigation */}
@@ -828,6 +917,22 @@ export default function ChessGame() {
               <p className="text-emerald-300/80 text-xs text-center">
                 💡 Use arrow keys or buttons to navigate moves
               </p>
+            </div>
+
+            {/* Eval Bar Toggle */}
+            <div className="bg-slate-800/50 backdrop-blur rounded-xl p-3 border border-slate-700/50">
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-sm text-slate-300">📊 Evaluation Bar</span>
+                <div className="relative">
+                  <input
+                    type="checkbox"
+                    checked={showEvalBar}
+                    onChange={() => setShowEvalBar(prev => !prev)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-9 h-5 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
+                </div>
+              </label>
             </div>
           </div>
         </div>

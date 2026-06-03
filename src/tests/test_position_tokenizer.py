@@ -95,15 +95,9 @@ class TestPositionTokenizer(unittest.TestCase):
         test_positions = [
             chess.Board(),  # Starting position
             chess.Board.empty(),  # Empty board
-            chess.Board(
-                "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
-            ),  # After e4
-            chess.Board(
-                "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2"
-            ),  # After e4 e5
-            chess.Board(
-                "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"
-            ),  # After e4 e5 Nf3 Nc6
+            chess.Board("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"),  # After e4
+            chess.Board("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2"),  # After e4 e5
+            chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"),  # After e4 e5 Nf3 Nc6
         ]
 
         for original_board in test_positions:

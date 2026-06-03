@@ -5,76 +5,117 @@ import numpy as np
 import chess
 from chesstransformer.models.tokenizer.position_tokenizer import PostionTokenizer
 from chesstransformer.models.tokenizer.move_tokenizer import MoveTokenizer
+from chesstransformer.models.tokenizer.alphazero_move_encoder import (
+    move_to_action_plane,
+    NUM_ACTION_PLANES,
+)
+
 
 class HDF5ChessDataset(Dataset):
-    def __init__(self, hdf5_path: str, cache_size: int = 500, min_elo: int = None, max_elo: int = None):
+    def __init__(
+        self,
+        hdf5_path: str,
+        cache_size: int = 500,
+        min_elo: int = None,
+        max_elo: int = None,
+        sample_weighting: str = "middlegame",
+        skip_opening_plies: int = 0,
+    ):
         """
         Efficient dataset that loads games as UCI sequences and samples random positions.
-        
+
         Each dataset index corresponds to one game. When a sample is requested, it:
         1. Uses the index to select a game
-        2. Randomly samples a position uniformly within that game
+        2. Samples a position within that game (uniform or phase-weighted)
         3. Replays the game to that position to get the board state
         4. Returns the encoded board state + the next move
-        
+
         Args:
             hdf5_path: Path to HDF5 file containing games
             cache_size: Number of games to cache in memory
             min_elo: Minimum average ELO for filtering games (optional)
             max_elo: Maximum average ELO for filtering games (optional)
+            sample_weighting: "uniform" (legacy) or "middlegame" (triangular peak around move 25)
+            skip_opening_plies: Force sampling to start at this ply (0 = no restriction)
         """
         self.hdf5_path = hdf5_path
         self.cache_size = cache_size
         self.game_cache = {}  # Cache for game move sequences
         self.position_tokenizer = PostionTokenizer()
         self.move_tokenizer = MoveTokenizer()
-        
+        self.sample_weighting = sample_weighting
+        self.skip_opening_plies = skip_opening_plies
+
         # Load metadata and filter games by ELO
-        with h5py.File(hdf5_path, 'r') as f:
-            self.num_games = f['moves'].shape[0]
-            num_moves = f['num_moves'][:]
-            white_elos = f['white_elo'][:]
-            black_elos = f['black_elo'][:]
-            
+        with h5py.File(hdf5_path, "r") as f:
+            self.num_games = f["moves"].shape[0]
+            num_moves = f["num_moves"][:]
+            white_elos = f["white_elo"][:]
+            black_elos = f["black_elo"][:]
+
             # Filter games by ELO if specified
             valid_games = np.ones(self.num_games, dtype=bool)
             if min_elo is not None or max_elo is not None:
                 avg_elos = (white_elos + black_elos) / 2
                 if min_elo is not None:
-                    valid_games &= (avg_elos >= min_elo)
+                    valid_games &= avg_elos >= min_elo
                 if max_elo is not None:
-                    valid_games &= (avg_elos <= max_elo)
-            
+                    valid_games &= avg_elos <= max_elo
+
             # Store valid game indices and their move counts
             self.valid_game_indices = np.where(valid_games)[0]
             self.num_moves_per_game = num_moves[valid_games]
-            
+
             total_positions = int(self.num_moves_per_game.sum())
             print(f"Loaded dataset: {len(self.valid_game_indices)} games with {total_positions} total positions")
             if min_elo or max_elo:
                 print(f"Filtered by ELO: {min_elo or 0} - {max_elo or 'inf'}")
-    
+
     def __len__(self):
         """Return the number of games in the dataset."""
         return len(self.valid_game_indices)
-    
+
+    def _sample_move_idx(self, max_move_idx: int) -> int:
+        """Sample a position index within a game.
+
+        - "uniform": legacy behavior, np.random.randint(0, max_move_idx)
+        - "middlegame": triangular weight peaking around ply 25,
+          downweights opening (rare unique positions) and very late
+          endgame (sparse signal). Falls back to uniform for short games.
+
+        Optionally enforces ``skip_opening_plies`` as a hard floor.
+        """
+        lo = min(self.skip_opening_plies, max_move_idx - 1) if max_move_idx > 1 else 0
+        hi = max_move_idx  # exclusive upper bound
+
+        if self.sample_weighting == "uniform" or hi - lo <= 8:
+            return int(np.random.randint(lo, hi))
+
+        # Triangular weights: ramp up over plies 0->20, flat 20-40, taper 40->80
+        plies = np.arange(lo, hi)
+        ramp_up = np.minimum(plies / 20.0, 1.0)
+        taper = np.minimum(np.maximum((80.0 - plies) / 40.0, 0.1), 1.0)
+        weights = ramp_up * taper
+        weights = weights / weights.sum()
+        return int(np.random.choice(plies, p=weights))
+
     def _get_game_moves(self, game_idx: int) -> np.ndarray:
         """Load and cache a game's move sequence."""
         if game_idx in self.game_cache:
             return self.game_cache[game_idx]
-        
+
         # Read from HDF5
-        with h5py.File(self.hdf5_path, 'r') as f:
-            moves = f['moves'][game_idx]
-        
+        with h5py.File(self.hdf5_path, "r") as f:
+            moves = f["moves"][game_idx]
+
         # Update cache (simple LRU-like behavior)
         if len(self.game_cache) >= self.cache_size:
             # Remove oldest item
             self.game_cache.pop(next(iter(self.game_cache)))
-        
+
         self.game_cache[game_idx] = moves
         return moves
-    
+
     def __getitem__(self, idx):
         """
         Returns a position-move pair by:
@@ -85,20 +126,19 @@ class HDF5ChessDataset(Dataset):
         """
         # Map dataset index to actual game index
         actual_game_idx = self.valid_game_indices[idx]
-        
+
         # Load game moves
         game_moves = self._get_game_moves(actual_game_idx)
         num_moves = self.num_moves_per_game[idx]
-        
+
         # Uniformly sample a position within the game (exclude last move - no next move)
         max_move_idx = num_moves - 1
         if max_move_idx <= 0:
             # Edge case: game with only one move, use position 0
             move_idx = 0
         else:
-            # Use random sampling for uniform distribution
-            move_idx = np.random.randint(0, max_move_idx)
-        
+            move_idx = self._sample_move_idx(int(max_move_idx))
+
         # Replay game to position
         board = chess.Board()
         for i in range(move_idx):
@@ -112,25 +152,48 @@ class HDF5ChessDataset(Dataset):
                 # If move is invalid, skip to next position
                 # This shouldn't happen with properly encoded data
                 pass
-        
+
         # Encode current position
         position = self.position_tokenizer.encode(board)
         position_tensor = torch.tensor(position, dtype=torch.long)
 
         legal_moves = list(board.legal_moves)
         legal_moves_tokens = torch.zeros(len(self.move_tokenizer.vocab), dtype=torch.bool)
+        legal_moves_grid = torch.zeros(64, 64, dtype=torch.bool)
+        legal_moves_planes = torch.zeros(64, NUM_ACTION_PLANES, dtype=torch.bool)
         for move in legal_moves:
             if move.uci() in self.move_tokenizer.vocab:
                 token_id = self.move_tokenizer.vocab[move.uci()]
                 legal_moves_tokens[token_id] = True
+            legal_moves_grid[move.from_square, move.to_square] = True
+            plane = move_to_action_plane(move.from_square, move.to_square, move.promotion)
+            legal_moves_planes[move.from_square, plane] = True
         legal_moves_tensor = legal_moves_tokens
-        
+
         # Get next move
         next_move_token = torch.tensor(int(game_moves[move_idx]), dtype=torch.long)
-        
+
+        # Parse next move for grid format (from/to squares + promotion)
+        next_move_uci = self._decode_move_token(int(game_moves[move_idx]))
+        next_move = chess.Move.from_uci(next_move_uci)
+        from_square = next_move.from_square
+        to_square = next_move.to_square
+        is_promotion = next_move.promotion is not None
+        # Promotion type: 0=queen/none, 1=rook, 2=bishop, 3=knight
+        promotion_type = 0
+        if next_move.promotion == chess.ROOK:
+            promotion_type = 1
+        elif next_move.promotion == chess.BISHOP:
+            promotion_type = 2
+        elif next_move.promotion == chess.KNIGHT:
+            promotion_type = 3
+
+        # AlphaZero action plane for this move
+        action_plane = move_to_action_plane(from_square, to_square, next_move.promotion)
+
         # Get turn indicator
         is_white = board.turn  # True for white, False for black
-        
+
         # Get castling rights as a single integer (0-15)
         # Bit 0: white kingside, Bit 1: white queenside, Bit 2: black kingside, Bit 3: black queenside
         castling_rights = 0
@@ -142,52 +205,60 @@ class HDF5ChessDataset(Dataset):
             castling_rights |= 4
         if board.has_queenside_castling_rights(chess.BLACK):
             castling_rights |= 8
-        
+
         # Get en passant file (0-7 for a-h, 8 for none)
         if board.has_legal_en_passant():
             en_passant_file = chess.square_file(board.ep_square)
         else:
             en_passant_file = 8  # No en passant
-        
+
         # Get halfmove clock (for 50-move rule)
         halfmove_clock = board.halfmove_clock
-        
+
         # Get game metadata
-        with h5py.File(self.hdf5_path, 'r') as f:
-            white_elo = int(f['white_elo'][actual_game_idx])
-            black_elo = int(f['black_elo'][actual_game_idx])
-            result = int(f['result'][actual_game_idx])
-        
+        with h5py.File(self.hdf5_path, "r") as f:
+            white_elo = int(f["white_elo"][actual_game_idx])
+            black_elo = int(f["black_elo"][actual_game_idx])
+            result = int(f["result"][actual_game_idx])
+
         return {
-            'position': position_tensor,
-            'move': next_move_token,
-            'is_white': is_white,
-            'castling_rights': castling_rights,
-            'en_passant_file': en_passant_file,
-            'halfmove_clock': halfmove_clock,
-            'game_id': actual_game_idx,
-            'move_number': move_idx,
-            'white_elo': white_elo,
-            'black_elo': black_elo,
-            'result': result,
-            'legal_moves_mask': legal_moves_tensor
+            "position": position_tensor,
+            "move": next_move_token,
+            "is_white": is_white,
+            "castling_rights": castling_rights,
+            "en_passant_file": en_passant_file,
+            "halfmove_clock": halfmove_clock,
+            "game_id": actual_game_idx,
+            "move_number": move_idx,
+            "white_elo": white_elo,
+            "black_elo": black_elo,
+            "result": result,
+            "legal_moves_mask": legal_moves_tensor,
+            "from_square": from_square,
+            "to_square": to_square,
+            "is_promotion": is_promotion,
+            "promotion_type": promotion_type,
+            "action_plane": action_plane,
+            "legal_moves_grid": legal_moves_grid,
+            "legal_moves_planes": legal_moves_planes,
         }
-    
+
     def _decode_move_token(self, token: int) -> str:
         """Decode a move token back to UCI string."""
         return self.move_tokenizer.decode(token)
-    
+
+
 if __name__ == "__main__":
     # Example usage
     import sys
-    
+
     if len(sys.argv) < 2:
         print("Usage: python h5_lichess_dataset.py <path_to_h5_file>")
         sys.exit(1)
-    
+
     dataset = HDF5ChessDataset(sys.argv[1], cache_size=100)
     print(f"Dataset length: {len(dataset)}")
-    
+
     # Test a few samples
     for i in range(min(5, len(dataset))):
         sample = dataset[i]

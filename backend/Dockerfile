@@ -28,6 +28,9 @@ RUN uv sync --frozen --no-dev
 # Copy backend code
 COPY backend/ ./backend/
 
+# Copy default model weights
+COPY data/models/pos2move_v2/ ./data/models/pos2move_v2/
+
 # Expose port
 EXPOSE 5001
 
@@ -35,5 +38,5 @@ EXPOSE 5001
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Run the API server
-CMD ["uv", "run", "python", "backend/api.py"]
+# Run the API server (use venv Python directly to avoid uv syncing dev deps at startup)
+CMD ["/app/.venv/bin/python", "backend/api.py"]
