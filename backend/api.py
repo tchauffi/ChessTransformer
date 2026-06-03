@@ -13,10 +13,12 @@ from chesstransformer.bots import Pos2MoveV2Bot, RandomBot
 
 app = FastAPI(title="ChessTransformer API")
 
-# Enable CORS for frontend requests
+_origins = os.environ.get("ALLOWED_ORIGINS", "*")
+_allow_origins = [o.strip() for o in _origins.split(",")] if _origins != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -108,28 +110,21 @@ async def get_bot_move(request: MoveRequest):
     }
     """
     try:
-        # Create board from FEN
         board = chess.Board(request.fen)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid FEN string")
 
-        # Check if game is over
+    try:
         if board.is_game_over():
-            raise HTTPException(
-                status_code=400,
-                detail="Game is already over"
-            )
+            raise HTTPException(status_code=400, detail="Game is already over")
 
-        # Get bot's move
         move_uci, probability = bot.predict(board)
-
-        # Apply move
         board.push_uci(move_uci)
 
-        # Get value estimate for the new position (if supported)
         value = None
         if hasattr(bot, 'get_value'):
             value = bot.get_value(board)
 
-        # Return move and new board state
         return MoveResponse(
             move=move_uci,
             probability=probability,
@@ -169,25 +164,22 @@ async def validate_move(request: ValidateMoveRequest):
     """
     try:
         board = chess.Board(request.fen)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid FEN string")
 
-        # Check if move is legal
-        try:
-            move = chess.Move.from_uci(request.move)
-            if move in board.legal_moves:
-                board.push(move)
-                return ValidateMoveResponse(
-                    valid=True,
-                    fen=board.fen(),
-                    game_over=board.is_game_over(),
-                    result=board.result() if board.is_game_over() else None,
-                )
-            else:
-                return ValidateMoveResponse(valid=False, error="Illegal move")
-        except ValueError:
-            return ValidateMoveResponse(valid=False, error="Invalid move format")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    try:
+        move = chess.Move.from_uci(request.move)
+        if move in board.legal_moves:
+            board.push(move)
+            return ValidateMoveResponse(
+                valid=True,
+                fen=board.fen(),
+                game_over=board.is_game_over(),
+                result=board.result() if board.is_game_over() else None,
+            )
+        return ValidateMoveResponse(valid=False, error="Illegal move")
+    except ValueError:
+        return ValidateMoveResponse(valid=False, error="Invalid move format")
 
 
 @app.post("/api/evaluate", response_model=EvalResponse)
@@ -195,12 +187,13 @@ async def evaluate_position(request: EvalRequest):
     """Get the bot's value estimate for a position."""
     try:
         board = chess.Board(request.fen)
-        value = None
-        if hasattr(bot, 'get_value'):
-            value = bot.get_value(board)
-        return EvalResponse(value=value)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid FEN string")
+
+    value = None
+    if hasattr(bot, 'get_value'):
+        value = bot.get_value(board)
+    return EvalResponse(value=value)
 
 
 if __name__ == "__main__":
