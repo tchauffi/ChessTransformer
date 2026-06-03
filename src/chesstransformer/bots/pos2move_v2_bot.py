@@ -15,7 +15,7 @@ from chesstransformer.models.tokenizer import PostionTokenizer
 from chesstransformer.models.tokenizer.alphazero_move_encoder import move_to_action_plane
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2
 
-_DEFAULT_RUN = Path(__file__).parents[1] / "data" / "models" / "pos2move_v2"
+_DEFAULT_RUN = Path(__file__).parents[3] / "data" / "models" / "pos2move_v2"
 
 
 class _SearchTimeout(Exception):
