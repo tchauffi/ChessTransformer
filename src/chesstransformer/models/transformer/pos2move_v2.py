@@ -53,6 +53,9 @@ def build_chess_relation_index(context_size: int = CONTEXT_SIZE) -> torch.Tensor
     return rel
 
 
+_RELATION_INDEX: torch.Tensor = build_chess_relation_index()
+
+
 class ReluSquared(nn.Module):
     def forward(self, x):
         return F.relu(x) ** 2
@@ -86,7 +89,7 @@ class ChessGroupedQueryAttention(nn.Module):
         # Massively fewer params than fully-learned (H, T, T) bias.
         self.num_relations = 8
         self.bias_table = nn.Parameter(torch.zeros(num_heads, self.num_relations))
-        self.register_buffer("rel_idx", build_chess_relation_index(context_size), persistent=False)
+        self.register_buffer("rel_idx", _RELATION_INDEX, persistent=False)
 
 
     def forward(self, x):

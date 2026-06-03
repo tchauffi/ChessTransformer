@@ -214,7 +214,7 @@ class Pos2MoveV2Bot:
         for i, (_, _, _, _, fen) in enumerate(items):
             if self._tt_size > 0 and len(self._tt) >= self._tt_size:
                 del self._tt[next(iter(self._tt))]
-            self._tt[fen] = (logits_np[i], float(values_np[i]))
+            self._tt[fen] = (logits_np[i], float(values_np[i].item()))
 
     def _encode_position(self, board: chess.Board) -> tuple[np.ndarray, int, int, int]:
         position = self.position_tokenizer.encode(board)
