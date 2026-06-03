@@ -1,132 +1,152 @@
 # ChessTransformer
 
-This project aims to test the hypothesis that transformer is a suitable architecture for chess engines. After learning more about transformers, and it's capacity to model long text sequences, I want to see if it can be applied to chess, which is also a game with long sequences of moves. My main intuition is that a squence of chess moves can be treated similarly to a sequence of words in a sentence, where each move is dependent on the previous moves.
+A transformer-based chess engine trained on elite Lichess games. The model learns to predict moves directly from board positions, then plays via alpha-beta search guided by its policy and value heads.
 
-The final goal of the project is to build a transformer-based chess engine that can play chess at a high level, and evaluate its performance against existing chess engines such as Stockfish.
+**Current strength: ~1550 Elo** (depth-3 alpha-beta vs Stockfish, June 2026)
 
-## Features
+## Architecture — Pos2MoveV2
 
-### ✅ Implemented
-- ✅ Chess move tokenization (UCI format)
-- ✅ Position-based transformer model (Position2Move)
-- ✅ Training on Lichess game database
-- ✅ **Puzzle-based training and evaluation** (NEW!)
+| Component | Details |
+|---|---|
+| Parameters | 11.7M |
+| Attention | Grouped Query Attention (8 heads, 4 KV groups) + QK-norm |
+| Position bias | Learnable chess-geometry relative bias (8 relation categories: file, rank, diagonal, knight-reach, king-adjacent, nearby, far, global) |
+| Policy head | AlphaZero-style 64×73 action planes |
+| Value head | Board state → scalar in (−1, 1) |
+| Training | Muon + AdamW mixed optimizer, BF16, stochastic depth |
+| Search | Iterative-deepening alpha-beta, nucleus filtering (top-p), transposition table |
 
-### 🚧 To Do
-- [ ] Fine tune model to play chess using reinforcement learning
-- [ ] Add the possibility to choose the elo level of the engine
-- [ ] Evaluate model performance against existing chess engines
-- [ ] Optimize model for inference speed and memory usage
-- [ ] Explore potential applications of the model in chess analysis and training tools
-- [x] Create Next.js frontend for human-vs-bot testing
+## Elo Evaluation
 
-### 💡 Future Ideas
-- [ ] Multimodal approach: vision transformer for chessboard images + move sequences
-- [ ] LLM integration for natural language move explanations
+| Stockfish skill | Approx. Elo | Result |
+|---|---|---|
+| ≤ 2 | ≤ 1000 | 100% win rate |
+| 7 | ~1600 | ~50 / 50 |
+| 8 | ~1700 | Heavy losses |
+
+Evaluated with `scripts/elo_gauntlet.py` over 100 games across skills 0–10.
 
 ## Quick Start
 
-### Train on Chess Puzzles
+### Docker (recommended)
 
-Train a model on tactical puzzles from Lichess:
-
-```bash
-# Quick test with limited puzzles
-uv run scripts/test_puzzle_dataset.py
-
-# Full training on medium difficulty puzzles
-./scripts/train_puzzle.sh --min-rating 1200 --max-rating 1800 --epochs 10
-
-# Or use the trainer directly
-uv run src/chesstransformer/trainers/puzzle_trainer.py --help
-```
-
-### Evaluate Puzzle Performance
-
-```bash
-uv run src/chesstransformer/utils/evaluate_puzzles.py \
-    --model data/models/puzzle_training/run_001/best_model.pth \
-    --num-puzzles 1000
-```
-
-See [doc/puzzle_training.md](doc/puzzle_training.md) for detailed documentation.
-
-## Project installation
-The project uses UV for Python dependency management. To install the project:
-
-```bash
-uv sync
-```
-
-This will install all required dependencies including the web frontend API dependencies (FastAPI, uvicorn).
-
-For development with additional tools:
-
-```bash
-uv sync --group dev
-```
-
-## Web Frontend for Human vs Bot Testing
-
-A Next.js web application is available for testing the chess bot interactively. See [frontend/README.md](frontend/README.md) for detailed setup and usage instructions.
-
-**Quick Start (Development):**
-
-1. Start the backend API server:
-```bash
-cd backend
-uv run python api.py
-```
-
-2. In a separate terminal, start the frontend:
-```bash
-cd frontend
-npm install  # First time only
-npm run dev
-```
-
-3. Open http://localhost:3000 in your browser and start playing!
-
-## Docker Deployment
-
-Deploy the entire application using Docker Compose:
-
-**Development mode:**
 ```bash
 docker compose up --build
 ```
 
-The application will be available at:
-- Development: Frontend at http://localhost:3000, API at http://localhost:5001
-- Production: Everything at http://localhost (port 80)
+- Frontend: http://localhost:3000
+- API: http://localhost:5001
 
-## Project structure
-The project is structured as follows:
+Model weights are baked into the backend image — no volume mounts needed.
+
+**With GPU (NVIDIA):**
+```bash
+docker compose up --build   # deploy.resources.reservations already set in docker-compose.yml
+```
+Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host.
+
+### Local Development
+
+1. Install dependencies:
+```bash
+uv sync
+```
+
+2. Start the backend:
+```bash
+uv run python backend/api.py
+```
+
+3. Start the frontend (separate terminal):
+```bash
+cd frontend
+npm install   # first time only
+npm run dev
+```
+
+4. Open http://localhost:3000 and start playing.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_PATH` | `data/models/pos2move_v2` | Path to a checkpoint directory |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+
+## Training
+
+### Data preparation
+
+```bash
+# Convert PGN/PGN.zst files to HDF5
+uv run src/chesstransformer/datasets/dataset_h5_convertor.py \
+    --input data/games/ --output data/elite_db.h5
+
+# Inspect position distribution
+uv run scripts/dataset_sanity_check.py --data data/elite_db.h5 --games 5000
+```
+
+### Train Pos2MoveV2
+
+```bash
+uv run src/chesstransformer/trainers/pos2move_v2_trainer.py
+```
+
+### Evaluate
+
+```bash
+# Elo gauntlet vs Stockfish
+uv run scripts/elo_gauntlet.py data/models/pos2move_v2 \
+    --depth 3 --games 10 --skills 0 2 4 6 7 8
+
+# Export to ONNX (for TensorRT)
+uv run scripts/export_onnx.py data/models/pos2move_v2
+```
+
+## Project Structure
+
 ```
 ChessTransformer/
-├── backend/                # FastAPI backend server for bot integration
-│   ├── api.py             # API endpoints for chess bot
-│   └── Dockerfile         # Backend container definition
-├── frontend/               # Next.js web application
-│   ├── app/               # Next.js app directory
-│   ├── Dockerfile         # Frontend container definition
-│   └── README.md          # Frontend documentation
-├── docker-compose.yml      # Development Docker orchestration
-├── docker-compose.prod.yml # Production Docker with Nginx
-├── nginx.conf              # Nginx reverse proxy configuration
-├── data/                   # Data processing scripts and datasets
-├── doc/                    # Documentation files
-├── src/                    # Source code
-│   └── chesstransformer/   # Main package
-│       ├── bots/          # Chess bot implementations
-│       ├── data/           # Data loading and preprocessing
-│       ├── models/         # Model architectures
-│       ├── trainers/       # Training scripts
-│       └── utils/          # Utility functions
-├── tests/                  # Unit tests
-├── .gitignore              # Git ignore file
-├── LICENSE                 # License file
-├── README.md               # Project overview and setup instructions
-├── pyproject.toml          # Project metadata and dependencies
-└── uv.lock                 # UV lock file
+├── backend/
+│   ├── api.py                        # FastAPI server (move, evaluate, validate endpoints)
+│   └── Dockerfile
+├── frontend/                         # Next.js web app (human vs bot)
+│   └── app/components/ChessGame.tsx  # Main game component
+├── data/
+│   └── models/pos2move_v2/           # Bundled model weights
+├── scripts/
+│   ├── elo_gauntlet.py               # Elo estimation vs Stockfish
+│   ├── export_onnx.py                # ONNX export for TensorRT
+│   ├── quantize_onnx.py              # INT8 quantization
+│   ├── dataset_sanity_check.py       # Dataset distribution analysis
+│   └── compress_pgn_to_zst.py        # PGN compression utility
+├── src/chesstransformer/
+│   ├── bots/
+│   │   ├── pos2move_v2_bot.py        # Alpha-beta bot (main)
+│   │   └── random_bot.py
+│   ├── models/
+│   │   ├── transformer/pos2move_v2.py  # Model architecture
+│   │   └── tokenizer/
+│   │       ├── alphazero_move_encoder.py  # 64×73 action planes
+│   │       ├── position_tokenizer.py
+│   │       └── move_tokenizer.py
+│   ├── datasets/
+│   │   ├── h5_lichess_dataset.py     # HDF5 dataset with phase-weighted sampling
+│   │   └── dataset_h5_convertor.py
+│   ├── optimizer.py                  # AdamW + Muon combined optimizer
+│   └── trainers/
+│       └── pos2move_v2_trainer.py
+├── docker-compose.yml
+├── pyproject.toml
+└── uv.lock
+```
+
+## Installation (development extras)
+
+```bash
+# Linting / formatting
+uv sync --group dev
+
+# ONNX / TensorRT export
+uv sync --group optimized
 ```
