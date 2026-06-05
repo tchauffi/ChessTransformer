@@ -9,7 +9,7 @@ from pydantic import BaseModel
 import chess
 import os
 
-from chesstransformer.bots import Pos2MoveV2Bot, RandomBot
+from chesstransformer.bots import Pos2MoveV2Bot, Pos2MoveV2MctsBot, RandomBot
 
 app = FastAPI(title="ChessTransformer API")
 
@@ -24,16 +24,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Set MODEL_PATH env var to point to a specific checkpoint directory
+# Set MODEL_PATH env var to point to a specific checkpoint directory.
+# ENGINE selects the search: "mcts" (default, strongest — won 82% head-to-head
+# vs the alpha-beta engine) or "alphabeta". MCTS_SIMS tunes MCTS strength/speed.
 model_path = os.environ.get("MODEL_PATH")
+engine = os.environ.get("ENGINE", "mcts").lower()
 try:
     kwargs = {}
     if model_path:
         kwargs["model_dir"] = model_path
-    bot = Pos2MoveV2Bot(**kwargs)
-    bot_type = "Pos2MoveV2Bot"
+    if engine == "alphabeta":
+        bot = Pos2MoveV2Bot(**kwargs)
+        bot_type = "Pos2MoveV2Bot (alpha-beta)"
+    else:
+        kwargs["num_simulations"] = int(os.environ.get("MCTS_SIMS", "400"))
+        bot = Pos2MoveV2MctsBot(**kwargs)
+        bot_type = "Pos2MoveV2MctsBot (MCTS)"
 except Exception as e:
-    print(f"Warning: Could not load Pos2MoveV2Bot: {e}")
+    print(f"Warning: Could not load Pos2MoveV2 bot: {e}")
     print("Falling back to RandomBot")
     bot = RandomBot()
     bot_type = "RandomBot"
