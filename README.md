@@ -2,11 +2,11 @@
 
 A transformer-based chess engine trained on elite Lichess games. The model learns to predict moves directly from board positions, then plays via an AlphaZero-style MCTS (policy priors + value head), with a compiled alpha-beta engine as an alternative.
 
-**Current strength: ~2075 Elo** (MCTS @ 800 sims with FPU + tuned c_puct, model v2.1, vs Stockfish — MLE estimate over a 140-game gauntlet, skills 0–12, June 2026)
+**Current strength: ~2100 Elo** (MCTS @ 800 sims with FPU + tuned c_puct + tree reuse, model v2.1, vs Stockfish — MLE estimate over a 140-game gauntlet, skills 0–12, June 2026)
 
 ## Improvements (June 2026)
 
-Inference-side overhaul — **~1550 → ~2075 Elo (+~525), no retraining**:
+Inference-side overhaul — **~1550 → ~2100 Elo (+~550), no retraining**:
 
 | Change | Effect |
 |---|---|
@@ -45,17 +45,16 @@ Both run a `torch.compile`/CUDA-graph forward (~2.3× faster, lossless).
 
 ## Elo Evaluation
 
-MCTS @ 800 sims (`c_puct=1.0`, `fpu=0.2`), model v2.1, 20 games/level vs Stockfish (`scripts/tune_vs_stockfish.py`):
+MCTS @ 800 sims (`c_puct=1.0`, `fpu=0.2`, tree reuse), model v2.1, 20 games/level vs Stockfish (`scripts/tune_vs_stockfish.py`):
 
 | Stockfish skill | Approx. Elo | Score |
 |---|---|---|
-| 0–4 | ≤ 1200 | 100% |
-| 6 | ~1500 | 97.5% |
-| 8 | ~1700 | 100% |
-| 10 | ~1900 | 62.5% |
-| 12 | ~2100 | 47.5% |
+| 0–6 | ≤ 1500 | 100% |
+| 8 | ~1700 | 90% |
+| 10 | ~1900 | 85% |
+| 12 | ~2100 | 35% |
 
-**MLE estimate: ~2075 Elo.** Elo is fit by maximum likelihood over all games (averaging per-level estimates is biased low — saturated easy levels cap at a low value and drag the mean). Search tuning (FPU + `c_puct` + 800 sims) added ~+280 Elo over the untuned MCTS@400 baseline (~1793), with no retraining.
+**MLE estimate: ~2100 Elo.** Elo is fit by maximum likelihood over all games (averaging per-level estimates is biased low — saturated easy levels cap at a low value and drag the mean). Search tuning (FPU + `c_puct` + 800 sims) added ~+280 Elo over the untuned MCTS@400 baseline (~1793), and tree reuse a further small gain — all with no retraining. (Per-level scores carry ~20-game noise; the MLE smooths it.)
 
 ## Quick Start
 
@@ -103,7 +102,7 @@ npm run dev
 |---|---|---|
 | `MODEL_PATH` | `data/models/pos2move_v2.1` | Path to a checkpoint directory |
 | `ENGINE` | `mcts` | Search engine: `mcts` or `alphabeta` |
-| `MCTS_SIMS` | `400` | MCTS simulations per move (when `ENGINE=mcts`) |
+| `MCTS_SIMS` | `800` | MCTS simulations per move (when `ENGINE=mcts`) |
 | `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
 
 ## Training
