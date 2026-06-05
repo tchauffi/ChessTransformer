@@ -7,6 +7,7 @@ import time as _time
 from pathlib import Path
 
 import chess
+import chess.polyglot
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -15,7 +16,11 @@ from chesstransformer.models.tokenizer import PostionTokenizer
 from chesstransformer.models.tokenizer.alphazero_move_encoder import move_to_action_plane
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2
 
-_DEFAULT_RUN = Path(__file__).parents[3] / "data" / "models" / "pos2move_v2"
+_DEFAULT_RUN = Path(__file__).parents[3] / "data" / "models" / "pos2move_v2.1"
+
+# Fixed batch-size buckets. Batched evals are zero-padded up to the next bucket
+# so the (optionally compiled) model only ever sees a handful of static shapes.
+_BATCH_BUCKETS = (4, 8, 16, 32)
 
 
 class _SearchTimeout(Exception):
@@ -32,10 +37,13 @@ class Pos2MoveV2Bot:
         tt_size: int = 500_000,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         use_ema: bool = False,
+        compile: bool = True,
+        quiescence_depth: int = 4,
     ):
         self.depth = depth
         self.top_p = top_p
         self.time_limit = time_limit
+        self.quiescence_depth = quiescence_depth
         self.nodes_searched = 0
         self.tt_hits = 0
         self.completed_depth = 0
@@ -84,10 +92,24 @@ class Pos2MoveV2Bot:
         self._buf_player = torch.zeros(1, dtype=torch.long, device=device)
         self._buf_castling = torch.zeros(1, dtype=torch.long, device=device)
         self._buf_ep = torch.zeros(1, dtype=torch.long, device=device)
+        self._batch_bufs: dict[int, tuple] = {}
 
         self._tt_size = tt_size
-        self._tt: dict[str, tuple[np.ndarray, float]] = {}
+        self._tt: dict[int, tuple[np.ndarray, float]] = {}
         self._deadline: float = 0.0
+
+        # CUDA graphs collapse the Python/kernel-launch overhead that dominates
+        # this tiny model at small batch sizes. Bucketed batches keep the number
+        # of captured graphs small. Falls back to eager if compilation fails.
+        self._compiled = False
+        if compile and device == "cuda":
+            self._eager_model = self.model
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                self._compiled = True
+            except Exception as e:  # pragma: no cover - environment dependent
+                print(f"WARNING: torch.compile unavailable ({e}); using eager.")
+                self.model = self._eager_model
 
         self._warmup()
 
@@ -98,8 +120,24 @@ class Pos2MoveV2Bot:
 
     @torch.no_grad()
     def _warmup(self):
-        for _ in range(3):
-            self.model(self._buf_board, self._buf_player, self._buf_castling, self._buf_ep)
+        try:
+            # Batch-1 path (single-position _evaluate).
+            for _ in range(3):
+                self.model(self._buf_board, self._buf_player, self._buf_castling, self._buf_ep)
+            # Each bucket shape used by _batch_run, so compilation / CUDA-graph
+            # capture happens up front rather than mid-search.
+            for bucket in _BATCH_BUCKETS:
+                b, p, c, e = self._batch_buffers(bucket)
+                for _ in range(3):
+                    self.model(b, p, c, e)
+        except Exception as e:  # pragma: no cover - environment dependent
+            if self._compiled:
+                print(f"WARNING: compiled warmup failed ({e}); falling back to eager.")
+                self.model = self._eager_model
+                self._compiled = False
+                self.model(self._buf_board, self._buf_player, self._buf_castling, self._buf_ep)
+            else:
+                raise
         if self.device == "cuda":
             torch.cuda.synchronize()
 
@@ -156,9 +194,8 @@ class Pos2MoveV2Bot:
 
     @torch.no_grad()
     def _evaluate(self, board: chess.Board) -> tuple[np.ndarray, float]:
-        ep = chess.square_name(board.ep_square) if board.ep_square else "-"
-        fen = f"{board.board_fen()} {'w' if board.turn else 'b'} {board.castling_xfen() or '-'} {ep}"
-        cached = self._tt.get(fen)
+        key = chess.polyglot.zobrist_hash(board)
+        cached = self._tt.get(key)
         if cached is not None:
             self.tt_hits += 1
             return cached
@@ -190,17 +227,44 @@ class Pos2MoveV2Bot:
 
         if self._tt_size > 0 and len(self._tt) >= self._tt_size:
             del self._tt[next(iter(self._tt))]
-        self._tt[fen] = (logits, value)
+        self._tt[key] = (logits, value)
 
         return logits, value
 
+    def _batch_buffers(self, bucket: int):
+        """Persistent zero-padded device buffers per bucket size.
+
+        Using a small fixed set of batch shapes keeps torch.compile / CUDA
+        graphs from recompiling (and re-capturing) on every distinct batch size.
+        """
+        bufs = self._batch_bufs.get(bucket)
+        if bufs is None:
+            bufs = (
+                torch.zeros(bucket, 64, dtype=torch.long, device=self.device),
+                torch.zeros(bucket, dtype=torch.long, device=self.device),
+                torch.zeros(bucket, dtype=torch.long, device=self.device),
+                torch.zeros(bucket, dtype=torch.long, device=self.device),
+            )
+            self._batch_bufs[bucket] = bufs
+        return bufs
+
+    @staticmethod
+    def _bucket_for(n: int) -> int:
+        for b in _BATCH_BUCKETS:
+            if n <= b:
+                return b
+        return _BATCH_BUCKETS[-1]
+
     @torch.no_grad()
-    def _batch_run(self, items: list[tuple[np.ndarray, int, int, int, str]]):
+    def _batch_run(self, items: list[tuple[np.ndarray, int, int, int, int]]):
         n = len(items)
-        board_arr = torch.zeros(n, 64, dtype=torch.long, device=self.device)
-        player_arr = torch.zeros(n, dtype=torch.long, device=self.device)
-        castling_arr = torch.zeros(n, dtype=torch.long, device=self.device)
-        ep_arr = torch.zeros(n, dtype=torch.long, device=self.device)
+        bucket = self._bucket_for(n)
+        board_arr, player_arr, castling_arr, ep_arr = self._batch_buffers(bucket)
+        # Zero the padding rows (token/index 0 is a valid embedding index).
+        board_arr.zero_()
+        player_arr.zero_()
+        castling_arr.zero_()
+        ep_arr.zero_()
 
         for i, (pos, player, castling, ep, _) in enumerate(items):
             board_arr[i] = torch.tensor(pos, dtype=torch.long)
@@ -209,13 +273,14 @@ class Pos2MoveV2Bot:
             ep_arr[i] = ep
 
         move_logits, value_t = self.model(board_arr, player_arr, castling_arr, ep_arr)
-        logits_np = move_logits.float().cpu().numpy()
-        values_np = value_t.float().cpu().numpy()
+        # Slice off padding before the host copy.
+        logits_np = move_logits[:n].float().cpu().numpy()
+        values_np = value_t[:n].float().cpu().numpy()
 
-        for i, (_, _, _, _, fen) in enumerate(items):
+        for i, (_, _, _, _, key) in enumerate(items):
             if self._tt_size > 0 and len(self._tt) >= self._tt_size:
                 del self._tt[next(iter(self._tt))]
-            self._tt[fen] = (logits_np[i], float(values_np[i].item()))
+            self._tt[key] = (logits_np[i], float(values_np[i].item()))
 
     def _encode_position(self, board: chess.Board) -> tuple[np.ndarray, int, int, int]:
         position = self.position_tokenizer.encode(board)
@@ -236,11 +301,15 @@ class Pos2MoveV2Bot:
         uncached = []
         for move in moves:
             board.push(move)
-            ep = chess.square_name(board.ep_square) if board.ep_square else "-"
-            fen = f"{board.board_fen()} {'w' if board.turn else 'b'} {board.castling_xfen() or '-'} {ep}"
-            if fen not in self._tt and not board.is_game_over(claim_draw=True):
+            key = chess.polyglot.zobrist_hash(board)
+            # Cheap terminal proxy: positions with no legal moves (checkmate /
+            # stalemate) are scored directly by _alpha_beta, so skip a wasted
+            # model eval on them. Claimable-draw positions (threefold / 50-move)
+            # still have legal moves; caching their eval is harmless because
+            # _alpha_beta's authoritative is_game_over check overrides it.
+            if key not in self._tt and any(board.legal_moves):
                 pos, player, castling, ep_file = self._encode_position(board)
-                uncached.append((pos, player, castling, ep_file, fen))
+                uncached.append((pos, player, castling, ep_file, key))
             board.pop()
         if len(uncached) >= 2:
             self._batch_run(uncached)
@@ -271,15 +340,78 @@ class Pos2MoveV2Bot:
                 best_move = move
         return best_move, alpha
 
+    def _terminal_value(self, board: chess.Board) -> float | None:
+        """Negamax terminal value (side-to-move POV), or None if not terminal.
+
+        Uses cheap checks instead of ``is_game_over(claim_draw=True)`` (whose
+        ``can_claim_threefold_repetition`` dominated the profile): no-legal-move
+        positions are mate/stalemate, and draws are detected via material,
+        3-fold repetition and the 50-move clock — without the expensive
+        "a move *could* force a repetition" probe.
+        """
+        if not any(board.legal_moves):
+            return -1.0 if board.is_check() else 0.0
+        if (
+            board.is_insufficient_material()
+            or board.is_repetition(3)
+            or board.halfmove_clock >= 100
+        ):
+            return 0.0
+        return None
+
+    @torch.no_grad()
+    def _quiescence(self, board: chess.Board, alpha: float, beta: float, qdepth: int) -> float:
+        """Resolve tactical noise before trusting the value head.
+
+        Stand-pat on the value head, then search only forcing moves (captures
+        and promotions) so the leaf isn't evaluated in the middle of an
+        unresolved exchange (the horizon effect).
+        """
+        self.nodes_searched += 1
+        self._check_time()
+
+        term = self._terminal_value(board)
+        if term is not None:
+            return term
+
+        logits, stand_pat = self._evaluate(board)
+        if stand_pat >= beta:
+            return beta
+        if stand_pat > alpha:
+            alpha = stand_pat
+        if qdepth <= 0:
+            return alpha
+
+        noisy = []
+        for move in board.legal_moves:
+            if board.is_capture(move) or move.promotion:
+                plane = move_to_action_plane(move.from_square, move.to_square, move.promotion)
+                noisy.append((float(logits[move.from_square, plane]), move))
+        if not noisy:
+            return alpha
+        noisy.sort(key=lambda x: -x[0])
+
+        for _, move in noisy:
+            board.push(move)
+            score = -self._quiescence(board, -beta, -alpha, qdepth - 1)
+            board.pop()
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+        return alpha
+
     def _alpha_beta(self, board: chess.Board, depth: int, alpha: float, beta: float, max_depth: int) -> float:
         self.nodes_searched += 1
         self._check_time()
 
-        if board.is_game_over(claim_draw=True):
-            result = board.result(claim_draw=True)
-            return 0.0 if result == "1/2-1/2" else -1.0
+        term = self._terminal_value(board)
+        if term is not None:
+            return term
 
         if depth <= 0:
+            if self.quiescence_depth > 0:
+                return self._quiescence(board, alpha, beta, self.quiescence_depth)
             _, value = self._evaluate(board)
             return value
 
