@@ -43,7 +43,7 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
     def __init__(
         self,
         *args,
-        num_simulations: int = 400,
+        num_simulations: int = 800,
         c_puct: float = 1.0,
         prior_temp: float = 1.0,
         fpu: float | None = 0.2,
@@ -240,7 +240,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("model_dir", nargs="?", default=str(_DEFAULT_RUN))
-    parser.add_argument("--sims", type=int, default=400)
+    parser.add_argument("--sims", type=int, default=800)
     parser.add_argument("--c-puct", type=float, default=1.5)
     parser.add_argument("--ema", action="store_true")
     args = parser.parse_args()

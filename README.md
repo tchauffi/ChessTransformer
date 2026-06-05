@@ -2,7 +2,7 @@
 
 A transformer-based chess engine trained on elite Lichess games. The model learns to predict moves directly from board positions, then plays via an AlphaZero-style MCTS (policy priors + value head), with a compiled alpha-beta engine as an alternative.
 
-**Current strength: ~1775 Elo** (MCTS @ 400 sims, model v2.1, vs Stockfish — 140-game gauntlet over skills 0–12, June 2026)
+**Current strength: ~2075 Elo** (MCTS @ 800 sims with FPU + tuned c_puct, model v2.1, vs Stockfish — MLE estimate over a 140-game gauntlet, skills 0–12, June 2026)
 
 ## Architecture — Pos2MoveV2
 
@@ -22,24 +22,24 @@ A transformer-based chess engine trained on elite Lichess games. The model learn
 
 Two search engines share the same network (`Pos2MoveV2`):
 
-- **MCTS / PUCT** (`Pos2MoveV2MctsBot`, default) — AlphaZero-style. Uses the policy head as priors and the value head at leaves; picks the most-visited move. Batched-leaf evaluation with virtual loss collects several leaves per network call, amortizing the GPU→CPU sync (~8× faster than single-leaf). Beat the alpha-beta engine ~82% head-to-head.
+- **MCTS / PUCT** (`Pos2MoveV2MctsBot`, default) — AlphaZero-style. Policy head → priors, value head → leaf scores, most-visited move chosen. Batched-leaf evaluation with virtual loss amortizes the GPU→CPU sync (~8× faster than single-leaf). Tuned for **exploitation**: first-play-urgency (`fpu=0.2`) and `c_puct=1.0` (flatter priors / more exploration both lost). With FPU the search scales with simulations, so the default is **800 sims**.
 - **Alpha-beta** (`Pos2MoveV2Bot`) — iterative-deepening negamax with quiescence search, policy-prior move ordering, and a Zobrist transposition table.
 
 Both run a `torch.compile`/CUDA-graph forward (~2.3× faster, lossless).
 
 ## Elo Evaluation
 
-MCTS @ 400 sims, model v2.1, 20 games/level vs Stockfish (`scripts/tune_vs_stockfish.py`):
+MCTS @ 800 sims (`c_puct=1.0`, `fpu=0.2`), model v2.1, 20 games/level vs Stockfish (`scripts/tune_vs_stockfish.py`):
 
 | Stockfish skill | Approx. Elo | Score |
 |---|---|---|
-| 0–4 | ≤ 1200 | 95–100% |
-| 6 | ~1500 | 70% |
-| 8 | ~1700 | 62.5% |
-| 10 | ~1900 | 40% |
-| 12 | ~2100 | 27.5% |
+| 0–4 | ≤ 1200 | 100% |
+| 6 | ~1500 | 97.5% |
+| 8 | ~1700 | 100% |
+| 10 | ~1900 | 62.5% |
+| 12 | ~2100 | 47.5% |
 
-**Weighted estimate: ~1775 Elo.** Tuning showed MCTS @ 400 sims is the sweet spot (~1725 in the quick scan, ~+175 Elo over the best alpha-beta config; 800 sims gave no gain).
+**MLE estimate: ~2075 Elo.** Elo is fit by maximum likelihood over all games (averaging per-level estimates is biased low — saturated easy levels cap at a low value and drag the mean). Search tuning (FPU + `c_puct` + 800 sims) added ~+280 Elo over the untuned MCTS@400 baseline (~1793), with no retraining.
 
 ## Quick Start
 

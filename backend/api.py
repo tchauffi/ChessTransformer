@@ -37,7 +37,7 @@ try:
         bot = Pos2MoveV2Bot(**kwargs)
         bot_type = "Pos2MoveV2Bot (alpha-beta)"
     else:
-        kwargs["num_simulations"] = int(os.environ.get("MCTS_SIMS", "400"))
+        kwargs["num_simulations"] = int(os.environ.get("MCTS_SIMS", "800"))
         bot = Pos2MoveV2MctsBot(**kwargs)
         bot_type = "Pos2MoveV2MctsBot (MCTS)"
 except Exception as e:
