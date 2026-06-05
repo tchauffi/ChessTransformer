@@ -4,6 +4,21 @@ A transformer-based chess engine trained on elite Lichess games. The model learn
 
 **Current strength: ~2075 Elo** (MCTS @ 800 sims with FPU + tuned c_puct, model v2.1, vs Stockfish — MLE estimate over a 140-game gauntlet, skills 0–12, June 2026)
 
+## Improvements (June 2026)
+
+Inference-side overhaul — **~1550 → ~2075 Elo (+~525), no retraining**:
+
+| Change | Effect |
+|---|---|
+| **MCTS / PUCT engine** (new default) | beat the alpha-beta engine ~82% head-to-head |
+| **`torch.compile` + CUDA graphs** | alpha-beta forward ~2.3× faster (lossless) |
+| **Batched-leaf MCTS** (virtual loss) | ~8× faster per sim — amortizes the GPU→CPU sync |
+| **Search tuning** — FPU (`fpu=0.2`), `c_puct=1.0`, 800 sims | +~280 Elo (exploitation > exploration; FPU lifts the sims plateau) |
+| **Model v2.1** | promoted from `run_021`, now the default weights |
+| **MLE Elo estimator** | per-level averaging was biased low; fit a single Elo over all games |
+
+Tried and rejected: **Stockfish policy distillation** — no gain even at 200k labels (the policy is near the 11.7M model's capacity ceiling).
+
 ## Architecture — Pos2MoveV2
 
 | Component | Details |
