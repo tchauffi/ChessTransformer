@@ -14,6 +14,7 @@ Inference-side overhaul — **~1550 → ~2075 Elo (+~525), no retraining**:
 | **`torch.compile` + CUDA graphs** | alpha-beta forward ~2.3× faster (lossless) |
 | **Batched-leaf MCTS** (virtual loss) | ~8× faster per sim — amortizes the GPU→CPU sync |
 | **Search tuning** — FPU (`fpu=0.2`), `c_puct=1.0`, 800 sims | +~280 Elo (exploitation > exploration; FPU lifts the sims plateau) |
+| **Tree reuse** across moves | re-roots the retained subtree — deeper search at the same per-move cost (won 58% head-to-head) |
 | **Model v2.1** | promoted from `run_021`, now the default weights |
 | **MLE Elo estimator** | per-level averaging was biased low; fit a single Elo over all games |
 
@@ -37,7 +38,7 @@ Tried and rejected: **Stockfish policy distillation** — no gain even at 200k l
 
 Two search engines share the same network (`Pos2MoveV2`):
 
-- **MCTS / PUCT** (`Pos2MoveV2MctsBot`, default) — AlphaZero-style. Policy head → priors, value head → leaf scores, most-visited move chosen. Batched-leaf evaluation with virtual loss amortizes the GPU→CPU sync (~8× faster than single-leaf). Tuned for **exploitation**: first-play-urgency (`fpu=0.2`) and `c_puct=1.0` (flatter priors / more exploration both lost). With FPU the search scales with simulations, so the default is **800 sims**.
+- **MCTS / PUCT** (`Pos2MoveV2MctsBot`, default) — AlphaZero-style. Policy head → priors, value head → leaf scores, most-visited move chosen. Batched-leaf evaluation with virtual loss amortizes the GPU→CPU sync (~8× faster than single-leaf). Tuned for **exploitation**: first-play-urgency (`fpu=0.2`) and `c_puct=1.0` (flatter priors / more exploration both lost). With FPU the search scales with simulations, so the default is **800 sims**. **Tree reuse** re-roots the retained subtree under the moves played (when the caller keeps `board.move_stack`), giving deeper search at the same per-move cost.
 - **Alpha-beta** (`Pos2MoveV2Bot`) — iterative-deepening negamax with quiescence search, policy-prior move ordering, and a Zobrist transposition table.
 
 Both run a `torch.compile`/CUDA-graph forward (~2.3× faster, lossless).
