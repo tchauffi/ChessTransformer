@@ -48,11 +48,20 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         prior_temp: float = 1.0,
         fpu: float | None = 0.2,
         sim_batch: int = 16,
+        tree_reuse: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.num_simulations = num_simulations
         self.c_puct = c_puct
+        # Tree reuse: keep the searched subtree under the moves actually played
+        # and re-root it next move, so prior visits carry over (effectively
+        # deeper search for free). Requires the caller to keep board.move_stack
+        # across calls; falls back to a fresh tree otherwise (e.g. boards rebuilt
+        # from FEN with no history).
+        self.tree_reuse = tree_reuse
+        self._reuse_root: _Node | None = None
+        self._reuse_moves: list | None = None
         # prior_temp > 1 flattens the policy priors so good-but-low-prior moves
         # still get explored (the value head can then promote them). fpu (first-
         # play-urgency): value unvisited children as parent_Q - fpu; None keeps
@@ -205,18 +214,43 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
                 self._expand_from_logits(node, moves, logits)
             self._backup_vl(path, value)
 
+    def _take_reuse_root(self, board: chess.Board) -> _Node | None:
+        """Re-root the retained tree to ``board`` if it follows the previous
+        search position by a few plies (the moves actually played). Consumes the
+        stored tree; returns an expanded node to use as root, or None for fresh.
+        """
+        root = self._reuse_root
+        self._reuse_root = None
+        if root is None or self._reuse_moves is None:
+            return None
+        ms = board.move_stack
+        rp = len(self._reuse_moves)
+        gap = len(ms) - rp
+        # Normal case: our move + opponent reply (gap 2). Allow 1-4 for safety;
+        # require an exact history-prefix match so we never reuse another game.
+        if gap < 1 or gap > 4 or list(ms[:rp]) != self._reuse_moves:
+            return None
+        node = root
+        for mv in ms[rp:]:
+            if not (node.expanded and mv in node.children):
+                return None
+            node = node.children[mv]
+        return node if node.expanded else None
+
     def predict(self, board: chess.Board) -> tuple[str, float | None]:
         self.nodes_searched = 0
         self.tt_hits = 0
         self.completed_depth = self.num_simulations
 
-        root = _Node(prior=1.0)
-        root_value = self._expand(root, board)
-        if not root.children:
-            return next(iter(board.legal_moves)).uci(), 0.0
-        # Seed the root with one visit so the first PUCT term is well-defined.
-        root.N = 1
-        root.W = root_value
+        root = self._take_reuse_root(board) if self.tree_reuse else None
+        if root is None:
+            root = _Node(prior=1.0)
+            root_value = self._expand(root, board)
+            if not root.children:
+                return next(iter(board.legal_moves)).uci(), 0.0
+            # Seed the root with one visit so the first PUCT term is well-defined.
+            root.N = 1
+            root.W = root_value
 
         if self.sim_batch <= 1:
             for _ in range(self.num_simulations):
@@ -231,6 +265,12 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         best_move, best_child = max(root.children.items(), key=lambda kv: kv[1].N)
         # Root value from side-to-move POV (negate child's POV).
         best_value = -best_child.Q
+
+        # Retain the tree (and the history it was searched at) for next move.
+        if self.tree_reuse:
+            self._reuse_root = root
+            self._reuse_moves = list(board.move_stack)
+
         return best_move.uci(), best_value
 
 

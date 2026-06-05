@@ -82,7 +82,7 @@ def play(white: Pos2MoveV2Bot, black: Pos2MoveV2Bot, start_fen: str, max_moves: 
 
 
 def build_bot(args, ema, quiescence, depth, mcts, sims, model_dir,
-              cpuct=1.5, prior_temp=1.0, fpu=None):
+              cpuct=1.5, prior_temp=1.0, fpu=None, tree_reuse=True):
     if mcts:
         return Pos2MoveV2MctsBot(
             model_dir=model_dir,
@@ -91,6 +91,7 @@ def build_bot(args, ema, quiescence, depth, mcts, sims, model_dir,
             c_puct=cpuct,
             prior_temp=prior_temp,
             fpu=fpu,
+            tree_reuse=tree_reuse,
             time_limit=args.time_limit,
             use_ema=ema,
             compile=not args.no_compile,
@@ -131,6 +132,8 @@ def main():
     p.add_argument("--b-prior-temp", type=float, default=1.0)
     p.add_argument("--a-fpu", type=float, default=None)
     p.add_argument("--b-fpu", type=float, default=None)
+    p.add_argument("--a-no-reuse", action="store_true", help="disable tree reuse for engine A")
+    p.add_argument("--b-no-reuse", action="store_true", help="disable tree reuse for engine B")
     p.add_argument("--a-model-dir", default=None, help="Override model dir for engine A")
     p.add_argument("--b-model-dir", default=None, help="Override model dir for engine B")
     p.add_argument("--openings", type=int, default=len(OPENINGS), help="How many openings to use")
@@ -148,9 +151,9 @@ def main():
     print(f"Engine A: {a_desc} ema={args.a_ema} model={a_model}")
     print(f"Engine B: {b_desc} ema={args.b_ema} model={b_model}")
     bot_a = build_bot(args, args.a_ema, args.a_quiescence, a_depth, args.a_mcts, args.a_sims, a_model,
-                      args.a_cpuct, args.a_prior_temp, args.a_fpu)
+                      args.a_cpuct, args.a_prior_temp, args.a_fpu, not args.a_no_reuse)
     bot_b = build_bot(args, args.b_ema, args.b_quiescence, b_depth, args.b_mcts, args.b_sims, b_model,
-                      args.b_cpuct, args.b_prior_temp, args.b_fpu)
+                      args.b_cpuct, args.b_prior_temp, args.b_fpu, not args.b_no_reuse)
 
     openings = OPENINGS[: args.openings]
     a_score = 0.0
