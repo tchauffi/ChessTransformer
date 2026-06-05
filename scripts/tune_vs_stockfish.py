@@ -43,6 +43,30 @@ def weighted_elo(results: list[dict]) -> float | None:
     return sum(e * w for e, w in zip(ests, ws)) / sum(ws)
 
 
+def mle_elo(results: list[dict]) -> float | None:
+    """Single maximum-likelihood Elo over ALL games (logistic model).
+
+    Unlike averaging per-level estimates, saturated easy levels (100%/0%)
+    contribute ~no gradient instead of biasing the mean toward their capped
+    value, so this doesn't get dragged down by low-skill sweeps.
+    """
+    import numpy as np
+
+    e = np.array([r["ref_elo"] for r in results], float)
+    g = np.array([r["wins"] + r["draws"] + r["losses"] for r in results], float)
+    s = np.array([r["score"] for r in results], float)
+    if g.sum() == 0:
+        return None
+    wins, losses = s * g, g - s * g
+    best_R, best_ll = None, -1e18
+    for R in np.arange(800, 3000, 1.0):
+        p = np.clip(1 / (1 + 10 ** ((e - R) / 400)), 1e-9, 1 - 1e-9)
+        ll = (wins * np.log(p) + losses * np.log(1 - p)).sum()
+        if ll > best_ll:
+            best_ll, best_R = ll, R
+    return best_R
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("model_dir", help="Model dir (e.g. run21 best_model)")
@@ -53,6 +77,9 @@ def main():
     p.add_argument("--ab-depths", type=int, nargs="*", default=[2, 3, 4])
     p.add_argument("--mcts-sims", type=int, nargs="*", default=[200, 400, 800])
     p.add_argument("--sim-batch", type=int, default=16)
+    p.add_argument("--c-puct", type=float, default=1.5)
+    p.add_argument("--prior-temp", type=float, default=1.0)
+    p.add_argument("--fpu", type=float, default=None)
     p.add_argument("--ema", action="store_true")
     args = p.parse_args()
 
@@ -66,9 +93,11 @@ def main():
         ))
     for s in args.mcts_sims:
         configs.append((
-            f"mcts sims={s} batch={args.sim_batch}",
+            f"mcts sims={s} cpuct={args.c_puct} fpu={args.fpu}",
             lambda s=s: Pos2MoveV2MctsBot(model_dir=args.model_dir, num_simulations=s,
-                                          sim_batch=args.sim_batch, time_limit=0.0, use_ema=args.ema),
+                                          sim_batch=args.sim_batch, c_puct=args.c_puct,
+                                          prior_temp=args.prior_temp, fpu=args.fpu,
+                                          time_limit=0.0, use_ema=args.ema),
         ))
 
     summary = []
@@ -81,20 +110,21 @@ def main():
                 bot=bot, stockfish_path=args.sf_path, skill_levels=args.skills,
                 games_per_level=args.games, sf_time_limit=args.sf_time, pgn_path=None,
             )
-            elo = weighted_elo(results)
+            elo = mle_elo(results)  # principled single-Elo MLE (not biased by easy levels)
             secs = time.time() - t0
-            summary.append((label, elo, results, secs))
+            summary.append((label, elo, weighted_elo(results), results, secs))
             del bot
         except Exception as e:  # pragma: no cover
             print(f"CONFIG FAILED: {e}")
-            summary.append((label, None, [], 0.0))
+            summary.append((label, None, None, [], 0.0))
 
     print(f"\n{'=' * 64}\nTUNING SUMMARY (model: {args.model_dir})\n{'=' * 64}")
-    print(f"{'config':<28}{'est Elo':>9}{'levels':>9}{'time':>9}")
+    print(f"{'config':<28}{'MLE Elo':>9}{'(wtd)':>8}{'levels':>8}{'time':>9}")
     print("-" * 64)
-    for label, elo, results, secs in sorted(summary, key=lambda x: (x[1] or -1), reverse=True):
+    for label, elo, wtd, results, secs in sorted(summary, key=lambda x: (x[1] or -1), reverse=True):
         elo_s = f"~{round(elo / 25) * 25}" if elo is not None else "N/A"
-        print(f"{label:<28}{elo_s:>9}{len(results):>9}{secs:>8.0f}s")
+        wtd_s = f"{round(wtd):.0f}" if wtd is not None else "N/A"
+        print(f"{label:<28}{elo_s:>9}{wtd_s:>8}{len(results):>8}{secs:>9.0f}s")
 
 
 if __name__ == "__main__":

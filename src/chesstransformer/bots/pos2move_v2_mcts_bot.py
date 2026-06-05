@@ -44,23 +44,29 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         self,
         *args,
         num_simulations: int = 400,
-        c_puct: float = 1.5,
+        c_puct: float = 1.0,
+        prior_temp: float = 1.0,
+        fpu: float | None = 0.2,
         sim_batch: int = 16,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.num_simulations = num_simulations
         self.c_puct = c_puct
+        # prior_temp > 1 flattens the policy priors so good-but-low-prior moves
+        # still get explored (the value head can then promote them). fpu (first-
+        # play-urgency): value unvisited children as parent_Q - fpu; None keeps
+        # the legacy behavior (unvisited contribute 0 to selection).
+        self.prior_temp = prior_temp
+        self.fpu = fpu
         # Leaves collected per network call. >1 amortizes the GPU->CPU sync that
         # otherwise dominates (one stall per simulation). 1 = legacy single-leaf.
         # Capped at the largest batch bucket so _batch_run's preallocated buffers
         # (and the captured CUDA graphs) are never overrun.
         self.sim_batch = max(1, min(sim_batch, _BATCH_BUCKETS[-1]))
 
-    def _priors_and_value(self, board: chess.Board):
-        """Legal moves, their softmax policy priors, and the value-head score."""
-        logits, value = self._evaluate(board)
-        moves = list(board.legal_moves)
+    def _compute_priors(self, moves: list[chess.Move], logits: np.ndarray) -> np.ndarray:
+        """Softmax policy priors over legal moves, with temperature flattening."""
         scores = np.array(
             [
                 logits[m.from_square, move_to_action_plane(m.from_square, m.to_square, m.promotion)]
@@ -68,10 +74,16 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
             ],
             dtype=np.float64,
         )
+        scores /= self.prior_temp
         scores -= scores.max()
         exp = np.exp(scores)
-        probs = exp / exp.sum()
-        return moves, probs, value
+        return exp / exp.sum()
+
+    def _priors_and_value(self, board: chess.Board):
+        """Legal moves, their softmax policy priors, and the value-head score."""
+        logits, value = self._evaluate(board)
+        moves = list(board.legal_moves)
+        return moves, self._compute_priors(moves, logits), value
 
     def _expand(self, node: _Node, board: chess.Board) -> float:
         self.nodes_searched += 1
@@ -79,22 +91,9 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         node.children = {m: _Node(float(p)) for m, p in zip(moves, probs)}
         return value
 
-    @staticmethod
-    def _softmax_priors(moves: list[chess.Move], logits: np.ndarray) -> np.ndarray:
-        scores = np.array(
-            [
-                logits[m.from_square, move_to_action_plane(m.from_square, m.to_square, m.promotion)]
-                for m in moves
-            ],
-            dtype=np.float64,
-        )
-        scores -= scores.max()
-        exp = np.exp(scores)
-        return exp / exp.sum()
-
     def _expand_from_logits(self, node: _Node, moves: list[chess.Move], logits: np.ndarray):
         self.nodes_searched += 1
-        probs = self._softmax_priors(moves, logits)
+        probs = self._compute_priors(moves, logits)
         node.children = {m: _Node(float(p)) for m, p in zip(moves, probs)}
 
     @staticmethod
@@ -114,14 +113,17 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
 
     def _select_child(self, node: _Node) -> tuple[chess.Move, _Node]:
         sqrt_total = math.sqrt(node.N)
+        # FPU: value unvisited children relative to the parent's own estimate.
+        fpu_q = (node.Q - self.fpu) if self.fpu is not None else 0.0
         best_score = -float("inf")
         best_move = None
         best_child = None
         for move, child in node.children.items():
             # child.Q is from the child's side-to-move POV; negate for the
-            # parent's POV (negamax). Unvisited children get Q=0.
+            # parent's POV (negamax).
             u = self.c_puct * child.prior * sqrt_total / (1 + child.N)
-            score = -child.Q + u
+            q = fpu_q if child.N == 0 else -child.Q
+            score = q + u
             if score > best_score:
                 best_score = score
                 best_move = move

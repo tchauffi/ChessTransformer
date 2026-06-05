@@ -81,12 +81,16 @@ def play(white: Pos2MoveV2Bot, black: Pos2MoveV2Bot, start_fen: str, max_moves: 
     return result, n_moves, nodes, move_time
 
 
-def build_bot(args, ema: bool, quiescence: int, depth: int, mcts: bool, sims: int, model_dir: str):
+def build_bot(args, ema, quiescence, depth, mcts, sims, model_dir,
+              cpuct=1.5, prior_temp=1.0, fpu=None):
     if mcts:
         return Pos2MoveV2MctsBot(
             model_dir=model_dir,
             num_simulations=sims,
             sim_batch=args.sim_batch,
+            c_puct=cpuct,
+            prior_temp=prior_temp,
+            fpu=fpu,
             time_limit=args.time_limit,
             use_ema=ema,
             compile=not args.no_compile,
@@ -121,6 +125,12 @@ def main():
     p.add_argument("--a-sims", type=int, default=200)
     p.add_argument("--b-sims", type=int, default=200)
     p.add_argument("--sim-batch", type=int, default=16, help="MCTS leaves per batch")
+    p.add_argument("--a-cpuct", type=float, default=1.5)
+    p.add_argument("--b-cpuct", type=float, default=1.5)
+    p.add_argument("--a-prior-temp", type=float, default=1.0)
+    p.add_argument("--b-prior-temp", type=float, default=1.0)
+    p.add_argument("--a-fpu", type=float, default=None)
+    p.add_argument("--b-fpu", type=float, default=None)
     p.add_argument("--a-model-dir", default=None, help="Override model dir for engine A")
     p.add_argument("--b-model-dir", default=None, help="Override model dir for engine B")
     p.add_argument("--openings", type=int, default=len(OPENINGS), help="How many openings to use")
@@ -131,12 +141,16 @@ def main():
     b_depth = args.b_depth if args.b_depth is not None else args.depth
     a_model = args.a_model_dir or args.model_dir
     b_model = args.b_model_dir or args.model_dir
-    a_desc = f"MCTS sims={args.a_sims}" if args.a_mcts else f"depth={a_depth} quiescence={args.a_quiescence}"
-    b_desc = f"MCTS sims={args.b_sims}" if args.b_mcts else f"depth={b_depth} quiescence={args.b_quiescence}"
+    a_desc = (f"MCTS sims={args.a_sims} cpuct={args.a_cpuct} ptemp={args.a_prior_temp} fpu={args.a_fpu}"
+              if args.a_mcts else f"depth={a_depth} quiescence={args.a_quiescence}")
+    b_desc = (f"MCTS sims={args.b_sims} cpuct={args.b_cpuct} ptemp={args.b_prior_temp} fpu={args.b_fpu}"
+              if args.b_mcts else f"depth={b_depth} quiescence={args.b_quiescence}")
     print(f"Engine A: {a_desc} ema={args.a_ema} model={a_model}")
     print(f"Engine B: {b_desc} ema={args.b_ema} model={b_model}")
-    bot_a = build_bot(args, args.a_ema, args.a_quiescence, a_depth, args.a_mcts, args.a_sims, a_model)
-    bot_b = build_bot(args, args.b_ema, args.b_quiescence, b_depth, args.b_mcts, args.b_sims, b_model)
+    bot_a = build_bot(args, args.a_ema, args.a_quiescence, a_depth, args.a_mcts, args.a_sims, a_model,
+                      args.a_cpuct, args.a_prior_temp, args.a_fpu)
+    bot_b = build_bot(args, args.b_ema, args.b_quiescence, b_depth, args.b_mcts, args.b_sims, b_model,
+                      args.b_cpuct, args.b_prior_temp, args.b_fpu)
 
     openings = OPENINGS[: args.openings]
     a_score = 0.0
