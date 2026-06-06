@@ -1,8 +1,24 @@
 # ChessTransformer
 
-A transformer-based chess engine trained on elite Lichess games. The model learns to predict moves directly from board positions, then plays via alpha-beta search guided by its policy and value heads.
+A transformer-based chess engine trained on elite Lichess games. The model learns to predict moves directly from board positions, then plays via an AlphaZero-style MCTS (policy priors + value head), with a compiled alpha-beta engine as an alternative.
 
-**Current strength: ~1550 Elo** (depth-3 alpha-beta vs Stockfish, June 2026)
+**Current strength: ~2100 Elo** (MCTS @ 800 sims with FPU + tuned c_puct + tree reuse, model v2.1, vs Stockfish — MLE estimate over a 140-game gauntlet, skills 0–12, June 2026)
+
+## Improvements (June 2026)
+
+Inference-side overhaul — **~1550 → ~2100 Elo (+~550), no retraining**:
+
+| Change | Effect |
+|---|---|
+| **MCTS / PUCT engine** (new default) | beat the alpha-beta engine ~82% head-to-head |
+| **`torch.compile` + CUDA graphs** | alpha-beta forward ~2.3× faster (lossless) |
+| **Batched-leaf MCTS** (virtual loss) | ~8× faster per sim — amortizes the GPU→CPU sync |
+| **Search tuning** — FPU (`fpu=0.2`), `c_puct=1.0`, 800 sims | +~280 Elo (exploitation > exploration; FPU lifts the sims plateau) |
+| **Tree reuse** across moves | re-roots the retained subtree — deeper search at the same per-move cost (won 58% head-to-head) |
+| **Model v2.1** | promoted from `run_021`, now the default weights |
+| **MLE Elo estimator** | per-level averaging was biased low; fit a single Elo over all games |
+
+Tried and rejected: **Stockfish policy distillation** — no gain even at 200k labels (the policy is near the 11.7M model's capacity ceiling).
 
 ## Architecture — Pos2MoveV2
 
@@ -14,17 +30,31 @@ A transformer-based chess engine trained on elite Lichess games. The model learn
 | Policy head | AlphaZero-style 64×73 action planes |
 | Value head | Board state → scalar in (−1, 1) |
 | Training | Muon + AdamW mixed optimizer, BF16, stochastic depth |
-| Search | Iterative-deepening alpha-beta, nucleus filtering (top-p), transposition table |
+| Search (default) | **MCTS / PUCT** — policy priors + value head, batched-leaf evaluation with virtual loss |
+| Search (alt) | Iterative-deepening alpha-beta with quiescence, nucleus filtering (top-p), transposition table |
+| Inference | `torch.compile` + CUDA graphs, bucketed batches, BF16 |
+
+## Search engines
+
+Two search engines share the same network (`Pos2MoveV2`):
+
+- **MCTS / PUCT** (`Pos2MoveV2MctsBot`, default) — AlphaZero-style. Policy head → priors, value head → leaf scores, most-visited move chosen. Batched-leaf evaluation with virtual loss amortizes the GPU→CPU sync (~8× faster than single-leaf). Tuned for **exploitation**: first-play-urgency (`fpu=0.2`) and `c_puct=1.0` (flatter priors / more exploration both lost). With FPU the search scales with simulations, so the default is **800 sims**. **Tree reuse** re-roots the retained subtree under the moves played (when the caller keeps `board.move_stack`), giving deeper search at the same per-move cost.
+- **Alpha-beta** (`Pos2MoveV2Bot`) — iterative-deepening negamax with quiescence search, policy-prior move ordering, and a Zobrist transposition table.
+
+Both run a `torch.compile`/CUDA-graph forward (~2.3× faster, lossless).
 
 ## Elo Evaluation
 
-| Stockfish skill | Approx. Elo | Result |
-|---|---|---|
-| ≤ 2 | ≤ 1000 | 100% win rate |
-| 7 | ~1600 | ~50 / 50 |
-| 8 | ~1700 | Heavy losses |
+MCTS @ 800 sims (`c_puct=1.0`, `fpu=0.2`, tree reuse), model v2.1, 20 games/level vs Stockfish (`scripts/tune_vs_stockfish.py`):
 
-Evaluated with `scripts/elo_gauntlet.py` over 100 games across skills 0–10.
+| Stockfish skill | Approx. Elo | Score |
+|---|---|---|
+| 0–6 | ≤ 1500 | 100% |
+| 8 | ~1700 | 90% |
+| 10 | ~1900 | 85% |
+| 12 | ~2100 | 35% |
+
+**MLE estimate: ~2100 Elo.** Elo is fit by maximum likelihood over all games (averaging per-level estimates is biased low — saturated easy levels cap at a low value and drag the mean). Search tuning (FPU + `c_puct` + 800 sims) added ~+280 Elo over the untuned MCTS@400 baseline (~1793), and tree reuse a further small gain — all with no retraining. (Per-level scores carry ~20-game noise; the MLE smooths it.)
 
 ## Quick Start
 
@@ -70,7 +100,9 @@ npm run dev
 
 | Variable | Default | Description |
 |---|---|---|
-| `MODEL_PATH` | `data/models/pos2move_v2` | Path to a checkpoint directory |
+| `MODEL_PATH` | `data/models/pos2move_v2.1` | Path to a checkpoint directory |
+| `ENGINE` | `mcts` | Search engine: `mcts` or `alphabeta` |
+| `MCTS_SIMS` | `800` | MCTS simulations per move (when `ENGINE=mcts`) |
 | `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
 
 ## Training
@@ -115,12 +147,23 @@ uv run src/chesstransformer/trainers/pos2move_v2_trainer.py
 ### Evaluate
 
 ```bash
-# Elo gauntlet vs Stockfish
-uv run scripts/elo_gauntlet.py data/models/pos2move_v2 \
+# Tune & benchmark search budget vs Stockfish (alpha-beta depths + MCTS sims)
+uv run scripts/tune_vs_stockfish.py data/models/pos2move_v2.1 \
+    --games 8 --skills 0 2 4 6 8
+
+# Alpha-beta-only Elo gauntlet vs Stockfish
+uv run scripts/elo_gauntlet.py data/models/pos2move_v2.1 \
     --depth 3 --games 10 --skills 0 2 4 6 7 8
 
+# Deterministic engine-vs-engine A/B (MCTS vs alpha-beta, model A vs model B, ...)
+uv run scripts/engine_match.py --a-mcts --a-sims 400 --b-quiescence 4 --b-depth 3
+
+# Inference speed + lossless-regression guard
+uv run scripts/bench_inference.py --depth 3 --save-golden golden.json
+uv run scripts/bench_inference.py --depth 3 --check golden.json
+
 # Export to ONNX (for TensorRT)
-uv run scripts/export_onnx.py data/models/pos2move_v2
+uv run scripts/export_onnx.py data/models/pos2move_v2.1
 ```
 
 ## Project Structure
@@ -133,17 +176,23 @@ ChessTransformer/
 ├── frontend/                         # Next.js web app (human vs bot)
 │   └── app/components/ChessGame.tsx  # Main game component
 ├── data/
-│   └── models/pos2move_v2/           # Bundled model weights
+│   └── models/
+│       ├── pos2move_v2.1/            # Bundled model weights (default)
+│       └── pos2move_v2/              # Previous weights (fallback)
 ├── scripts/
+│   ├── tune_vs_stockfish.py          # Sweep alpha-beta depth / MCTS sims vs Stockfish
+│   ├── elo_gauntlet.py               # Elo estimation vs Stockfish (alpha-beta)
+│   ├── engine_match.py               # Deterministic engine-vs-engine A/B
+│   ├── bench_inference.py            # Inference speed + lossless-regression guard
 │   ├── build_db.py                   # Download elite games and build HDF5 database
-│   ├── elo_gauntlet.py               # Elo estimation vs Stockfish
 │   ├── export_onnx.py                # ONNX export for TensorRT
 │   ├── quantize_onnx.py              # INT8 quantization
 │   ├── dataset_sanity_check.py       # Dataset distribution analysis
 │   └── compress_pgn_to_zst.py        # PGN compression utility
 ├── src/chesstransformer/
 │   ├── bots/
-│   │   ├── pos2move_v2_bot.py        # Alpha-beta bot (main)
+│   │   ├── pos2move_v2_mcts_bot.py   # MCTS / PUCT bot (default)
+│   │   ├── pos2move_v2_bot.py        # Alpha-beta bot (with quiescence + compile)
 │   │   └── random_bot.py
 │   ├── models/
 │   │   ├── transformer/pos2move_v2.py  # Model architecture

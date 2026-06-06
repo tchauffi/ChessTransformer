@@ -1,0 +1,9 @@
+{
+  "vocab_size": 13,
+  "embed_dim": 256,
+  "nb_transformer_layers": 16,
+  "num_heads": 8,
+  "dropout": 0.05,
+  "kvq_bias": false,
+  "layer_drop": 0.1
+}

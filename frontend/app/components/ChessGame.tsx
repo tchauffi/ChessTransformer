@@ -70,6 +70,7 @@ export default function ChessGame() {
   const [gameStatus, setGameStatus] = useState<string>('White to move');
   const [isThinking, setIsThinking] = useState(false);
   const [botType, setBotType] = useState<string>('Loading...');
+  const [engineLabel, setEngineLabel] = useState<string>('');
   const [error, setError] = useState<string>('');
   const [playerColor, setPlayerColor] = useState<'w' | 'b'>('w');
   const [gameStarted, setGameStarted] = useState(false);
@@ -87,7 +88,16 @@ export default function ChessGame() {
     const poll = (attempt: number) => {
       fetch(`${API_BASE_URL}/api/health`)
         .then(res => res.json())
-        .then(data => { if (!cancelled) setBotType(data.bot_type); })
+        .then(data => {
+          if (cancelled) return;
+          setBotType(data.bot_type);
+          if (data.engine && data.engine !== 'none') {
+            const search = data.engine === 'mcts' ? `MCTS ${data.sims} sims` : data.engine;
+            const parts = [data.model, search];
+            if (data.approx_elo) parts.push(`~${data.approx_elo} Elo`);
+            setEngineLabel(parts.filter(Boolean).join(' · '));
+          }
+        })
         .catch(() => {
           if (cancelled) return;
           if (attempt < 20) {
@@ -466,6 +476,9 @@ export default function ChessGame() {
                 <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
               </span>
               <span className="text-emerald-100 font-medium">{botType}</span>
+              {engineLabel && (
+                <span className="text-emerald-300/70 text-sm border-l border-white/10 pl-3">{engineLabel}</span>
+              )}
             </div>
           </div>
 
