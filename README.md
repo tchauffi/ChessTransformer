@@ -107,14 +107,34 @@ npm run dev
 
 ## Training
 
-### Data preparation
+### Building the database
+
+`scripts/build_db.py` downloads elite games from [database.nikonoel.fr](https://database.nikonoel.fr) and converts them to HDF5 in one step. Bullet and blitz games are excluded by default (keeps rapid, classical, correspondence).
 
 ```bash
-# Convert PGN/PGN.zst files to HDF5
-uv run src/chesstransformer/datasets/dataset_h5_convertor.py \
-    --input data/games/ --output data/elite_db.h5
+# Download last 12 months and build database (default)
+uv run scripts/build_db.py
 
-# Inspect position distribution
+# Specific date range
+uv run scripts/build_db.py --from 2024-01 --to 2024-12
+
+# Last 6 months
+uv run scripts/build_db.py --last 6
+
+# Everything available
+uv run scripts/build_db.py --all
+
+# Re-convert already-downloaded PGN files without re-downloading
+uv run scripts/build_db.py --skip-download
+
+# Include all game types (no time control filter)
+uv run scripts/build_db.py --no-filter
+```
+
+Output goes to `data/elite_db.h5` and raw PGN files are cleaned up automatically unless `--keep-raw` is passed.
+
+```bash
+# Inspect position distribution after building
 uv run scripts/dataset_sanity_check.py --data data/elite_db.h5 --games 5000
 ```
 
@@ -164,6 +184,7 @@ ChessTransformer/
 │   ├── elo_gauntlet.py               # Elo estimation vs Stockfish (alpha-beta)
 │   ├── engine_match.py               # Deterministic engine-vs-engine A/B
 │   ├── bench_inference.py            # Inference speed + lossless-regression guard
+│   ├── build_db.py                   # Download elite games and build HDF5 database
 │   ├── export_onnx.py                # ONNX export for TensorRT
 │   ├── quantize_onnx.py              # INT8 quantization
 │   ├── dataset_sanity_check.py       # Dataset distribution analysis
