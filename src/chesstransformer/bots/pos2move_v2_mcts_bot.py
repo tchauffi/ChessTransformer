@@ -197,7 +197,13 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
                 key = chess.polyglot.zobrist_hash(board)
                 moves = list(board.legal_moves)
                 leaves.append((path, node, key, moves))
-                if key not in items_by_key:
+                # Only schedule a network eval for positions we haven't already
+                # cached (transpositions, reused subtree, prior moves / games):
+                # the policy+value are reused straight from the transposition
+                # table. Lossless — cached output == what the net would produce.
+                if key in self._tt:
+                    self.tt_hits += 1
+                elif key not in items_by_key:
                     pos, player, castling, ep = self._encode_position(board)
                     items_by_key[key] = (pos, player, castling, ep, key)
 
