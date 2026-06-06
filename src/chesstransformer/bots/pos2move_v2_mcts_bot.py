@@ -1,13 +1,15 @@
 """AlphaZero-style PUCT MCTS engine for Pos2MoveV2.
 
-Subclasses :class:`Pos2MoveV2Bot` to reuse its (optionally torch.compiled and
+Subclasses :class:`Pos2MoveV2Bot` to reuse its (torch.compiled, transposition-
 cached) ``_evaluate`` — the policy head supplies move priors and the value head
-scores leaves. Move selection is by visit count, the standard AlphaZero choice.
+scores leaves. Move selection is by visit count (the standard AlphaZero choice).
 
-This is a correctness-first single-leaf implementation: one network evaluation
-per simulation (the compiled batch-1 path is fast). Collecting several leaves
-per network call with virtual loss — to better fill the GPU — is a natural
-follow-up that this structure leaves room for.
+Node representation is **edge-centric**: a node stores its children's visit
+counts / values / priors as numpy arrays, and child ``_Node`` objects are created
+lazily only when a child is actually descended into. This avoids allocating a
+node per legal move at every expansion (which dominated latency) and lets PUCT
+selection run vectorized over the arrays. Leaves are collected in batches with
+virtual loss so the network sees one batched forward per wave.
 """
 
 from __future__ import annotations
@@ -22,21 +24,22 @@ from chesstransformer.models.tokenizer.alphazero_move_encoder import move_to_act
 
 
 class _Node:
-    __slots__ = ("prior", "N", "W", "children")
+    """A search node. Child visit stats live in arrays here (edge-centric); child
+    ``_Node`` objects are created lazily on first descent. A node is *expanded*
+    once ``moves`` is set."""
 
-    def __init__(self, prior: float):
-        self.prior = prior
-        self.N = 0          # visit count
-        self.W = 0.0        # total value, from this node's side-to-move POV
-        self.children: dict[chess.Move, _Node] | None = None
+    __slots__ = ("moves", "priors", "child_N", "child_W", "children")
 
-    @property
-    def Q(self) -> float:
-        return self.W / self.N if self.N else 0.0
+    def __init__(self):
+        self.moves: list[chess.Move] | None = None
+        self.priors: np.ndarray | None = None
+        self.child_N: np.ndarray | None = None  # int64, per child
+        self.child_W: np.ndarray | None = None  # float64, child-POV total value
+        self.children: list[_Node | None] | None = None
 
     @property
     def expanded(self) -> bool:
-        return self.children is not None
+        return self.moves is not None
 
 
 class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
@@ -74,6 +77,7 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         # (and the captured CUDA graphs) are never overrun.
         self.sim_batch = max(1, min(sim_batch, _BATCH_BUCKETS[-1]))
 
+    # ── expansion ────────────────────────────────────────────────────────
     def _compute_priors(self, moves: list[chess.Move], logits: np.ndarray) -> np.ndarray:
         """Softmax policy priors over legal moves, with temperature flattening."""
         scores = np.array(
@@ -88,108 +92,95 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         exp = np.exp(scores)
         return exp / exp.sum()
 
-    def _priors_and_value(self, board: chess.Board):
-        """Legal moves, their softmax policy priors, and the value-head score."""
+    def _expand_node(self, node: _Node, moves: list[chess.Move], priors: np.ndarray):
+        self.nodes_searched += 1
+        n = len(moves)
+        node.moves = moves
+        node.priors = priors
+        node.child_N = np.zeros(n, dtype=np.int64)
+        node.child_W = np.zeros(n, dtype=np.float64)
+        node.children = [None] * n
+
+    def _expand_leaf(self, node: _Node, board: chess.Board) -> float:
+        """Evaluate ``board`` (policy + value) and expand ``node``; return value."""
         logits, value = self._evaluate(board)
         moves = list(board.legal_moves)
-        return moves, self._compute_priors(moves, logits), value
-
-    def _expand(self, node: _Node, board: chess.Board) -> float:
-        self.nodes_searched += 1
-        moves, probs, value = self._priors_and_value(board)
-        node.children = {m: _Node(float(p)) for m, p in zip(moves, probs)}
+        self._expand_node(node, moves, self._compute_priors(moves, logits))
         return value
 
-    def _expand_from_logits(self, node: _Node, moves: list[chess.Move], logits: np.ndarray):
-        self.nodes_searched += 1
-        probs = self._compute_priors(moves, logits)
-        node.children = {m: _Node(float(p)) for m, p in zip(moves, probs)}
+    # ── selection / descent / backup ─────────────────────────────────────
+    def _select_idx(self, node: _Node) -> int:
+        """Vectorized PUCT: pick the child index maximizing -Q + U."""
+        N = node.child_N
+        total = int(N.sum())
+        sqrt_total = math.sqrt(1.0 + total)  # +1 ≈ the node's own eval visit
+        # value-to-parent = -child_Q (child stores value from its own POV).
+        q_parent = np.zeros_like(node.child_W)
+        np.divide(-node.child_W, N, out=q_parent, where=N > 0)
+        if self.fpu is not None:
+            parent_q = (-node.child_W.sum() / total) if total > 0 else 0.0
+            q_parent[N == 0] = parent_q - self.fpu
+        u = (self.c_puct * sqrt_total) * node.priors / (1.0 + N)
+        return int(np.argmax(q_parent + u))
+
+    def _descend(self, node: _Node, board: chess.Board, apply_vl: bool):
+        """Walk to an unexpanded leaf, pushing moves. Returns (leaf_node, path),
+        where path is the list of (node, child_idx) edges traversed."""
+        path: list[tuple[_Node, int]] = []
+        while node.expanded:
+            idx = self._select_idx(node)
+            if apply_vl:
+                # Virtual loss: a virtual *win* in the child's POV looks like a
+                # loss to this node under -Q selection, so concurrent descents in
+                # the batch avoid the path.
+                node.child_N[idx] += 1
+                node.child_W[idx] += 1.0
+            path.append((node, idx))
+            board.push(node.moves[idx])
+            child = node.children[idx]
+            if child is None:
+                child = _Node()
+                node.children[idx] = child
+            node = child
+        return node, path
 
     @staticmethod
-    def _backup_vl(path: list[_Node], leaf_value: float):
-        """Back up a leaf value, undoing the virtual loss applied during descent.
-
-        Descent did ``N += 1; W += 1`` on each path node (a virtual *win* in the
-        node's own POV, which looks like a loss to its parent under the negamax
-        ``-child.Q`` selection, so concurrent descents avoid the path). Here we
-        subtract that +1 back out and apply the real, sign-alternating value. N
-        is left as-is since the virtual-loss pass already counted the visit.
-        """
-        v = leaf_value
-        for node in reversed(path):
-            node.W += v - 1.0
-            v = -v
-
-    def _select_child(self, node: _Node) -> tuple[chess.Move, _Node]:
-        sqrt_total = math.sqrt(node.N)
-        # FPU: value unvisited children relative to the parent's own estimate.
-        fpu_q = (node.Q - self.fpu) if self.fpu is not None else 0.0
-        best_score = -float("inf")
-        best_move = None
-        best_child = None
-        for move, child in node.children.items():
-            # child.Q is from the child's side-to-move POV; negate for the
-            # parent's POV (negamax).
-            u = self.c_puct * child.prior * sqrt_total / (1 + child.N)
-            q = fpu_q if child.N == 0 else -child.Q
-            score = q + u
-            if score > best_score:
-                best_score = score
-                best_move = move
-                best_child = child
-        return best_move, best_child
-
-    def _simulate(self, root: _Node, board: chess.Board):
-        node = root
-        path = [node]
-        pushed = 0
-        while node.expanded:
-            move, child = self._select_child(node)
-            board.push(move)
-            pushed += 1
-            node = child
-            path.append(node)
-
-        term = self._terminal_value(board)
-        value = term if term is not None else self._expand(node, board)
-
-        # Negamax backup: value is from the leaf's side-to-move POV; flip sign
-        # at each step toward the root.
+    def _backup(path: list[tuple[_Node, int]], value: float):
+        """Negamax backup over edges (no virtual loss)."""
         v = value
-        for n in reversed(path):
-            n.N += 1
-            n.W += v
+        for node, idx in reversed(path):
+            node.child_N[idx] += 1
+            node.child_W[idx] += v
             v = -v
 
+    @staticmethod
+    def _backup_vl(path: list[tuple[_Node, int]], value: float):
+        """Backup that undoes the per-edge virtual loss (+1 added during descent)
+        and applies the real, sign-alternating value. N already counted."""
+        v = value
+        for node, idx in reversed(path):
+            node.child_W[idx] += v - 1.0
+            v = -v
+
+    # ── search drivers ───────────────────────────────────────────────────
+    def _simulate(self, root: _Node, board: chess.Board):
+        node, path = self._descend(root, board, apply_vl=False)
+        pushed = len(path)
+        term = self._terminal_value(board)
+        value = term if term is not None else self._expand_leaf(node, board)
+        self._backup(path, value)
         for _ in range(pushed):
             board.pop()
 
     def _run_batch(self, root: _Node, board: chess.Board, batch_n: int):
-        """Collect up to ``batch_n`` leaves (virtual loss applied during descent),
-        evaluate the unique non-terminal ones in a single batched forward, then
-        expand and back them up. This turns ~batch_n synchronous GPU->CPU syncs
-        into one."""
-        leaves = []          # (path, node, key, moves) awaiting network eval
-        items_by_key = {}    # key -> (pos, player, castling, ep, key) for _batch_run
+        """Collect up to ``batch_n`` leaves (virtual loss during descent),
+        evaluate the unique uncached non-terminal ones in one batched forward,
+        then expand and back them up."""
+        leaves = []          # (path, leaf_node, key, moves)
+        items_by_key = {}    # key -> (pos, player, castling, ep, key)
 
         for _ in range(batch_n):
-            node = root
-            path = [node]
-            pushed = 0
-            while node.expanded:
-                move, child = self._select_child(node)
-                board.push(move)
-                pushed += 1
-                node = child
-                path.append(node)
-
-            # Virtual loss: a virtual *win* in each node's own POV (looks like a
-            # loss to its parent under negamax -child.Q selection) so other
-            # descents in this batch avoid re-exploring the same path.
-            for n in path:
-                n.N += 1
-                n.W += 1.0
-
+            node, path = self._descend(root, board, apply_vl=True)
             term = self._terminal_value(board)
             if term is not None:
                 self._backup_vl(path, term)
@@ -197,34 +188,29 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
                 key = chess.polyglot.zobrist_hash(board)
                 moves = list(board.legal_moves)
                 leaves.append((path, node, key, moves))
-                # Only schedule a network eval for positions we haven't already
-                # cached (transpositions, reused subtree, prior moves / games):
-                # the policy+value are reused straight from the transposition
-                # table. Lossless — cached output == what the net would produce.
+                # Reuse cached policy+value (transpositions / reused subtree /
+                # prior moves); only batch positions we haven't evaluated yet.
                 if key in self._tt:
                     self.tt_hits += 1
                 elif key not in items_by_key:
                     pos, player, castling, ep = self._encode_position(board)
                     items_by_key[key] = (pos, player, castling, ep, key)
-
-            for _ in range(pushed):
+            for _ in range(len(path)):
                 board.pop()
 
-        # One batched forward (+ one sync) populates the TT for every position.
         if items_by_key:
-            self._batch_run(list(items_by_key.values()))
+            self._batch_run(list(items_by_key.values()))  # populates self._tt
 
         for path, node, key, moves in leaves:
             logits, value = self._tt[key]
             if not node.expanded:
-                self._expand_from_logits(node, moves, logits)
+                self._expand_node(node, moves, self._compute_priors(moves, logits))
             self._backup_vl(path, value)
 
+    # ── tree reuse ───────────────────────────────────────────────────────
     def _take_reuse_root(self, board: chess.Board) -> _Node | None:
         """Re-root the retained tree to ``board`` if it follows the previous
-        search position by a few plies (the moves actually played). Consumes the
-        stored tree; returns an expanded node to use as root, or None for fresh.
-        """
+        search position by a few plies. Consumes the stored tree."""
         root = self._reuse_root
         self._reuse_root = None
         if root is None or self._reuse_moves is None:
@@ -232,15 +218,20 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         ms = board.move_stack
         rp = len(self._reuse_moves)
         gap = len(ms) - rp
-        # Normal case: our move + opponent reply (gap 2). Allow 1-4 for safety;
-        # require an exact history-prefix match so we never reuse another game.
         if gap < 1 or gap > 4 or list(ms[:rp]) != self._reuse_moves:
             return None
         node = root
         for mv in ms[rp:]:
-            if not (node.expanded and mv in node.children):
+            if not node.expanded:
                 return None
-            node = node.children[mv]
+            try:
+                idx = node.moves.index(mv)
+            except ValueError:
+                return None
+            child = node.children[idx]
+            if child is None or not child.expanded:
+                return None
+            node = child
         return node if node.expanded else None
 
     def predict(self, board: chess.Board) -> tuple[str, float | None]:
@@ -248,15 +239,13 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         self.tt_hits = 0
         self.completed_depth = self.num_simulations
 
+        if not any(board.legal_moves):
+            return chess.Move.null().uci(), 0.0
+
         root = self._take_reuse_root(board) if self.tree_reuse else None
         if root is None:
-            root = _Node(prior=1.0)
-            root_value = self._expand(root, board)
-            if not root.children:
-                return next(iter(board.legal_moves)).uci(), 0.0
-            # Seed the root with one visit so the first PUCT term is well-defined.
-            root.N = 1
-            root.W = root_value
+            root = _Node()
+            self._expand_leaf(root, board)
 
         if self.sim_batch <= 1:
             for _ in range(self.num_simulations):
@@ -268,11 +257,12 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
                 self._run_batch(root, board, n)
                 done += n
 
-        best_move, best_child = max(root.children.items(), key=lambda kv: kv[1].N)
+        best_idx = int(np.argmax(root.child_N))
+        best_move = root.moves[best_idx]
+        n = int(root.child_N[best_idx])
         # Root value from side-to-move POV (negate child's POV).
-        best_value = -best_child.Q
+        best_value = float(-root.child_W[best_idx] / n) if n > 0 else 0.0
 
-        # Retain the tree (and the history it was searched at) for next move.
         if self.tree_reuse:
             self._reuse_root = root
             self._reuse_moves = list(board.move_stack)
@@ -287,7 +277,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("model_dir", nargs="?", default=str(_DEFAULT_RUN))
     parser.add_argument("--sims", type=int, default=800)
-    parser.add_argument("--c-puct", type=float, default=1.5)
+    parser.add_argument("--c-puct", type=float, default=1.0)
     parser.add_argument("--ema", action="store_true")
     args = parser.parse_args()
 
