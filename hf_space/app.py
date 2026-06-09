@@ -87,6 +87,35 @@ def _human_color(human_color: str) -> bool:
     return chess.BLACK if human_color == "black" else chess.WHITE
 
 
+def _white_pov_value(board: chess.Board) -> float:
+    """Value-head eval in [-1, 1] from White's perspective (+ = White better)."""
+    if board.is_game_over():
+        if board.is_checkmate():
+            return -1.0 if board.turn == chess.WHITE else 1.0
+        return 0.0  # stalemate / draw
+    v = bot.get_value(board)
+    if v is None:
+        return 0.0
+    return v if board.turn == chess.WHITE else -v
+
+
+def eval_bar_html(board: chess.Board, orientation: str) -> str:
+    """A vertical eval bar (White share fills from the bottom of White's side).
+    Flipped to match the board orientation so the viewer's side is at the bottom."""
+    wv = _white_pov_value(board)
+    white_pct = round(max(0.0, min(1.0, (wv + 1) / 2)) * 100, 1)
+    white_div = f'<div style="height:{white_pct}%;background:#f5f5f5;"></div>'
+    black_div = f'<div style="height:{round(100 - white_pct, 1)}%;background:#3a3a3a;"></div>'
+    # orientation "white": Black on top, White on bottom; flipped when "black".
+    segments = black_div + white_div if orientation == "white" else white_div + black_div
+    return (
+        f'<div title="Model eval (White POV): {wv:+.2f}" '
+        'style="display:flex;flex-direction:column;width:26px;height:460px;'
+        'border:1px solid #999;border-radius:4px;overflow:hidden;">'
+        f'{segments}</div>'
+    )
+
+
 def _result_text(board: chess.Board, human_color: str) -> str:
     outcome = board.outcome()
     if outcome is None:
@@ -107,10 +136,11 @@ def _bot_move(board: chess.Board, sims: int):
 
 
 def on_move(fen: str, sims: int, human_color: str):
-    """Human just moved; reply with the bot's move (whichever side is to move)."""
+    """Human just moved; reply with the bot's move (whichever side is to move).
+    The human's board orientation equals their color."""
     board = chess.Board(fen)
     if board.is_game_over():
-        return board.fen(), _result_text(board, human_color)
+        return board.fen(), _result_text(board, human_color), eval_bar_html(board, human_color)
 
     san, value = _bot_move(board, sims)
 
@@ -119,7 +149,7 @@ def on_move(fen: str, sims: int, human_color: str):
     else:
         eval_str = f"  (eval {value:+.2f})" if value is not None else ""
         status = f"Bot played **{san}**{eval_str}.  Your move."
-    return board.fen(), status
+    return board.fen(), status, eval_bar_html(board, human_color)
 
 
 # Monotonic id so every New game yields a *distinct* setup dict. Without it,
@@ -141,8 +171,9 @@ def new_game(play_as: str, sims: int) -> dict:
         status = f"New game — you are **Black**. Bot opened with **{san}**. Your move."
     else:
         status = "New game — you are **White**. Make your move."
-    return {"fen": board.fen(), "orientation": human_color,
-            "color": human_color, "status": status, "nonce": next(_game_counter)}
+    setup = {"fen": board.fen(), "orientation": human_color,
+             "color": human_color, "status": status, "nonce": next(_game_counter)}
+    return setup, eval_bar_html(board, human_color)
 
 
 with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
@@ -160,8 +191,13 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
                       "status": "You are **White**. Make your move.", "nonce": 0})
 
     with gr.Row():
+        eval_col = gr.Column(scale=0, min_width=40)
         board_col = gr.Column(scale=3)
         ctrl_col = gr.Column(scale=1)
+
+    # Eval bar (persistent, hidden by default) — sits left of the board.
+    with eval_col:
+        eval_bar = gr.HTML(eval_bar_html(chess.Board(), "white"), visible=False)
 
     # Controls first so `sims` exists when the render block references it.
     with ctrl_col:
@@ -169,6 +205,7 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
         sims = gr.Slider(32, 1200, value=DEFAULT_SIMS, step=8,
                          label="Engine strength (MCTS sims/move)",
                          info="Higher = stronger but slower on CPU")
+        show_eval = gr.Checkbox(False, label="Show evaluation bar")
         new_btn = gr.Button("New game", variant="primary")
 
     # The board lives in a gr.render so switching color rebuilds it with the new
@@ -181,10 +218,11 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
             status = gr.Markdown(cfg["status"])
             board.move(
                 lambda fen, s, _c=cfg["color"]: on_move(fen, s, _c),
-                inputs=[board, sims], outputs=[board, status],
+                inputs=[board, sims], outputs=[board, status, eval_bar],
             )
 
-    new_btn.click(new_game, inputs=[play_as, sims], outputs=[setup])
+    show_eval.change(lambda show: gr.update(visible=show), inputs=show_eval, outputs=eval_bar)
+    new_btn.click(new_game, inputs=[play_as, sims], outputs=[setup, eval_bar])
 
 
 if __name__ == "__main__":
