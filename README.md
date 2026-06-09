@@ -6,15 +6,13 @@ A transformer-based chess engine trained on elite Lichess games. The model learn
 
 ## Improvements (June 2026)
 
-Inference-side overhaul — **~1550 → ~2100 Elo (+~550), no retraining**:
-
 | Change | Effect |
 |---|---|
 | **MCTS / PUCT engine** (new default) | beat the alpha-beta engine ~82% head-to-head |
-| **`torch.compile` + CUDA graphs** | alpha-beta forward ~2.3× faster (lossless) |
+| **`torch.compile` + CUDA graphs** | forward ~2.3× faster (lossless) |
 | **Batched-leaf MCTS** (virtual loss) | ~8× faster per sim — amortizes the GPU→CPU sync |
-| **Search tuning** — FPU (`fpu=0.2`), `c_puct=1.0`, 800 sims | +~280 Elo (exploitation > exploration; FPU lifts the sims plateau) |
-| **Tree reuse** across moves | re-roots the retained subtree — deeper search at the same per-move cost (won 58% head-to-head) |
+| **Search tuning** — FPU (`fpu=0.2`), `c_puct=1.0`, 800 sims | +~280 Elo over untuned baseline |
+| **Tree reuse** across moves | re-roots the retained subtree — deeper search at the same per-move cost |
 | **Model v2.1** | promoted from `run_021`, now the default weights |
 | **MLE Elo estimator** | per-level averaging was biased low; fit a single Elo over all games |
 
