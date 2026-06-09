@@ -75,6 +75,10 @@ bot = Pos2MoveV2MctsBot(
     device="cpu",
     compile=False,
     time_limit=0.0,
+    # Sample the opening moves (∝ visit count) so games aren't identical every
+    # time; switches to deterministic best-move play after the opening.
+    move_temp=1.0,
+    move_temp_plies=12,
 )
 
 
