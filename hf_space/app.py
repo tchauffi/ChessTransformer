@@ -30,7 +30,7 @@ if (_repo_src / "chesstransformer").exists():
 from chesstransformer.bots import Pos2MoveV2MctsBot  # noqa: E402
 
 START_FEN = chess.STARTING_FEN
-DEFAULT_SIMS = int(os.environ.get("MCTS_SIMS", "200"))
+DEFAULT_SIMS = int(os.environ.get("MCTS_SIMS", "400"))
 
 # GitHub locations for the last-resort weight download.
 _GH = "tchauffi/ChessTransformer"
@@ -133,7 +133,7 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
                                label="Drag to move (you are White)")
         with gr.Column(scale=1):
             status = gr.Markdown("You are **White**. Make your move.")
-            sims = gr.Slider(32, 400, value=DEFAULT_SIMS, step=8, label="Engine strength (MCTS sims/move)",
+            sims = gr.Slider(32, 1200, value=DEFAULT_SIMS, step=8, label="Engine strength (MCTS sims/move)",
                              info="Higher = stronger but slower on CPU")
             new_btn = gr.Button("New game", variant="primary")
 
