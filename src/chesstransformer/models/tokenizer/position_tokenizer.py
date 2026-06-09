@@ -1,5 +1,14 @@
 import chess
 
+_PIECE_TOKEN = {
+    (chess.PAWN,   chess.WHITE): 1,  (chess.KNIGHT, chess.WHITE): 2,
+    (chess.BISHOP, chess.WHITE): 3,  (chess.ROOK,   chess.WHITE): 4,
+    (chess.QUEEN,  chess.WHITE): 5,  (chess.KING,   chess.WHITE): 6,
+    (chess.PAWN,   chess.BLACK): 7,  (chess.KNIGHT, chess.BLACK): 8,
+    (chess.BISHOP, chess.BLACK): 9,  (chess.ROOK,   chess.BLACK): 10,
+    (chess.QUEEN,  chess.BLACK): 11, (chess.KING,   chess.BLACK): 12,
+}
+
 
 class PostionTokenizer:
     """A simple tokenizer for chess board positions.
@@ -36,10 +45,10 @@ class PostionTokenizer:
         Returns:
             List of token IDs representing the board position
         """
-        reordered_board = str(board).split("\n")[::-1]
-        flattened_board = [char for row in reordered_board for char in row if char != " "]
-        token_ids = [self.vocab[char] for char in flattened_board]
-        return token_ids
+        result = [0] * 64
+        for sq, piece in board.piece_map().items():
+            result[sq] = _PIECE_TOKEN[(piece.piece_type, piece.color)]
+        return result
 
     def decode(self, token_ids: list[int]) -> chess.Board:
         """Decode a list of token IDs back into a chess board string.

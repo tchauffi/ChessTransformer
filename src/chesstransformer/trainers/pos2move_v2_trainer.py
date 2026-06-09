@@ -420,7 +420,8 @@ def main():
             best_val_loss = trainer_state["best_val_loss"]
 
     # ── Scheduler ────────────────────────────────────────────────────────
-    total_steps = (len(train_loader) * args.epochs) // max(1, args.grad_accum)
+    total_steps_from_epochs = (len(train_loader) * args.epochs) // max(1, args.grad_accum)
+    total_steps = args.max_steps if args.max_steps else total_steps_from_epochs
     scheduler_config = {
         "warmup_steps": args.warmup_steps,
         "total_steps": total_steps,
