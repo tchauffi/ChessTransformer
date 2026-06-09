@@ -12,6 +12,7 @@ Weights are resolved in this order:
 
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 from pathlib import Path
@@ -121,6 +122,12 @@ def on_move(fen: str, sims: int, human_color: str):
     return board.fen(), status
 
 
+# Monotonic id so every New game yields a *distinct* setup dict. Without it,
+# replaying with the same colour returns an identical dict and the gr.render
+# block sees no change — so the board wouldn't reset.
+_game_counter = itertools.count(1)
+
+
 def new_game(play_as: str, sims: int) -> dict:
     """Start a fresh game. If the human plays Black, the bot (White) opens.
 
@@ -135,7 +142,7 @@ def new_game(play_as: str, sims: int) -> dict:
     else:
         status = "New game — you are **White**. Make your move."
     return {"fen": board.fen(), "orientation": human_color,
-            "color": human_color, "status": status}
+            "color": human_color, "status": status, "nonce": next(_game_counter)}
 
 
 with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
@@ -149,8 +156,8 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
         "replies automatically.  "
         "[GitHub repo →](https://github.com/tchauffi/ChessTransformer)"
     )
-    setup = gr.State({"fen": START_FEN, "orientation": "white",
-                      "color": "white", "status": "You are **White**. Make your move."})
+    setup = gr.State({"fen": START_FEN, "orientation": "white", "color": "white",
+                      "status": "You are **White**. Make your move.", "nonce": 0})
 
     with gr.Row():
         board_col = gr.Column(scale=3)
