@@ -4,6 +4,14 @@ A transformer-based chess engine trained on elite Lichess games. The model learn
 
 **Current strength: ~2100 Elo** (MCTS @ 800 sims with FPU + tuned c_puct + tree reuse, model v2.1, vs Stockfish — MLE estimate over a 140-game gauntlet, skills 0–12, June 2026)
 
+## Demo
+
+ChessTransformer v2.1 (White, MCTS @ 800 sims) checkmating Stockfish Level 8 — the finishing sequence:
+
+![ChessTransformer checkmates Stockfish Level 8](docs/demo.gif)
+
+▶ [Watch the full game (MP4)](docs/demo.mp4)
+
 ## Improvements (June 2026)
 
 | Change | Effect |
