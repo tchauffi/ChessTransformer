@@ -117,17 +117,21 @@ def on_move(fen: str, sims: int, human_color: str):
     return board.fen(), status
 
 
-def new_game(play_as: str, sims: int):
-    """Start a fresh game. If the human plays Black, the bot (White) opens."""
+def new_game(play_as: str, sims: int) -> dict:
+    """Start a fresh game. If the human plays Black, the bot (White) opens.
+
+    Returns a ``setup`` dict that drives a ``gr.render`` block — changing it
+    rebuilds the board so its orientation (chessboard.js, set only at mount)
+    actually flips."""
     human_color = "black" if play_as == "Black" else "white"
-    orientation = human_color
     board = chess.Board()
     if human_color == "black":
         san, _ = _bot_move(board, sims)
         status = f"New game — you are **Black**. Bot opened with **{san}**. Your move."
     else:
         status = "New game — you are **White**. Make your move."
-    return gr.update(value=board.fen(), orientation=orientation), status, human_color
+    return {"fen": board.fen(), "orientation": human_color,
+            "color": human_color, "status": status}
 
 
 with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
@@ -141,20 +145,35 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
         "replies automatically.  "
         "[GitHub repo →](https://github.com/tchauffi/ChessTransformer)"
     )
-    human_color = gr.State("white")
-    with gr.Row():
-        with gr.Column(scale=3):
-            board = Chessboard(value=START_FEN, game_mode=True, orientation="white",
-                               label="Drag to move")
-        with gr.Column(scale=1):
-            status = gr.Markdown("You are **White**. Make your move.")
-            play_as = gr.Radio(["White", "Black"], value="White", label="Play as")
-            sims = gr.Slider(32, 1200, value=DEFAULT_SIMS, step=8, label="Engine strength (MCTS sims/move)",
-                             info="Higher = stronger but slower on CPU")
-            new_btn = gr.Button("New game", variant="primary")
+    setup = gr.State({"fen": START_FEN, "orientation": "white",
+                      "color": "white", "status": "You are **White**. Make your move."})
 
-    board.move(on_move, inputs=[board, sims, human_color], outputs=[board, status])
-    new_btn.click(new_game, inputs=[play_as, sims], outputs=[board, status, human_color])
+    with gr.Row():
+        board_col = gr.Column(scale=3)
+        ctrl_col = gr.Column(scale=1)
+
+    # Controls first so `sims` exists when the render block references it.
+    with ctrl_col:
+        play_as = gr.Radio(["White", "Black"], value="White", label="Play as")
+        sims = gr.Slider(32, 1200, value=DEFAULT_SIMS, step=8,
+                         label="Engine strength (MCTS sims/move)",
+                         info="Higher = stronger but slower on CPU")
+        new_btn = gr.Button("New game", variant="primary")
+
+    # The board lives in a gr.render so switching color rebuilds it with the new
+    # orientation (chessboard.js only reads orientation at construction).
+    with board_col:
+        @gr.render(inputs=setup)
+        def render_board(cfg):
+            board = Chessboard(value=cfg["fen"], game_mode=True,
+                               orientation=cfg["orientation"], label="Drag to move")
+            status = gr.Markdown(cfg["status"])
+            board.move(
+                lambda fen, s, _c=cfg["color"]: on_move(fen, s, _c),
+                inputs=[board, sims], outputs=[board, status],
+            )
+
+    new_btn.click(new_game, inputs=[play_as, sims], outputs=[setup])
 
 
 if __name__ == "__main__":
