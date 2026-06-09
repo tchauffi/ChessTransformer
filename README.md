@@ -4,13 +4,15 @@
 
 The model predicts moves directly from board positions, then plays via an AlphaZero-style MCTS (policy priors + value head). A compiled alpha-beta engine is available as an alternative.
 
+**▶ [Play it in your browser](https://huggingface.co/spaces/tchauffi/ChessTransformer)** — live demo on Hugging Face Spaces (no install).
+
 ## Demo
 
 ChessTransformer v2.1 (White, MCTS @ 800 sims) checkmating Stockfish Level 8 — the finishing sequence:
 
 ![ChessTransformer checkmates Stockfish Level 8](docs/demo.gif)
 
-▶ [Watch the full game (MP4)](docs/demo.mp4)
+▶ [Watch the full game (MP4)](docs/demo.mp4) · 🤗 [Play live on Hugging Face Spaces](https://huggingface.co/spaces/tchauffi/ChessTransformer)
 
 ## Highlights
 
