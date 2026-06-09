@@ -52,11 +52,21 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         fpu: float | None = 0.2,
         sim_batch: int = 16,
         tree_reuse: bool = True,
+        move_temp: float = 0.0,
+        move_temp_plies: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.num_simulations = num_simulations
         self.c_puct = c_puct
+        # Move selection. By default the move is argmax(visit count) — fully
+        # deterministic (what the gauntlet / API rely on). For variety (e.g. so
+        # the opening isn't identical every game), set move_temp > 0 to *sample*
+        # the move ∝ visit_count**(1/move_temp) for the first move_temp_plies
+        # half-moves, then fall back to argmax. move_temp=1 samples proportional
+        # to visits; higher is more random.
+        self.move_temp = move_temp
+        self.move_temp_plies = move_temp_plies
         # Tree reuse: keep the searched subtree under the moves actually played
         # and re-root it next move, so prior visits carry over (effectively
         # deeper search for free). Requires the caller to keep board.move_stack
@@ -257,7 +267,15 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
                 self._run_batch(root, board, n)
                 done += n
 
-        best_idx = int(np.argmax(root.child_N))
+        ply = 2 * (board.fullmove_number - 1) + (0 if board.turn == chess.WHITE else 1)
+        if self.move_temp > 0 and ply < self.move_temp_plies and root.child_N.sum() > 0:
+            # Sample ∝ visit_count**(1/temp) over the opening plies for variety.
+            weights = root.child_N.astype(np.float64) ** (1.0 / self.move_temp)
+            total = weights.sum()
+            best_idx = int(np.random.choice(len(weights), p=weights / total)) if total > 0 \
+                else int(np.argmax(root.child_N))
+        else:
+            best_idx = int(np.argmax(root.child_N))
         best_move = root.moves[best_idx]
         n = int(root.child_N[best_idx])
         # Root value from side-to-move POV (negate child's POV).

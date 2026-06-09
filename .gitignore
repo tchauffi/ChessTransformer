@@ -224,3 +224,6 @@ next-env.d.ts
 # Data files
 data/raw/
 *.h5
+
+# HF Space build artifact (assembled by hf_space/prepare.sh)
+hf_space/space_build/

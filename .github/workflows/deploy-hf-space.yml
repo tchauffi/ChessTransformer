@@ -1,0 +1,90 @@
+name: Deploy HF Space
+
+# Pushes the assembled Gradio Space (hf_space/) to a Hugging Face Space using an
+# OIDC "trusted publisher" — no HF_TOKEN secret stored in GitHub.
+#
+# One-time setup (see hf_space/DEPLOY.md):
+#   1. Create the Space on HF: spaces/<you>/chesstransformer (SDK: Gradio, CPU).
+#   2. On that Space → Settings → Trusted Publishers, add provider GitHub Actions:
+#        repository = tchauffi/ChessTransformer
+#        ref        = refs/heads/main
+#        workflow   = deploy-hf-space.yml
+#   3. Set the repo variable HF_SPACE_REPO (Settings → Secrets and variables →
+#      Actions → Variables) to "<you>/chesstransformer" if it differs from the
+#      default below.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hf_space/**"
+      - "src/chesstransformer/**"
+      - "data/models/pos2move_v2.1/**"
+      - ".github/workflows/deploy-hf-space.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required to mint the GitHub OIDC token
+      contents: read
+    env:
+      HF_SPACE_REPO: ${{ vars.HF_SPACE_REPO || 'tchauffi/ChessTransformer' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true   # materialize the model weights (stored via Git LFS)
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install --upgrade "huggingface_hub>=1.18.0"
+
+      - name: Assemble the Space bundle
+        run: bash hf_space/prepare.sh
+
+      - name: Exchange GitHub OIDC token for a Hub token
+        run: |
+          set -euo pipefail
+          RESOURCE="spaces/${HF_SPACE_REPO}"
+
+          ID_TOKEN=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://huggingface.co" \
+            | jq -r .value)
+
+          HEADERS=$(mktemp); BODY=$(mktemp)
+          STATUS=$(curl -sS -D "$HEADERS" -o "$BODY" -w '%{http_code}' \
+            -X POST "https://huggingface.co/oauth/token" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg t "$ID_TOKEN" --arg r "$RESOURCE" \
+                  '{
+                    grant_type:         "urn:ietf:params:oauth:grant-type:token-exchange",
+                    subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+                    subject_token:      $t,
+                    resource:           $r
+                  }')")
+
+          if [ "$STATUS" -ne 200 ]; then
+            REQUEST_ID=$(grep -i '^x-request-id:' "$HEADERS" | sed 's/.*: *//' | tr -d '\r')
+            echo "::error::Token exchange failed with HTTP $STATUS (x-request-id: ${REQUEST_ID:-unknown})"
+            cat "$BODY"
+            exit 1
+          fi
+
+          HF_TOKEN=$(jq -r .access_token "$BODY")
+          echo "::add-mask::$HF_TOKEN"
+          DELIM="EOF_$(openssl rand -hex 16)"
+          {
+            echo "HF_TOKEN<<$DELIM"
+            echo "$HF_TOKEN"
+            echo "$DELIM"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload to the Space
+        run: |
+          hf upload "$HF_SPACE_REPO" hf_space/space_build . \
+            --repo-type space \
+            --commit-message "Deploy from ${GITHUB_SHA::7}"

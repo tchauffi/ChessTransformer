@@ -1,0 +1,10 @@
+# Slim CPU runtime for the Space. The chesstransformer package source is
+# vendored next to app.py (see prepare.sh), so only the runtime deps of the
+# inference path are needed here — not the full training stack.
+torch>=2.2
+numpy>=1.26
+python-chess>=1.999
+safetensors>=0.4
+tokenizers>=0.15
+gradio>=5.49.0
+gradio-chessboard>=0.0.10
