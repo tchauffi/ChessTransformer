@@ -137,10 +137,17 @@ def _bot_move(board: chess.Board, sims: int):
 
 def on_move(fen: str, sims: int, human_color: str):
     """Human just moved; reply with the bot's move (whichever side is to move).
-    The human's board orientation equals their color."""
+    The human's board orientation equals their color.
+
+    A generator: first yields a "thinking" status (so the player sees the bot is
+    working during the ~1-3s CPU search), then yields the bot's reply."""
     board = chess.Board(fen)
     if board.is_game_over():
-        return board.fen(), _result_text(board, human_color), eval_bar_html(board, human_color)
+        yield board.fen(), _result_text(board, human_color), eval_bar_html(board, human_color)
+        return
+
+    # Immediate feedback while the search runs (board/eval unchanged for now).
+    yield gr.update(), "⏳ ChessTransformer is thinking…", gr.update()
 
     san, value = _bot_move(board, sims)
 
@@ -149,7 +156,7 @@ def on_move(fen: str, sims: int, human_color: str):
     else:
         eval_str = f"  (eval {value:+.2f})" if value is not None else ""
         status = f"Bot played **{san}**{eval_str}.  Your move."
-    return board.fen(), status, eval_bar_html(board, human_color)
+    yield board.fen(), status, eval_bar_html(board, human_color)
 
 
 # Monotonic id so every New game yields a *distinct* setup dict. Without it,
@@ -216,10 +223,12 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
             board = Chessboard(value=cfg["fen"], game_mode=True,
                                orientation=cfg["orientation"], label="Drag to move")
             status = gr.Markdown(cfg["status"])
-            board.move(
-                lambda fen, s, _c=cfg["color"]: on_move(fen, s, _c),
-                inputs=[board, sims], outputs=[board, status, eval_bar],
-            )
+            color = cfg["color"]
+
+            def handle(fen, s):  # generator → streams the "thinking" update first
+                yield from on_move(fen, s, color)
+
+            board.move(handle, inputs=[board, sims], outputs=[board, status, eval_bar])
 
     show_eval.change(lambda show: gr.update(visible=show), inputs=show_eval, outputs=eval_bar)
     new_btn.click(new_game, inputs=[play_as, sims], outputs=[setup, eval_bar])
