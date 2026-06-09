@@ -12,33 +12,43 @@ uv run python hf_space/app.py
 # open the printed http://127.0.0.1:7860
 ```
 
-## Deploy to Hugging Face Spaces
+## Deploy via GitHub Actions (recommended — no stored token)
 
-1. **Create a Space**: https://huggingface.co/new-space → SDK **Gradio**, hardware
-   **CPU basic** (free). Note its git URL, e.g.
-   `https://huggingface.co/spaces/<you>/chesstransformer`.
+Uses HF [Trusted Publishers](https://huggingface.co/docs/hub/trusted-publishers):
+the CI job proves its identity with a short-lived GitHub OIDC token and exchanges
+it for a 1-hour HF token. Nothing to store or rotate. Workflow:
+`.github/workflows/deploy-hf-space.yml`.
 
-2. **Assemble the deployable bundle** (vendors the package + weights):
+1. **Create the Space**: https://huggingface.co/new-space → SDK **Gradio**,
+   hardware **CPU basic** (free), name it `chesstransformer`.
 
-   ```bash
-   bash hf_space/prepare.sh        # writes hf_space/space_build/
-   ```
+2. **Register this repo as a trusted publisher** on the Space →
+   *Settings → Trusted Publishers* → provider **GitHub Actions**:
+   - `repository` = `tchauffi/ChessTransformer`
+   - `ref` = `refs/heads/main`
+   - `workflow` = `deploy-hf-space.yml`
 
-3. **Push it to the Space:**
+3. If your HF username isn't `tchauffi`, set the repo variable **`HF_SPACE_REPO`**
+   (GitHub → Settings → Secrets and variables → Actions → Variables) to
+   `<you>/chesstransformer`.
 
-   ```bash
-   cd hf_space/space_build
-   git init && git lfs install
-   git add -A && git commit -m "ChessTransformer playable demo"
-   git remote add space https://huggingface.co/spaces/<you>/chesstransformer
-   git push --force space main
-   ```
+4. **Merge to `main`.** The workflow runs on any push touching `hf_space/**`,
+   the package, or the v2.1 weights — or trigger it manually from the Actions tab
+   (*Run workflow*). It assembles the bundle (`prepare.sh`) and uploads it.
 
-   (You'll need a HF token with write access; `huggingface-cli login` once.)
+The Space builds and goes live at `https://huggingface.co/spaces/<you>/chesstransformer`
+(first build takes a few minutes: torch CPU + gradio).
 
-4. The Space builds and goes live at
-   `https://huggingface.co/spaces/<you>/chesstransformer`. First build takes a
-   few minutes (installing torch CPU + gradio).
+## Deploy manually (alternative — needs a write token)
+
+```bash
+bash hf_space/prepare.sh                       # writes hf_space/space_build/
+cd hf_space/space_build
+git init && git lfs install
+git add -A && git commit -m "ChessTransformer playable demo"
+git remote add space https://huggingface.co/spaces/<you>/chesstransformer
+git push --force space main                    # huggingface-cli login first
+```
 
 ## Notes
 
