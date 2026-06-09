@@ -30,7 +30,7 @@ jobs:
       id-token: write   # required to mint the GitHub OIDC token
       contents: read
     env:
-      HF_SPACE_REPO: ${{ vars.HF_SPACE_REPO || 'tchauffi/chesstransformer' }}
+      HF_SPACE_REPO: ${{ vars.HF_SPACE_REPO || 'tchauffi/ChessTransformer' }}
     steps:
       - uses: actions/checkout@v4
         with:
