@@ -228,7 +228,10 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
             def handle(fen, s):  # generator → streams the "thinking" update first
                 yield from on_move(fen, s, color)
 
-            board.move(handle, inputs=[board, sims], outputs=[board, status, eval_bar])
+            # show_progress="hidden": suppress Gradio's default loading overlay
+            # (it sits over the board); our "⏳ thinking…" status is the signal.
+            board.move(handle, inputs=[board, sims], outputs=[board, status, eval_bar],
+                       show_progress="hidden")
 
     show_eval.change(lambda show: gr.update(visible=show), inputs=show_eval, outputs=eval_bar)
     new_btn.click(new_game, inputs=[play_as, sims], outputs=[setup, eval_bar])
