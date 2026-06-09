@@ -12,6 +12,7 @@ Weights are resolved in this order:
 
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 from pathlib import Path
@@ -136,13 +137,13 @@ def _bot_move(board: chess.Board, sims: int):
 
 def on_move(fen: str, sims: int, human_color: str):
     """Human just moved; reply with the bot's move (whichever side is to move).
+    The board orientation matches the human's color, so the eval bar does too.
 
     A generator: first yields a "thinking" status (so the player sees the bot is
-    working during the ~1-3s CPU search), then yields the bot's reply. The board
-    is shown from White's side, so the eval bar is White-oriented."""
+    working during the ~1-3s CPU search), then yields the bot's reply."""
     board = chess.Board(fen)
     if board.is_game_over():
-        yield board.fen(), _result_text(board, human_color), eval_bar_html(board, "white")
+        yield board.fen(), _result_text(board, human_color), eval_bar_html(board, human_color)
         return
 
     # Immediate feedback while the search runs (board/eval unchanged for now).
@@ -155,14 +156,21 @@ def on_move(fen: str, sims: int, human_color: str):
     else:
         eval_str = f"  (eval {value:+.2f})" if value is not None else ""
         status = f"Bot played **{san}**{eval_str}.  Your move."
-    yield board.fen(), status, eval_bar_html(board, "white")
+    yield board.fen(), status, eval_bar_html(board, human_color)
+
+
+# Monotonic id so every New game yields a *distinct* setup dict — otherwise a
+# same-colour replay returns an identical dict and the gr.render block, seeing no
+# change, wouldn't rebuild (and reset) the board.
+_game_counter = itertools.count(1)
 
 
 def new_game(play_as: str, sims: int):
     """Start a fresh game. If the human plays Black, the bot (White) opens.
 
-    Returns (fen, status, eval_bar_html, human_color) — written straight to the
-    statically-mounted board so a same-colour replay still resets it."""
+    Returns (setup, eval_bar). The setup dict drives a gr.render block — changing
+    it rebuilds the board so its orientation (chessboard.js reads it only at
+    construction) actually flips to the human's side."""
     human_color = "black" if play_as == "Black" else "white"
     board = chess.Board()
     if human_color == "black":
@@ -170,7 +178,9 @@ def new_game(play_as: str, sims: int):
         status = f"New game — you are **Black**. Bot opened with **{san}**. Your move."
     else:
         status = "New game — you are **White**. Make your move."
-    return board.fen(), status, eval_bar_html(board, "white"), human_color
+    setup = {"fen": board.fen(), "orientation": human_color, "color": human_color,
+             "status": status, "nonce": next(_game_counter)}
+    return setup, eval_bar_html(board, human_color)
 
 
 with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
@@ -181,28 +191,22 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
         "It reaches **~2100 Elo** vs Stockfish at full strength; this CPU demo "
         "runs at a lower sim count so moves come back quickly.\n\n"
         "**Pick your color and hit New game.** Drag a piece to move — the bot "
-        "replies automatically. (The board is shown from White's side.)  "
+        "replies automatically.  "
         "[GitHub repo →](https://github.com/tchauffi/ChessTransformer)"
     )
-    human_color = gr.State("white")
+    setup = gr.State({"fen": START_FEN, "orientation": "white", "color": "white",
+                      "status": "You are **White**. Make your move.", "nonce": 0})
 
     with gr.Row():
-        # Solid min_widths so the board container always has a size at mount —
-        # the chessboard.js component reloads the page if it inits at 0 width.
+        # Solid min_widths so the board container always has a size when the
+        # gr.render block (re)mounts it — chessboard.js reloads the whole page if
+        # it inits at 0 width, which is what caused the mobile flicker/reload loop.
         eval_col = gr.Column(scale=0, min_width=44)
-        board_col = gr.Column(scale=3, min_width=320)
+        board_col = gr.Column(scale=3, min_width=340)
         ctrl_col = gr.Column(scale=1, min_width=200)
 
     with eval_col:
         eval_bar = gr.HTML(eval_bar_html(chess.Board(), "white"), visible=False)
-
-    # Board mounted statically (not in a gr.render) so it initializes once on the
-    # laid-out page — the dynamic remount was failing on mobile and triggering the
-    # component's window.location.reload() loop.
-    with board_col:
-        board = Chessboard(value=START_FEN, game_mode=True, orientation="white",
-                           label="Drag to move", min_width=320)
-        status = gr.Markdown("You are **White**. Make your move.")
 
     with ctrl_col:
         play_as = gr.Radio(["White", "Black"], value="White", label="Play as")
@@ -212,13 +216,27 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
         show_eval = gr.Checkbox(False, label="Show evaluation bar")
         new_btn = gr.Button("New game", variant="primary")
 
-    # on_move is a generator → streams the "thinking" status; show_progress hidden
-    # so Gradio's overlay doesn't sit over the board.
-    board.move(on_move, inputs=[board, sims, human_color],
-               outputs=[board, status, eval_bar], show_progress="hidden")
+    # The board lives in a gr.render so switching color rebuilds it with the new
+    # orientation (chessboard.js reads orientation only at construction). The
+    # min_width above keeps the container sized so the remount can't init at 0.
+    with board_col:
+        @gr.render(inputs=setup)
+        def render_board(cfg):
+            board = Chessboard(value=cfg["fen"], game_mode=True, min_width=320,
+                               orientation=cfg["orientation"], label="Drag to move")
+            status = gr.Markdown(cfg["status"])
+            color = cfg["color"]
+
+            def handle(fen, s):  # generator → streams the "thinking" update first
+                yield from on_move(fen, s, color)
+
+            # show_progress="hidden": our "⏳ thinking…" status is the signal, so
+            # Gradio's default overlay doesn't sit over the board.
+            board.move(handle, inputs=[board, sims], outputs=[board, status, eval_bar],
+                       show_progress="hidden")
+
     show_eval.change(lambda show: gr.update(visible=show), inputs=show_eval, outputs=eval_bar)
-    new_btn.click(new_game, inputs=[play_as, sims],
-                  outputs=[board, status, eval_bar, human_color])
+    new_btn.click(new_game, inputs=[play_as, sims], outputs=[setup, eval_bar])
 
 
 if __name__ == "__main__":
