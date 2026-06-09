@@ -78,43 +78,56 @@ bot = Pos2MoveV2MctsBot(
 )
 
 
-def _result_text(board: chess.Board) -> str:
+def _human_color(human_color: str) -> bool:
+    return chess.BLACK if human_color == "black" else chess.WHITE
+
+
+def _result_text(board: chess.Board, human_color: str) -> str:
     outcome = board.outcome()
     if outcome is None:
         return ""
     if outcome.winner is None:
         return f"Draw ({outcome.termination.name.lower().replace('_', ' ')}). New game?"
-    who = "You win! 🎉" if outcome.winner == chess.WHITE else "ChessTransformer wins."
+    who = "You win! 🎉" if outcome.winner == _human_color(human_color) else "ChessTransformer wins."
     return f"Checkmate — {who} New game?"
 
 
-def on_move(fen: str, sims: int):
-    """Human just moved (White). Reply with the bot's move (Black)."""
-    board = chess.Board(fen)
-    if board.is_game_over():
-        return fen, _result_text(board)
-
+def _bot_move(board: chess.Board, sims: int):
+    """Play the side to move with the bot; return its SAN and value."""
     bot.num_simulations = int(sims)
     uci, value = bot.predict(board)
+    san = board.san(chess.Move.from_uci(uci))
     board.push_uci(uci)
+    return san, value
 
-    move_san = "—"
-    tmp = chess.Board(fen)
-    try:
-        move_san = tmp.san(chess.Move.from_uci(uci))
-    except Exception:
-        move_san = uci
+
+def on_move(fen: str, sims: int, human_color: str):
+    """Human just moved; reply with the bot's move (whichever side is to move)."""
+    board = chess.Board(fen)
+    if board.is_game_over():
+        return board.fen(), _result_text(board, human_color)
+
+    san, value = _bot_move(board, sims)
 
     if board.is_game_over():
-        status = f"Bot played **{move_san}**.  {_result_text(board)}"
+        status = f"Bot played **{san}**.  {_result_text(board, human_color)}"
     else:
         eval_str = f"  (eval {value:+.2f})" if value is not None else ""
-        status = f"Bot played **{move_san}**{eval_str}.  Your move."
+        status = f"Bot played **{san}**{eval_str}.  Your move."
     return board.fen(), status
 
 
-def new_game():
-    return START_FEN, "New game — you are **White**. Make your move."
+def new_game(play_as: str, sims: int):
+    """Start a fresh game. If the human plays Black, the bot (White) opens."""
+    human_color = "black" if play_as == "Black" else "white"
+    orientation = human_color
+    board = chess.Board()
+    if human_color == "black":
+        san, _ = _bot_move(board, sims)
+        status = f"New game — you are **Black**. Bot opened with **{san}**. Your move."
+    else:
+        status = "New game — you are **White**. Make your move."
+    return gr.update(value=board.fen(), orientation=orientation), status, human_color
 
 
 with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
@@ -124,21 +137,24 @@ with gr.Blocks(title="ChessTransformer", theme=gr.themes.Soft()) as demo:
         "(no self-play, no RL), playing via AlphaZero-style MCTS. "
         "It reaches **~2100 Elo** vs Stockfish at full strength; this CPU demo "
         "runs at a lower sim count so moves come back quickly.\n\n"
-        "**You play White.** Drag a piece to move — the bot replies automatically.  "
+        "**Pick your color and hit New game.** Drag a piece to move — the bot "
+        "replies automatically.  "
         "[GitHub repo →](https://github.com/tchauffi/ChessTransformer)"
     )
+    human_color = gr.State("white")
     with gr.Row():
         with gr.Column(scale=3):
             board = Chessboard(value=START_FEN, game_mode=True, orientation="white",
-                               label="Drag to move (you are White)")
+                               label="Drag to move")
         with gr.Column(scale=1):
             status = gr.Markdown("You are **White**. Make your move.")
+            play_as = gr.Radio(["White", "Black"], value="White", label="Play as")
             sims = gr.Slider(32, 1200, value=DEFAULT_SIMS, step=8, label="Engine strength (MCTS sims/move)",
                              info="Higher = stronger but slower on CPU")
             new_btn = gr.Button("New game", variant="primary")
 
-    board.move(on_move, inputs=[board, sims], outputs=[board, status])
-    new_btn.click(new_game, outputs=[board, status])
+    board.move(on_move, inputs=[board, sims, human_color], outputs=[board, status])
+    new_btn.click(new_game, inputs=[play_as, sims], outputs=[board, status, human_color])
 
 
 if __name__ == "__main__":
