@@ -140,6 +140,25 @@ Cheap non-RL supplements worth folding in at any stage: Syzygy tablebase positio
 as perfect endgame value labels, and auxiliary prediction targets (final material,
 opponent reply) to extract more signal per game.
 
+## 4b. Rust generation core (step 2 infrastructure)
+
+Profiling showed the Python generator is CPU-bound (~38% python-chess, ~30%
+Python MCTS loop). `rust/selfplay-core` (PyO3 + shakmaty) moves boards, trees
+and game lifecycle into Rust and batches leaf evaluations **across all
+concurrent games**; Python keeps only the batched bf16/compiled NN forward
+(`scripts/selfplay_rust.py`). The transposition cache stores legal-move-aligned
+priors instead of full 64×73 logits (~200 B vs ~19 KB per entry).
+
+Encoding parity with the Python tokenizers is enforced by
+`scripts/check_rust_parity.py` (board tokens, castling/ep/player, action
+planes, legal move sets — 38k+ random positions).
+
+**Benchmark @ 128 sims:** 11,025 games/h single process (64 parallel games) vs
+840 (Python single) and ~1,900 (3 Python workers) — **13× / 5.8×**. The new
+generator also records MCTS visit distributions (CSR: visit_idx/visit_cnt/
+visit_ptr) — the policy targets for expert iteration. Output stays loadable by
+the existing training scripts.
+
 ## 5. Status log
 
 - **2026-06-10** — Pipeline built and smoke-tested end to end. First real dataset

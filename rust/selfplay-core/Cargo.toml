@@ -1,0 +1,20 @@
+[package]
+name = "selfplay-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "selfplay_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+shakmaty = "0.27"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
