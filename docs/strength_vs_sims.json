@@ -1,0 +1,41 @@
+{
+  "skills": [
+    4,
+    6,
+    8,
+    10,
+    12
+  ],
+  "games_per_level": 10,
+  "config": {
+    "c_puct": 1.0,
+    "fpu": 0.2,
+    "model": "data/models/pos2move_v2.1"
+  },
+  "points": [
+    {
+      "sims": 25,
+      "elo": 1327.0
+    },
+    {
+      "sims": 50,
+      "elo": 1436.0
+    },
+    {
+      "sims": 100,
+      "elo": 1691.0
+    },
+    {
+      "sims": 200,
+      "elo": 1819.0
+    },
+    {
+      "sims": 400,
+      "elo": 1977.0
+    },
+    {
+      "sims": 800,
+      "elo": 2175.0
+    }
+  ]
+}

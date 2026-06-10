@@ -55,6 +55,16 @@ MCTS @ 800 sims (`c_puct=1.0`, `fpu=0.2`, tree reuse), model v2.1, 20 games/leve
 
 **MLE estimate: ~2100 Elo.** Elo is fit by maximum likelihood over all games rather than averaging per-level estimates (which is biased low — saturated easy levels cap at a low value and drag the mean down).
 
+### Strength scales with search
+
+More MCTS simulations per move = stronger play — the same human-trained network gains **~+850 Elo** from 25 → 800 sims, with no retraining. Each point is an MLE Elo fit over a Stockfish gauntlet (`scripts/sims_scaling.py`):
+
+![Elo vs MCTS simulations](docs/strength_vs_sims.png)
+
+| MCTS sims | 25 | 50 | 100 | 200 | 400 | 800 |
+|---|---|---|---|---|---|---|
+| Est. Elo | 1327 | 1436 | 1691 | 1819 | 1977 | 2175 |
+
 <details>
 <summary><b>What moved the needle</b> (inference-side, no retraining)</summary>
 

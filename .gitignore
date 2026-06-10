@@ -227,3 +227,6 @@ data/raw/
 
 # HF Space build artifact (assembled by hf_space/prepare.sh)
 hf_space/space_build/
+
+# Maia weights (downloaded by maia2 on first use)
+maia2_models/
