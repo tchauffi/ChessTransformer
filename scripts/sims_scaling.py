@@ -33,15 +33,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 def run_one_level(args) -> None:
     """Single sim level: run the gauntlet, print ``RESULT_ELO=<n>``."""
-    from chesstransformer.bots.pos2move_v2_mcts_bot import Pos2MoveV2MctsBot
     from elo_gauntlet import run_gauntlet
     from tune_vs_stockfish import mle_elo
 
-    use_compile = args.device == "cuda"
-    bot = Pos2MoveV2MctsBot(model_dir=args.model, num_simulations=args.sims[0],
-                            c_puct=args.cpuct, fpu=args.fpu, device=args.device,
-                            compile=use_compile, time_limit=0.0, move_temp=0.0)
-    results = run_gauntlet(bot, args.sf_path, args.skills, args.games, args.sf_time, None)
+    if args.engine_cmd:
+        import shlex
+
+        from uci_bot_adapter import UciBotAdapter
+
+        bot = UciBotAdapter(shlex.split(args.engine_cmd), sims=args.sims[0])
+    else:
+        from chesstransformer.bots.pos2move_v2_mcts_bot import Pos2MoveV2MctsBot
+
+        use_compile = args.device == "cuda"
+        bot = Pos2MoveV2MctsBot(model_dir=args.model, num_simulations=args.sims[0],
+                                c_puct=args.cpuct, fpu=args.fpu, device=args.device,
+                                compile=use_compile, time_limit=0.0, move_temp=0.0)
+    try:
+        results = run_gauntlet(bot, args.sf_path, args.skills, args.games, args.sf_time, None)
+    finally:
+        if args.engine_cmd:
+            bot.close()
     elo = mle_elo(results)
     print(f"RESULT_ELO={elo if elo is not None else ''}", flush=True)
 
@@ -85,6 +97,10 @@ def main():
     p.add_argument("--level-timeout", type=int, default=600, help="Per-sim-level wall-clock cap (s)")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                    help="cuda uses torch.compile for fast, clean measurement (run when GPU is free)")
+    p.add_argument("--engine-cmd", default=None,
+                   help="UCI engine command to test instead of the Python bot, e.g. "
+                        "'rust/target/release/ct-bot uci --model data/models/pos2move_v2.1/model_ema.onnx'. "
+                        "Raise --level-timeout for high sim counts.")
     p.add_argument("--out-json", default="docs/strength_vs_sims.json")
     p.add_argument("--out-png", default="docs/strength_vs_sims.png")
     p.add_argument("--_one", action="store_true", help=argparse.SUPPRESS)
@@ -105,6 +121,8 @@ def main():
                "--model", args.model, "--cpuct", str(args.cpuct), "--fpu", str(args.fpu),
                "--sf-path", args.sf_path, "--sf-time", str(args.sf_time),
                "--device", args.device]
+        if args.engine_cmd:
+            cmd += ["--engine-cmd", args.engine_cmd]
         print(f"\n########## MCTS sims = {s} (timeout {args.level_timeout}s) ##########", flush=True)
         elo = None
         try:

@@ -10,11 +10,15 @@
 //!
 //! Search semantics mirror `Pos2MoveV2MctsBot` (PUCT + FPU, virtual loss,
 //! negamax backup, terminal rules incl. in-search threefold repetition).
-//! Position/move encodings mirror `PostionTokenizer` and
-//! `alphazero_move_encoder.move_to_action_plane` exactly — see the parity test.
+//! Encodings and tree primitives live in the shared `chess-core` crate —
+//! see the parity test.
 
 use std::collections::HashMap;
 
+use chess_core::encoding::{
+    action_plane, encode_position, halfmove, move_coords, terminal_value, zobrist, NUM_PLANES,
+};
+use chess_core::tree::{backup_vl, puct_select, softmax_priors, Node};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -22,174 +26,7 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 use serde::Deserialize;
 use shakmaty::fen::Fen;
-use shakmaty::zobrist::{Zobrist64, ZobristHash};
-use shakmaty::{
-    CastlingMode, CastlingSide, Chess, Color, EnPassantMode, Move, Position, Role,
-};
-
-const NUM_PLANES: usize = 73;
-
-// ── encoding (must match the Python tokenizers exactly) ──────────────────
-
-fn piece_token(role: Role, color: Color) -> u8 {
-    let base = match role {
-        Role::Pawn => 1,
-        Role::Knight => 2,
-        Role::Bishop => 3,
-        Role::Rook => 4,
-        Role::Queen => 5,
-        Role::King => 6,
-    };
-    if color == Color::White {
-        base
-    } else {
-        base + 6
-    }
-}
-
-/// (from_sq, to_sq, promotion) in python-chess conventions: castling is the
-/// king's two-square move (e1g1), squares indexed a1=0..h8=63.
-fn move_coords(m: &Move) -> (usize, usize, Option<Role>) {
-    match m {
-        Move::Castle { king, rook } => {
-            let k = u32::from(*king) as usize;
-            let r = u32::from(*rook) as usize;
-            let to = if r > k { k + 2 } else { k - 2 };
-            (k, to, None)
-        }
-        _ => (
-            u32::from(m.from().expect("no drops in chess")) as usize,
-            u32::from(m.to()) as usize,
-            m.promotion(),
-        ),
-    }
-}
-
-/// AlphaZero 8x8x73 action plane (mirror of move_to_action_plane).
-fn action_plane(from: usize, to: usize, promo: Option<Role>) -> usize {
-    let df = (to % 8) as i32 - (from % 8) as i32;
-    let dr = (to / 8) as i32 - (from / 8) as i32;
-
-    if let Some(p) = promo {
-        if p != Role::Queen {
-            let dir_idx = (df + 1) as usize;
-            let piece_idx = match p {
-                Role::Knight => 0,
-                Role::Bishop => 1,
-                Role::Rook => 2,
-                _ => unreachable!("queen handled above"),
-            };
-            return 64 + dir_idx * 3 + piece_idx;
-        }
-    }
-
-    const KNIGHT_JUMPS: [(i32, i32); 8] = [
-        (1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2),
-    ];
-    if let Some(i) = KNIGHT_JUMPS.iter().position(|&d| d == (df, dr)) {
-        return 56 + i;
-    }
-
-    const QUEEN_DIRS: [(i32, i32); 8] = [
-        (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1),
-    ];
-    let dist = df.abs().max(dr.abs());
-    let dir_f = if df != 0 { df / dist } else { 0 };
-    let dir_r = if dr != 0 { dr / dist } else { 0 };
-    let dir_idx = QUEEN_DIRS.iter().position(|&d| d == (dir_f, dir_r)).unwrap();
-    dir_idx * 7 + (dist as usize - 1)
-}
-
-fn encode_position(pos: &Chess) -> ([u8; 64], u8, u8, u8) {
-    let mut tokens = [0u8; 64];
-    let board = pos.board();
-    for sq in board.occupied() {
-        let piece = board.piece_at(sq).unwrap();
-        tokens[u32::from(sq) as usize] = piece_token(piece.role, piece.color);
-    }
-    let player = if pos.turn() == Color::White { 1 } else { 0 };
-    let castles = pos.castles();
-    let mut castling = 0u8;
-    if castles.has(Color::White, CastlingSide::KingSide) {
-        castling |= 1;
-    }
-    if castles.has(Color::White, CastlingSide::QueenSide) {
-        castling |= 2;
-    }
-    if castles.has(Color::Black, CastlingSide::KingSide) {
-        castling |= 4;
-    }
-    if castles.has(Color::Black, CastlingSide::QueenSide) {
-        castling |= 8;
-    }
-    let ep = pos
-        .ep_square(EnPassantMode::Legal)
-        .map(|s| (u32::from(s) % 8) as u8)
-        .unwrap_or(8);
-    (tokens, player, castling, ep)
-}
-
-fn zobrist(pos: &Chess) -> u64 {
-    let h: Zobrist64 = pos.zobrist_hash(EnPassantMode::Legal);
-    h.0
-}
-
-/// Terminal value from the side-to-move POV, or None. `keys` is the sequence
-/// of zobrist keys of all positions seen (game history + search path),
-/// including the current position — mirrors python-chess is_repetition(3)
-/// seeing the search pushes on the shared board.
-fn terminal_value(pos: &Chess, keys: &[u64], current: u64) -> Option<f32> {
-    if pos.legal_moves().is_empty() {
-        return Some(if pos.is_check() { -1.0 } else { 0.0 });
-    }
-    if pos.is_insufficient_material() || pos.halfmoves() >= 100 {
-        return Some(0.0);
-    }
-    if keys.iter().filter(|&&k| k == current).count() >= 3 {
-        return Some(0.0);
-    }
-    None
-}
-
-// ── search tree ──────────────────────────────────────────────────────────
-
-#[derive(Default)]
-struct Node {
-    expanded: bool,
-    moves: Vec<Move>,
-    priors: Vec<f32>,
-    n: Vec<u32>,
-    w: Vec<f64>,
-    children: Vec<i32>, // -1 = not materialized
-}
-
-impl Node {
-    fn expand(&mut self, moves: Vec<Move>, priors: Vec<f32>) {
-        let k = moves.len();
-        self.moves = moves;
-        self.priors = priors;
-        self.n = vec![0; k];
-        self.w = vec![0.0; k];
-        self.children = vec![-1; k];
-        self.expanded = true;
-    }
-}
-
-fn softmax_priors(scores: &mut [f32], temp: f32) {
-    let mut max = f32::NEG_INFINITY;
-    for s in scores.iter_mut() {
-        *s /= temp;
-        max = max.max(*s);
-    }
-    let mut sum = 0.0;
-    for s in scores.iter_mut() {
-        *s = (*s - max).exp();
-        sum += *s;
-    }
-    for s in scores.iter_mut() {
-        *s /= sum;
-    }
-}
+use shakmaty::{CastlingMode, Chess, Color, Move, Position};
 
 // ── per-game state ───────────────────────────────────────────────────────
 
@@ -325,32 +162,6 @@ impl Engine {
         }
     }
 
-    fn select_idx(&self, node: &Node) -> usize {
-        let total: u32 = node.n.iter().sum();
-        let sqrt_total = (1.0 + total as f64).sqrt();
-        let parent_q = if total > 0 {
-            -node.w.iter().sum::<f64>() / total as f64
-        } else {
-            0.0
-        };
-        let mut best = 0usize;
-        let mut best_score = f64::NEG_INFINITY;
-        for i in 0..node.moves.len() {
-            let q = if node.n[i] > 0 {
-                -node.w[i] / node.n[i] as f64
-            } else {
-                parent_q - self.cfg.fpu
-            };
-            let u = self.cfg.c_puct * sqrt_total * node.priors[i] as f64 / (1.0 + node.n[i] as f64);
-            let s = q + u;
-            if s > best_score {
-                best_score = s;
-                best = i;
-            }
-        }
-        best
-    }
-
     /// Descend with virtual loss to an unexpanded node. Returns the leaf node
     /// index, the path, the leaf position and the zobrist keys pushed en route.
     fn descend(&mut self, gi: usize) -> (usize, Vec<(usize, usize)>, Chess, Vec<u64>) {
@@ -362,7 +173,7 @@ impl Engine {
             if !self.games[gi].tree[node_idx].expanded {
                 return (node_idx, path, pos, keys);
             }
-            let idx = self.select_idx(&self.games[gi].tree[node_idx]);
+            let idx = puct_select(&self.games[gi].tree[node_idx], self.cfg.c_puct, self.cfg.fpu);
             {
                 let node = &mut self.games[gi].tree[node_idx];
                 node.n[idx] += 1; // virtual loss
@@ -384,26 +195,13 @@ impl Engine {
         }
     }
 
-    fn backup_vl(game: &mut Game, path: &[(usize, usize)], value: f32) {
-        let mut v = value as f64;
-        for &(node_idx, idx) in path.iter().rev() {
-            // N was already counted by the virtual loss; undo the +1.0 on W.
-            game.tree[node_idx].w[idx] += v - 1.0;
-            v = -v;
-        }
-    }
-
     fn resolve_leaf(game: &mut Game, node_idx: usize, moves: Vec<Move>, priors: &[f32],
                     value: f32, path: &[(usize, usize)]) {
         if !game.tree[node_idx].expanded {
             game.tree[node_idx].expand(moves, priors.to_vec());
         }
-        Self::backup_vl(game, path, value);
+        backup_vl(&mut game.tree, path, value);
         game.sims_done += 1;
-    }
-
-    fn halfmove(pos: &Chess) -> u32 {
-        2 * (u32::from(pos.fullmoves()) - 1) + if pos.turn() == Color::White { 0 } else { 1 }
     }
 
     /// Search budget reached: record the position, play the move, handle game
@@ -413,7 +211,7 @@ impl Engine {
         let cfg_temp_plies = self.cfg.temp_plies;
 
         let (tokens, player, castling, ep) = encode_position(&self.games[gi].pos);
-        let halfmove = Self::halfmove(&self.games[gi].pos);
+        let halfmove = halfmove(&self.games[gi].pos);
 
         // Visit distribution + move selection from the root.
         let (best_idx, root_v, visit_idx, visit_cnt) = {
@@ -608,7 +406,7 @@ impl Engine {
                 all_keys.extend_from_slice(&path_keys);
                 if let Some(t) = terminal_value(&pos, &all_keys, key) {
                     let game = &mut self.games[gi];
-                    Self::backup_vl(game, &path, t);
+                    backup_vl(&mut game.tree, &path, t);
                     game.sims_done += 1;
                     continue;
                 }

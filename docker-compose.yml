@@ -1,21 +1,22 @@
 services:
-  # FastAPI Backend
+  # Rust backend (ct-bot serve: in-process ONNX inference + MCTS, same API as
+  # the old FastAPI backend). MCTS_SIMS tunes strength/latency per move.
   backend:
     build:
       context: .
-      dockerfile: backend/Dockerfile
+      dockerfile: rust/ct-bot/Dockerfile
     container_name: chesstransformer-backend
     ports:
       - "5001:5001"
     environment:
-      - PYTHONUNBUFFERED=1
+      - MCTS_SIMS=800
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/api/health')"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:5001/api/health"]
       interval: 5s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 30s
 
   # Next.js Frontend
   frontend:

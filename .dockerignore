@@ -71,3 +71,8 @@ benchmark_results.json
 .ruff_cache
 .mypy_cache
 .ruff_cache
+
+# Rust (ct-bot image builds from source; never ship the target dir)
+rust/target
+# Model served by the Rust backend
+!data/models/pos2move_v2.1/model_ema.onnx
