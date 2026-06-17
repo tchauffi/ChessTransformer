@@ -1,0 +1,14 @@
+[workspace]
+members = ["chess-core", "selfplay-core", "ct-bot"]
+resolver = "2"
+
+[workspace.dependencies]
+shakmaty = "0.27"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Profiles only apply from the workspace root (cargo ignores them in members).
+[profile.release]
+lto = true
+codegen-units = 1

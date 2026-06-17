@@ -6,6 +6,8 @@ The model predicts moves directly from board positions, then plays via an AlphaZ
 
 **▶ [Play it in your browser](https://huggingface.co/spaces/tchauffi/ChessTransformer)** — live demo on Hugging Face Spaces (no install).
 
+**♟ [Challenge it on Lichess](https://lichess.org/@/ChessTransformerBot)** — `ChessTransformerBot` runs the Rust engine ([`rust/ct-bot`](rust/ct-bot)) live; standard, rated, blitz/rapid. [![Lichess bot status](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fusers%2Fstatus%3Fids%3DChessTransformerBot&query=%24%5B0%5D.online&label=bot&color=brightgreen)](https://lichess.org/@/ChessTransformerBot) (`true` = online)
+
 ## Demo
 
 ChessTransformer v2.1 (White, MCTS @ 800 sims) checkmating Stockfish Level 8 — the finishing sequence:

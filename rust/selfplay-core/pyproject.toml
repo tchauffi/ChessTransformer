@@ -1,0 +1,11 @@
+# Pins the wheel name: without this, maturin walks up past the cargo workspace
+# and adopts the repo-root pyproject.toml (name "chesstransformer"), producing
+# a wheel that would shadow the real Python package.
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "selfplay_core"
+version = "0.1.0"
+requires-python = ">=3.9"

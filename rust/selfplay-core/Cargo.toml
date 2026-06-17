@@ -1,0 +1,17 @@
+[package]
+name = "selfplay-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "selfplay_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+chess-core = { path = "../chess-core" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+shakmaty = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

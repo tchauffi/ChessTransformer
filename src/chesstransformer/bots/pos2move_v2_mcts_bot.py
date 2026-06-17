@@ -186,7 +186,7 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
         """Collect up to ``batch_n`` leaves (virtual loss during descent),
         evaluate the unique uncached non-terminal ones in one batched forward,
         then expand and back them up."""
-        leaves = []          # (path, leaf_node, key, moves)
+        leaves = []          # (path, leaf_node, key, moves, cached eval or None)
         items_by_key = {}    # key -> (pos, player, castling, ep, key)
 
         for _ in range(batch_n):
@@ -197,22 +197,26 @@ class Pos2MoveV2MctsBot(Pos2MoveV2Bot):
             else:
                 key = chess.polyglot.zobrist_hash(board)
                 moves = list(board.legal_moves)
-                leaves.append((path, node, key, moves))
                 # Reuse cached policy+value (transpositions / reused subtree /
                 # prior moves); only batch positions we haven't evaluated yet.
-                if key in self._tt:
+                # Capture the cached entry *now*: once the TT is at capacity,
+                # _batch_run's inserts evict oldest entries, so a hit found here
+                # may no longer be in the TT after the batch runs.
+                cached = self._tt.get(key)
+                if cached is not None:
                     self.tt_hits += 1
                 elif key not in items_by_key:
                     pos, player, castling, ep = self._encode_position(board)
                     items_by_key[key] = (pos, player, castling, ep, key)
+                leaves.append((path, node, key, moves, cached))
             for _ in range(len(path)):
                 board.pop()
 
         if items_by_key:
             self._batch_run(list(items_by_key.values()))  # populates self._tt
 
-        for path, node, key, moves in leaves:
-            logits, value = self._tt[key]
+        for path, node, key, moves, cached in leaves:
+            logits, value = cached if cached is not None else self._tt[key]
             if not node.expanded:
                 self._expand_node(node, moves, self._compute_priors(moves, logits))
             self._backup_vl(path, value)
