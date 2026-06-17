@@ -1,10 +1,9 @@
 """Self-play generation driven by the Rust core (rust/selfplay-core).
 
-Same output contract as selfplay_value_games.py (npz shards + games.jsonl,
-loadable by train_value_head.py / train_value_trunk.py) plus **MCTS visit
-distributions** per position in CSR form (visit_idx/visit_cnt/visit_ptr,
-indices = from_square * 73 + action_plane) — the policy targets needed for
-expert-iteration training.
+Writes npz shards + games.jsonl, each position carrying the eventual game
+outcome plus **MCTS visit distributions** in CSR form (visit_idx/visit_cnt/
+visit_ptr, indices = from_square * 73 + action_plane) — the value and policy
+targets needed for expert-iteration training.
 
 The Rust engine runs N games concurrently and batches leaf evaluations across
 all of them; Python only runs the batched NN forward. Build the core with:

@@ -137,6 +137,7 @@ celerybeat.pid
 # Environments
 .env
 .env.local
+.env.lichess
 .envrc
 .venv
 env/
