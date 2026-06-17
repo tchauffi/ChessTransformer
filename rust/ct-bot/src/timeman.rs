@@ -4,6 +4,12 @@
 
 use std::time::{Duration, Instant};
 
+/// Upper bound on per-move simulations. The MCTS search degrades above ~2000
+/// sims (converges away from its priors to edge-pawn junk), so we cap the
+/// clock-derived budget well inside the healthy zone. Remove once the high-sim
+/// search bug is fixed. See memory: mcts-high-sim-bug.
+const MAX_SIMS: u32 = 1200;
+
 pub struct TimeManager {
     ewma_sims_per_sec: f64,
 }
@@ -37,7 +43,7 @@ impl TimeManager {
         let usable = remaining.saturating_sub(reserve);
         let alloc = (usable / 30 + inc.mul_f64(0.7)).clamp(min_alloc, (usable / 4).max(min_alloc));
         let sims = (alloc.as_secs_f64() * self.ewma_sims_per_sec).round() as u32;
-        let sims = sims.clamp(64, 100_000);
+        let sims = sims.clamp(64, MAX_SIMS);
         let hard = alloc.mul_f64(1.5).min((usable / 3).max(min_alloc));
         (sims, Instant::now() + hard)
     }
