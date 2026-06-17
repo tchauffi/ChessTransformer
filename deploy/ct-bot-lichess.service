@@ -1,0 +1,27 @@
+[Unit]
+Description=ChessTransformer lichess bot (ct-bot)
+Documentation=https://github.com/tchauffi/ChessTransformer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Token lives here, not in the unit (chmod 600). See deploy/oracle-lichess.md.
+EnvironmentFile=/etc/ct-bot/lichess.env
+Environment=RUST_LOG=info
+WorkingDirectory=/opt/ct-bot
+ExecStart=/opt/ct-bot/ct-bot lichess \
+    --model /opt/ct-bot/model_ema.int8.onnx \
+    --speeds blitz,rapid \
+    --max-games 1
+Restart=always
+RestartSec=5
+# The bot only makes outbound HTTPS calls to lichess; lock the rest down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/ct-bot
+
+[Install]
+WantedBy=multi-user.target
