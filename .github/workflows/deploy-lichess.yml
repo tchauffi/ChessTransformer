@@ -1,7 +1,9 @@
 name: Deploy lichess bot
 
-# Builds the ct-bot binary natively on a free arm64 runner and ships it to the
-# Oracle Always-Free (Ampere/ARM) VM, then restarts the systemd service.
+# Builds the ct-bot binary and ships it to the Oracle Always-Free VM, then
+# restarts the systemd service. Runner arch must match the instance:
+#   - VM.Standard.E2.1.Micro (x86 AMD) -> ubuntu-latest   (current)
+#   - VM.Standard.A1.Flex   (ARM Ampere) -> ubuntu-24.04-arm
 #
 # One-time setup (see deploy/oracle-lichess.md):
 #   - Provision the VM; install the model + token + systemd unit once.
@@ -25,7 +27,7 @@ on:
 
 jobs:
   build-deploy:
-    runs-on: ubuntu-24.04-arm   # free native arm64 runner (public repos)
+    runs-on: ubuntu-latest   # x86 — matches VM.Standard.E2.1.Micro
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +41,7 @@ jobs:
         with:
           workspaces: rust
 
-      - name: Build ct-bot (aarch64)
+      - name: Build ct-bot
         run: cargo build --release --manifest-path rust/Cargo.toml -p ct-bot
 
       - name: Copy binary to the instance

@@ -1,8 +1,13 @@
-# Deploy the lichess bot on Oracle Cloud (Always Free ARM)
+# Deploy the lichess bot on Oracle Cloud (Always Free)
 
-Runs `ct-bot lichess` as an always-on systemd service on a free Oracle Ampere
-(ARM64) VM. The bot is **outbound-only** (it connects out to lichess), so no
-inbound ports, public IP, domain, or TLS are needed.
+Runs `ct-bot lichess` as an always-on systemd service on a free Oracle VM. The
+bot is **outbound-only** (it connects out to lichess), so no inbound ports,
+public IP, domain, or TLS are needed.
+
+**Shape:** these steps target `VM.Standard.E2.1.Micro` (x86 AMD, 1 OCPU / 1 GB,
+almost always available). If you can grab the ARM `VM.Standard.A1.Flex`
+(Ampere, faster, often "out of capacity"), the steps are identical — just pick
+that shape in §1 and switch the CI runner to `ubuntu-24.04-arm`.
 
 Prereqs: an Oracle Cloud account, a BOT lichess account + token with the
 `bot:play` scope, and the int8 model built locally
@@ -14,8 +19,8 @@ Prereqs: an Oracle Cloud account, a BOT lichess account + token with the
 
 - **Compute → Instances → Create instance**
 - **Image**: Canonical Ubuntu 24.04
-- **Shape**: `VM.Standard.A1.Flex` (Ampere/ARM, Always Free). 1 OCPU / 6 GB is
-  plenty; 2 OCPU / 12 GB builds faster.
+- **Shape**: `VM.Standard.E2.1.Micro` (x86 AMD, Always Free, 1 OCPU / 1 GB).
+  (ARM `VM.Standard.A1.Flex` is faster if you can get capacity — see header.)
 - Add your SSH public key.
 - Networking: defaults are fine — **no ingress rules needed** (outbound only).
 - Create, then note the public IP for SSH.
@@ -41,8 +46,13 @@ cd ChessTransformer
 cargo build --release --manifest-path rust/Cargo.toml -p ct-bot
 ```
 
-`ort` downloads the linux-aarch64 ONNX Runtime automatically. The CPU build is
-self-contained (no shared libs to ship).
+`ort` downloads the matching ONNX Runtime automatically (x86_64 here, aarch64
+on A1). The CPU build is self-contained (no shared libs to ship).
+
+> The `E2.1.Micro` is a single weak core, so the build takes a while and may be
+> tight on 1 GB RAM. If `cargo build` is slow or OOMs, prefer the **CI/CD**
+> path (§8) — GitHub builds the x86 binary and ships it, so the box never
+> compiles.
 
 ## 4. Install binary + model into /opt/ct-bot
 
@@ -128,6 +138,11 @@ the new `model_ema.int8.onnx` to `/opt/ct-bot/`, then restart.
 - **Stop any other running instance of the bot** (e.g. your dev machine) before
   starting this one — two clients on the same account fight over the event
   stream.
+- **Weak CPU (E2.1.Micro):** the time manager auto-sizes sims to fit the clock
+  (and is deadline-bounded, so the bot won't flag), but on one slow core it will
+  play fewer sims and thus weaker than on a fast box. Prefer **rapid** (e.g.
+  10+5) over bullet/blitz. `--speeds rapid,classical` in the unit avoids fast
+  controls it can't search well. On the ARM A1 you can keep `blitz,rapid`.
 - Manual update after a code change (if not using CI): `git pull && cargo build --release -m rust/Cargo.toml -p ct-bot && cp rust/target/release/ct-bot /opt/ct-bot/ && sudo systemctl restart ct-bot-lichess`.
 - Tuning: edit `ExecStart` in the unit (`--speeds`, `--max-games`, `--move-temp`
   for opening variety). Sims are clock-budgeted and capped at 1200 (see
