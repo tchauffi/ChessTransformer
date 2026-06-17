@@ -4,12 +4,13 @@
 
 use std::time::{Duration, Instant};
 
-/// Upper bound on per-move simulations. Above ~2000 sims the search starts
-/// exploiting a value-head artifact (the EMA net over-rates quiet flank moves
-/// like 1.h4), so it converges onto junk — this is a model limitation, NOT a
-/// search bug (the Python reference does the same with EMA weights). Cap the
-/// clock-derived budget inside the policy-dominated zone where it plays well.
-const MAX_SIMS: u32 = 1800;
+/// Upper bound on per-move simulations. Past a model-dependent point the search
+/// starts exploiting value-head artifacts (over-rated quiet flank moves like
+/// 1.h4) and converges onto junk — a model limitation, not a search bug. The
+/// EMA net degrades by ~2000 sims; the base net stays sound to ~5000 (gauntlet:
+/// both ~2108 Elo @ 800). The deployed bot uses the base int8 model, so cap at
+/// 4000 — uses much more of the clock while keeping margin below the ~5k edge.
+const MAX_SIMS: u32 = 4000;
 
 pub struct TimeManager {
     ewma_sims_per_sec: f64,
