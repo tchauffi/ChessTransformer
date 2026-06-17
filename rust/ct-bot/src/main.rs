@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-const DEFAULT_MODEL: &str = "data/models/pos2move_v2.1/model_ema.onnx";
+const DEFAULT_MODEL: &str = "data/models/pos2move_v2.1/model.int8.onnx";
 
 #[derive(Parser)]
 #[command(name = "ct-bot", about = "ChessTransformer Rust bot")]

@@ -21,11 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=builder /build/rust/target/release/ct-bot /usr/local/bin/ct-bot
 # ONNX Runtime (CPU) is statically linked; only the model is needed at runtime.
-# The int8 model is ~1.75x faster on the CPU EP with negligible quality loss
-# (generate with: export_onnx.py <dir> --ema --quantize).
-COPY data/models/pos2move_v2.1/model_ema.int8.onnx ./model_ema.int8.onnx
+# Base int8 model — the single model used across all deliveries (default, serve,
+# lichess): ~1.75x faster on the CPU EP, and the base net scales with search far
+# better than EMA (generate with: export_onnx.py <dir> --quantize).
+COPY data/models/pos2move_v2.1/model.int8.onnx ./model.int8.onnx
 
 EXPOSE 5001
 ENV RUST_LOG=info
 
-CMD ["ct-bot", "serve", "--model", "/app/model_ema.int8.onnx", "--port", "5001"]
+CMD ["ct-bot", "serve", "--model", "/app/model.int8.onnx", "--port", "5001"]

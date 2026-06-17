@@ -99,7 +99,7 @@ def main():
                    help="cuda uses torch.compile for fast, clean measurement (run when GPU is free)")
     p.add_argument("--engine-cmd", default=None,
                    help="UCI engine command to test instead of the Python bot, e.g. "
-                        "'rust/target/release/ct-bot uci --model data/models/pos2move_v2.1/model_ema.onnx'. "
+                        "'rust/target/release/ct-bot uci --model data/models/pos2move_v2.1/model.int8.onnx'. "
                         "Raise --level-timeout for high sim counts.")
     p.add_argument("--out-json", default="docs/strength_vs_sims.json")
     p.add_argument("--out-png", default="docs/strength_vs_sims.png")
