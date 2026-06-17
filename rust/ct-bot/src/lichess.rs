@@ -264,6 +264,19 @@ impl Bot {
             while let Some(msg) = stream.next().await? {
                 let state = match s(&msg, &["type"]) {
                     "gameFull" => {
+                        // challenge_verdict declines non-standard challenges, but
+                        // games that start without the accept flow (e.g. an AI
+                        // challenge) can still be a variant we can't play. Resign
+                        // cleanly instead of erroring out / hanging on the clock.
+                        let variant = s(&msg, &["variant", "key"]);
+                        if !variant.is_empty() && variant != "standard" {
+                            log::warn!("game {game_id}: unsupported variant '{variant}'; resigning");
+                            let _ = self
+                                .client
+                                .post(&format!("/api/bot/game/{game_id}/resign"), &[])
+                                .await;
+                            return Ok(());
+                        }
                         our_color = if s(&msg, &["white", "id"]) == self.our_id {
                             Color::White
                         } else {
