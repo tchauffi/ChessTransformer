@@ -4,11 +4,12 @@
 
 use std::time::{Duration, Instant};
 
-/// Upper bound on per-move simulations. The MCTS search degrades above ~2000
-/// sims (converges away from its priors to edge-pawn junk), so we cap the
-/// clock-derived budget well inside the healthy zone. Remove once the high-sim
-/// search bug is fixed. See memory: mcts-high-sim-bug.
-const MAX_SIMS: u32 = 1200;
+/// Upper bound on per-move simulations. Above ~2000 sims the search starts
+/// exploiting a value-head artifact (the EMA net over-rates quiet flank moves
+/// like 1.h4), so it converges onto junk — this is a model limitation, NOT a
+/// search bug (the Python reference does the same with EMA weights). Cap the
+/// clock-derived budget inside the policy-dominated zone where it plays well.
+const MAX_SIMS: u32 = 1800;
 
 pub struct TimeManager {
     ewma_sims_per_sec: f64,

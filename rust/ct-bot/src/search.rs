@@ -56,13 +56,19 @@ pub struct SearchResult {
     pub elapsed: Duration,
 }
 
+enum LeafEval {
+    /// Index into the deduped NN batch (priors computed after the forward).
+    Batch(usize),
+    /// Transposition / reused-subtree hit: priors (legal-move order) + value.
+    Cached(Vec<f32>, f32),
+}
+
 struct PendingLeaf {
     node: usize,
     path: Vec<(usize, usize)>,
     key: u64,
     moves: Vec<Move>,
-    /// Index into the deduped NN batch.
-    batch_idx: usize,
+    eval: LeafEval,
 }
 
 pub struct Search<E: Evaluator> {
@@ -207,43 +213,52 @@ impl<E: Evaluator> Search<E> {
                     continue;
                 }
                 let moves: Vec<Move> = pos.legal_moves().to_vec();
-                if let Some((priors, value)) = self.tt.get(&key).cloned() {
+                // Defer cached (TT) hits and NN leaves alike: their virtual loss
+                // stays applied through the wave so concurrent descents diversify
+                // (mirrors Pos2MoveV2MctsBot._run_batch). Backing TT hits up
+                // immediately collapses search breadth once the TT fills, which
+                // wrecks play at high sim counts.
+                let eval = if let Some((priors, value)) = self.tt.get(&key).cloned() {
                     tt_hits += 1;
-                    if !self.tree[node_idx].expanded {
-                        self.tree[node_idx].expand(moves, priors);
-                    }
-                    backup_vl(&mut self.tree, &path, value);
-                    sims_done += 1;
-                    continue;
-                }
-                let batch_idx = *batch_index.entry(key).or_insert_with(|| {
-                    let (tokens, player, castling, ep) = encode_position(&pos);
-                    batch.push(EvalRequest { tokens, player, castling, ep });
-                    batch.len() - 1
-                });
-                pending.push(PendingLeaf { node: node_idx, path, key, moves, batch_idx });
+                    LeafEval::Cached(priors, value)
+                } else {
+                    let batch_idx = *batch_index.entry(key).or_insert_with(|| {
+                        let (tokens, player, castling, ep) = encode_position(&pos);
+                        batch.push(EvalRequest { tokens, player, castling, ep });
+                        batch.len() - 1
+                    });
+                    LeafEval::Batch(batch_idx)
+                };
+                pending.push(PendingLeaf { node: node_idx, path, key, moves, eval });
             }
 
-            if !batch.is_empty() {
-                let outputs = self.eval.eval_batch(&batch)?;
-                nn_evals += outputs.len() as u32;
-                for leaf in pending {
-                    let out = &outputs[leaf.batch_idx];
-                    let (priors, value) = match self.tt.get(&leaf.key) {
+            let outputs = if batch.is_empty() {
+                Vec::new()
+            } else {
+                let o = self.eval.eval_batch(&batch)?;
+                nn_evals += o.len() as u32;
+                o
+            };
+            for leaf in pending {
+                let prior_temp = self.params.prior_temp;
+                let (priors, value) = match leaf.eval {
+                    LeafEval::Cached(priors, value) => (priors, value),
+                    // A later leaf in this wave may have inserted the key; prefer
+                    // the TT entry so transpositions share one eval.
+                    LeafEval::Batch(bi) => match self.tt.get(&leaf.key) {
                         Some(hit) => hit.clone(),
                         None => {
-                            let priors =
-                                priors_for(&leaf.moves, &out.logits, self.params.prior_temp);
-                            self.insert_tt(leaf.key, priors.clone(), out.value);
-                            (priors, out.value)
+                            let priors = priors_for(&leaf.moves, &outputs[bi].logits, prior_temp);
+                            self.insert_tt(leaf.key, priors.clone(), outputs[bi].value);
+                            (priors, outputs[bi].value)
                         }
-                    };
-                    if !self.tree[leaf.node].expanded {
-                        self.tree[leaf.node].expand(leaf.moves, priors);
-                    }
-                    backup_vl(&mut self.tree, &leaf.path, value);
-                    sims_done += 1;
+                    },
+                };
+                if !self.tree[leaf.node].expanded {
+                    self.tree[leaf.node].expand(leaf.moves, priors);
                 }
+                backup_vl(&mut self.tree, &leaf.path, value);
+                sims_done += 1;
             }
 
             if stop.load(Ordering::Relaxed) {
