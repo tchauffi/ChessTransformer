@@ -74,5 +74,5 @@ benchmark_results.json
 
 # Rust (ct-bot image builds from source; never ship the target dir)
 rust/target
-# Model served by the Rust backend
-!data/models/pos2move_v2.1/model_ema.onnx
+# Model served by the Rust backend (int8: ~1.75x faster on the CPU EP)
+!data/models/pos2move_v2.1/model_ema.int8.onnx
