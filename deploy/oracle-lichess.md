@@ -88,12 +88,47 @@ Casual). It auto-accepts blitz/rapid.
 
 ---
 
+## 8. (Optional) CI/CD: auto-build + deploy on push
+
+`.github/workflows/deploy-lichess.yml` builds the aarch64 binary on a free
+GitHub arm64 runner and ships it to the instance on every push to `rust/**`
+(or via "Run workflow"). The model + token stay on the box (steps 4–5); CI only
+updates the binary, which is what changes with code.
+
+**One-time box prep so CI can deploy without an interactive sudo password:**
+
+```bash
+# let the deploy user own the binary dir (no sudo needed to replace the binary)
+sudo chown -R "$USER":"$USER" /opt/ct-bot
+# allow exactly one passwordless command: restarting the service
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart ct-bot-lichess" \
+  | sudo tee /etc/sudoers.d/ct-bot >/dev/null
+sudo chmod 440 /etc/sudoers.d/ct-bot
+```
+
+**Add the repo secrets** (GitHub → Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `ORACLE_HOST` | the instance public IP |
+| `ORACLE_USER` | ssh user (e.g. `ubuntu`) |
+| `ORACLE_SSH_KEY` | a private key authorized on the instance |
+
+CI needs **inbound SSH (port 22)** to the instance — that's the one ingress
+exception (key-based auth only). Push to `main` (touching `rust/**`) or run the
+workflow manually, and it builds → scp → `systemctl restart` → checks the
+service is active.
+
+To rebuild the **model** (only when the weights change): run
+`scripts/export_onnx.py data/models/pos2move_v2.1 --ema --quantize` and `scp`
+the new `model_ema.int8.onnx` to `/opt/ct-bot/`, then restart.
+
 ## Notes
 
 - **Stop any other running instance of the bot** (e.g. your dev machine) before
   starting this one — two clients on the same account fight over the event
   stream.
-- Update after a code change: `git pull && cargo build --release -m rust/Cargo.toml -p ct-bot && sudo cp rust/target/release/ct-bot /opt/ct-bot/ && sudo systemctl restart ct-bot-lichess`.
+- Manual update after a code change (if not using CI): `git pull && cargo build --release -m rust/Cargo.toml -p ct-bot && cp rust/target/release/ct-bot /opt/ct-bot/ && sudo systemctl restart ct-bot-lichess`.
 - Tuning: edit `ExecStart` in the unit (`--speeds`, `--max-games`, `--move-temp`
   for opening variety). Sims are clock-budgeted and capped at 1200 (see
   timeman.rs).

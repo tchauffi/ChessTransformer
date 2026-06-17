@@ -1,0 +1,69 @@
+name: Deploy lichess bot
+
+# Builds the ct-bot binary natively on a free arm64 runner and ships it to the
+# Oracle Always-Free (Ampere/ARM) VM, then restarts the systemd service.
+#
+# One-time setup (see deploy/oracle-lichess.md):
+#   - Provision the VM; install the model + token + systemd unit once.
+#   - chown /opt/ct-bot to the deploy user; add a NOPASSWD sudoers line for
+#     `systemctl restart ct-bot-lichess`.
+#   - Add repo secrets (Settings -> Secrets and variables -> Actions):
+#       ORACLE_HOST    public IP of the instance
+#       ORACLE_USER    ssh user (e.g. ubuntu)
+#       ORACLE_SSH_KEY private key with access to the instance
+#
+# The model is regenerated from the LFS weights only when it changes; CI ships
+# the binary, which is what changes with code.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - ".github/workflows/deploy-lichess.yml"
+  workflow_dispatch:
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-24.04-arm   # free native arm64 runner (public repos)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        # libssl-dev: ort's build script downloads ONNX Runtime over TLS.
+        # g++: the statically-linked ONNX Runtime needs libstdc++ at link time.
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev g++
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build ct-bot (aarch64)
+        run: cargo build --release --manifest-path rust/Cargo.toml -p ct-bot
+
+      - name: Copy binary to the instance
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          source: rust/target/release/ct-bot
+          target: /tmp/ct-bot-deploy
+          strip_components: 3
+
+      - name: Install + restart service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          script: |
+            set -e
+            # rename over the running binary (allowed on Linux), then restart
+            chmod 0755 /tmp/ct-bot-deploy/ct-bot
+            mv -f /tmp/ct-bot-deploy/ct-bot /opt/ct-bot/ct-bot
+            rmdir /tmp/ct-bot-deploy 2>/dev/null || true
+            sudo systemctl restart ct-bot-lichess
+            sleep 2
+            systemctl is-active ct-bot-lichess
