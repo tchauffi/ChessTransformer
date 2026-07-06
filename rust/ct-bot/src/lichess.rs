@@ -303,6 +303,11 @@ impl Bot {
         if c["rated"].as_bool().unwrap_or(false) && !self.args.allow_rated {
             return Some("casual");
         }
+        // Casual games are for humans (testing, friendlies); bots must play rated
+        // so every game counts toward the rating signal.
+        if !c["rated"].as_bool().unwrap_or(false) && s(c, &["challenger", "title"]) == "BOT" {
+            return Some("rated");
+        }
         if self.active.lock().await.len() >= self.args.max_games {
             return Some("later");
         }
