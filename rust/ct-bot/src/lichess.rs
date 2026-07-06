@@ -5,7 +5,7 @@
 //! Docs: https://lichess.org/api#tag/Bot
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,10 +14,11 @@ use serde_json::Value;
 use shakmaty::uci::UciMove;
 use shakmaty::{fen::Fen, CastlingMode, Chess, Color, Move, Position};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::nn::OnnxEvaluator;
 use crate::search::{Search, SearchParams};
-use crate::timeman::TimeManager;
+use crate::timeman::{effective_sims, ponder_budget, TimeManager, PONDER_HEADROOM};
 use crate::LichessArgs;
 
 #[derive(Clone)]
@@ -100,6 +101,87 @@ fn s<'a>(v: &'a Value, path: &[&str]) -> &'a str {
         cur = &cur[p];
     }
     cur.as_str().unwrap_or("")
+}
+
+/// Owner of the per-game `Search` between our turns. On our turn the Search
+/// moves out (`reclaim`), runs on a blocking thread, and moves back in —
+/// either idle or as a detached ponder search on the opponent's clock.
+/// The move-in/move-out discipline is kept: the Search is never shared.
+struct SearchSlot {
+    state: SlotState,
+}
+
+enum SlotState {
+    /// Transient while the Search is out for our own move.
+    Empty,
+    Idle(Search<OnnxEvaluator>),
+    Pondering {
+        stop: Arc<AtomicBool>,
+        handle: JoinHandle<Search<OnnxEvaluator>>,
+    },
+}
+
+impl SearchSlot {
+    fn idle(search: Search<OnnxEvaluator>) -> Self {
+        SearchSlot { state: SlotState::Idle(search) }
+    }
+
+    fn put(&mut self, search: Search<OnnxEvaluator>) {
+        self.state = SlotState::Idle(search);
+    }
+
+    /// Stop any ponder search and take the Search back. Ponder stop latency is
+    /// bounded by one sim wave (`go()` checks the flag between waves).
+    async fn reclaim(&mut self) -> Result<Search<OnnxEvaluator>> {
+        match std::mem::replace(&mut self.state, SlotState::Empty) {
+            SlotState::Idle(s) => Ok(s),
+            SlotState::Pondering { stop, handle } => {
+                stop.store(true, Ordering::Relaxed);
+                handle.await.context("ponder search thread panicked")
+            }
+            SlotState::Empty => anyhow::bail!("search slot empty (search already taken)"),
+        }
+    }
+
+    /// Start a ponder search from `start` + `moves` (position after our move,
+    /// opponent to move). Tree reuse re-roots into it (gap=1 from our search),
+    /// and re-roots again (gap=1) when the opponent's reply arrives. The
+    /// budget is clipped so the ponder root's TOTAL visits stay under
+    /// `total_cap` — chained ponder+reuse would otherwise compound tree
+    /// totals without bound. No-op unless the slot is idle. Callers must
+    /// ensure the position is not terminal (`go()` panics on positions
+    /// without legal moves).
+    fn start_ponder(&mut self, start: Chess, moves: Vec<Move>, max_sims: u32, total_cap: u32) {
+        match std::mem::replace(&mut self.state, SlotState::Empty) {
+            SlotState::Idle(mut search) => {
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop2 = stop.clone();
+                let handle = tokio::task::spawn_blocking(move || {
+                    search.set_position(start, &moves);
+                    let budget = ponder_budget(max_sims, search.root_visits(), total_cap);
+                    if budget > 0 {
+                        if let Err(e) = search.go(budget, None, &stop2) {
+                            log::warn!("ponder search failed: {e:#}");
+                        }
+                    }
+                    search
+                });
+                self.state = SlotState::Pondering { stop, handle };
+            }
+            other => self.state = other,
+        }
+    }
+}
+
+/// Every `play_game` exit path (game over, errors, task drop) must wind down a
+/// detached ponder thread, or it burns CPU to its sim cap. Drop can't await
+/// the JoinHandle, but raising the stop flag ends the thread within one wave.
+impl Drop for SearchSlot {
+    fn drop(&mut self) {
+        if let SlotState::Pondering { stop, .. } = &self.state {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 struct Bot {
@@ -239,11 +321,23 @@ impl Bot {
             move_temp_plies: self.args.move_temp_plies,
             ..SearchParams::default()
         };
-        let mut search = Some(Search::new(eval, params));
+        let mut slot = SearchSlot::idle(Search::new(eval, params));
         let mut tm = TimeManager::new(self.args.initial_sims_per_sec);
+        let ponder = self.args.ponder && self.args.max_games == 1;
+        if self.args.ponder && !ponder {
+            log::warn!("--ponder requires --max-games 1; pondering disabled");
+        }
+        log::info!(
+            "game {game_id}: params sim_batch={} move_temp={} move_temp_plies={} ponder={ponder} ponder_max_sims={}",
+            self.args.sim_batch,
+            self.args.move_temp,
+            self.args.move_temp_plies,
+            self.args.ponder_max_sims,
+        );
 
         let mut start = Chess::default();
         let mut our_color = Color::White;
+        let mut total_cap = self.args.max_sims + PONDER_HEADROOM;
         // Cumulative `moves` makes mid-game stream reconnects stateless.
         let mut attempts = 0u32;
         loop {
@@ -290,7 +384,19 @@ impl Bot {
                                 .parse::<Fen>()?
                                 .into_position(CastlingMode::Standard)?
                         };
-                        log::info!("game {game_id}: playing {our_color:?}");
+                        // The sims cap — not the clock — binds most moves, so
+                        // it's the per-speed time-management knob.
+                        let speed = s(&msg, &["speed"]);
+                        let max_sims = if matches!(speed, "rapid" | "classical" | "correspondence") {
+                            self.args.max_sims_rapid
+                        } else {
+                            self.args.max_sims
+                        };
+                        tm.set_max_sims(max_sims);
+                        total_cap = max_sims + PONDER_HEADROOM;
+                        log::info!(
+                            "game {game_id}: playing {our_color:?} (speed={speed} max_sims={max_sims})"
+                        );
                         msg["state"].clone()
                     }
                     "gameState" => msg.clone(),
@@ -329,27 +435,35 @@ impl Bot {
                 } else {
                     (state["btime"].as_u64(), state["binc"].as_u64())
                 };
-                let (sims, deadline) = tm.plan(
+
+                // Reclaim before planning so ponder-stop latency is charged
+                // to this move's budget, not silently added on top.
+                let mut sr = slot.reclaim().await?;
+                let (plan_sims, deadline) = tm.plan(
                     Duration::from_millis(our_ms.unwrap_or(60_000)),
                     Duration::from_millis(our_inc.unwrap_or(0)),
                 );
 
                 // Search on a blocking thread; Search moves in and out.
-                let mut sr = search.take().expect("search in use");
                 let start_clone = start.clone();
-                let (sr, result) = tokio::task::spawn_blocking(move || {
+                let (sr, moves, warm, result) = tokio::task::spawn_blocking(move || {
                     sr.set_position(start_clone, &moves);
+                    // Warm visits (tree reuse / ponder hits) cost zero clock;
+                    // only clip fresh sims when totals near the artifact edge.
+                    let warm = sr.root_visits();
+                    let sims = if ponder { effective_sims(plan_sims, warm, total_cap) } else { plan_sims };
                     let r = sr.go(sims, Some(deadline), &AtomicBool::new(false));
-                    (sr, r)
+                    (sr, moves, warm, r)
                 })
                 .await?;
-                search = Some(sr);
+                slot.put(sr);
                 let result = result?;
+                // Ponder searches never feed the EWMA — only real moves do.
                 tm.update(result.sims, result.elapsed);
 
                 let uci = result.best.to_uci(CastlingMode::Standard).to_string();
                 log::info!(
-                    "game {game_id}: {uci} value={:+.3} sims={} ({} nn evals, {:.2}s, ~{:.0} sims/s)",
+                    "game {game_id}: {uci} value={:+.3} sims={} warm={warm} ({} nn evals, {:.2}s, ~{:.0} sims/s)",
                     result.value,
                     result.sims,
                     result.nn_evals,
@@ -363,6 +477,21 @@ impl Bot {
                     if let Err(e) = self.client.post(&path, &[]).await {
                         // Typically the game ended (resign/abort) under us.
                         log::warn!("game {game_id}: move post failed again: {e:#}");
+                    }
+                }
+
+                if ponder && self.args.ponder_max_sims > 0 {
+                    let mut ponder_pos = pos_after.clone();
+                    ponder_pos.play_unchecked(&result.best);
+                    if !ponder_pos.is_game_over() {
+                        let mut ponder_moves = moves;
+                        ponder_moves.push(result.best.clone());
+                        slot.start_ponder(
+                            start.clone(),
+                            ponder_moves,
+                            self.args.ponder_max_sims,
+                            total_cap,
+                        );
                     }
                 }
             }

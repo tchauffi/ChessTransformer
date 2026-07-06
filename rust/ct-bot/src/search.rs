@@ -112,6 +112,16 @@ impl<E: Evaluator> Search<E> {
         &self.pos
     }
 
+    /// Total visits already banked at the current root (sum over child edges)
+    /// — warm-start credit carried in by tree reuse / pondering. 0 on a fresh
+    /// or unexpanded root.
+    pub fn root_visits(&self) -> u32 {
+        if !self.tree[0].expanded {
+            return 0;
+        }
+        self.tree[0].n.iter().sum()
+    }
+
     /// Set the root to `start` + `moves`, rebuilding the zobrist history and
     /// re-rooting the previous search tree when the new position extends the
     /// previous one by 1..=4 plies through expanded nodes.
@@ -486,6 +496,30 @@ mod tests {
         // and the root value must be drawish, not a fantasy win.
         assert!(r.value.abs() < 0.5, "root value should be drawish, got {}", r.value);
         assert_eq!(r.sims, 128);
+    }
+
+    #[test]
+    fn root_visits_carry_through_ponder_reroots() {
+        let start = Chess::default();
+        let mut s = Search::new(UniformEval, SearchParams::default());
+        s.set_position(start.clone(), &[]);
+        assert_eq!(s.root_visits(), 0, "unexpanded root has no visits");
+        s.go(128, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(s.root_visits(), 128, "root edge visits must sum to sims");
+
+        // Ponder flow: after playing e2e4, re-root into the position with the
+        // opponent to move (gap=1) and keep searching.
+        let m1 = mv(s.position(), "e2e4");
+        s.set_position(start.clone(), &[m1.clone()]);
+        let warm = s.root_visits();
+        assert!(warm > 0, "reused subtree should carry warm visits");
+        let ponder = s.go(64, None, &AtomicBool::new(false)).unwrap();
+
+        // Opponent plays the ponder PV move: re-root again (gap=1); the
+        // ponder work must survive as warm visits on our new root.
+        s.set_position(start, &[m1, ponder.best]);
+        assert!(s.tree[0].expanded, "ponder subtree should re-root, not reset");
+        assert!(s.root_visits() > 0, "ponder visits should carry to our turn");
     }
 
     #[test]

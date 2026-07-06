@@ -110,6 +110,22 @@ struct LichessArgs {
     /// Seed for the sims/sec estimate (refined after every move)
     #[arg(long, default_value_t = 400.0)]
     initial_sims_per_sec: f64,
+    /// Per-move sims cap for bullet/blitz games (live logs: the cap, not the
+    /// clock, binds 81%+ of moves — this is the main time-management knob)
+    #[arg(long, default_value_t = 4000)]
+    max_sims: u32,
+    /// Per-move sims cap for rapid/classical games (massive clock headroom
+    /// there; raise once the visit-cap A/B clears totals past ~5k)
+    #[arg(long, default_value_t = 4000)]
+    max_sims_rapid: u32,
+    /// Search on the opponent's clock from the position after our move; tree
+    /// reuse converts the work into warm root visits on our next turn.
+    /// Requires --max-games 1 (disabled otherwise to avoid oversubscription).
+    #[arg(long)]
+    ponder: bool,
+    /// Max simulations per ponder search
+    #[arg(long, default_value_t = 4000)]
+    ponder_max_sims: u32,
     /// Lichess server (override for testing)
     #[arg(long, default_value = "https://lichess.org")]
     base_url: String,

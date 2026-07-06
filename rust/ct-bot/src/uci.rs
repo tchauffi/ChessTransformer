@@ -28,6 +28,10 @@ struct Options {
     threads: usize,
     device_cuda: bool,
     sims: u32,
+    /// 0 = off. Otherwise clip the sim budget so total root visits (warm
+    /// tree-reuse visits + fresh sims) stay under this — the A/B knob for
+    /// probing the value-head artifact edge (fresh-sims vs total-visits).
+    total_visits_cap: u32,
     params: SearchParams,
 }
 
@@ -74,6 +78,10 @@ impl Uci {
         println!("option name CPuct type string default {}", self.opts.params.c_puct);
         println!("option name FPU type string default {}", self.opts.params.fpu);
         println!("option name PriorTemp type string default {}", self.opts.params.prior_temp);
+        println!(
+            "option name TotalVisitsCap type spin default {} min 0 max 10000000",
+            self.opts.total_visits_cap
+        );
         println!("uciok");
     }
 
@@ -131,6 +139,11 @@ impl Uci {
                     if let Some(s) = &mut self.search {
                         s.params.prior_temp = v;
                     }
+                }
+            }
+            "totalvisitscap" => {
+                if let Ok(v) = value.parse() {
+                    self.opts.total_visits_cap = v;
                 }
             }
             _ => log::warn!("unknown option: {name}"),
@@ -197,13 +210,13 @@ impl Uci {
         }
 
         let default_sims = self.opts.sims;
-        let turn = {
+        let (turn, warm) = {
             let search = self.ensure_search()?;
             if search.position().legal_moves().is_empty() {
                 println!("bestmove 0000");
                 return Ok(());
             }
-            search.position().turn()
+            (search.position().turn(), search.root_visits())
         };
         let (sims, deadline) = if let Some(n) = nodes {
             (n, None)
@@ -224,6 +237,13 @@ impl Uci {
             (u32::MAX, None)
         } else {
             (default_sims, None)
+        };
+        // With a total-visits cap, warm tree-reuse visits count against the
+        // budget; sims=0 then plays the argmax of the reused root instantly.
+        let sims = if self.opts.total_visits_cap > 0 {
+            sims.min(self.opts.total_visits_cap.saturating_sub(warm))
+        } else {
+            sims
         };
 
         self.stop.store(false, Ordering::Relaxed);
@@ -281,6 +301,7 @@ pub fn run(args: &UciArgs) -> Result<()> {
             threads: args.model.threads,
             device_cuda: args.model.device == "cuda",
             sims: args.sims,
+            total_visits_cap: 0,
             params: SearchParams {
                 sim_batch: args.sim_batch,
                 c_puct: args.c_puct,
