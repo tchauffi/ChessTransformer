@@ -65,6 +65,7 @@ class HDF5ChessDataset(Dataset):
             num_moves = f["num_moves"][:]
             white_elos = f["white_elo"][:]
             black_elos = f["black_elo"][:]
+            results = f["result"][:]
 
             # Filter games by ELO if specified
             valid_games = np.ones(self.num_games, dtype=bool)
@@ -217,7 +218,6 @@ class HDF5ChessDataset(Dataset):
             legal_moves_grid[move.from_square, move.to_square] = True
             plane = move_to_action_plane(move.from_square, move.to_square, move.promotion)
             legal_moves_planes[move.from_square, plane] = True
-        legal_moves_tensor = legal_moves_tokens
 
         # Get next move
         next_move_token = torch.tensor(int(game_moves[move_idx]), dtype=torch.long)
@@ -227,15 +227,6 @@ class HDF5ChessDataset(Dataset):
         next_move = chess.Move.from_uci(next_move_uci)
         from_square = next_move.from_square
         to_square = next_move.to_square
-        is_promotion = next_move.promotion is not None
-        # Promotion type: 0=queen/none, 1=rook, 2=bishop, 3=knight
-        promotion_type = 0
-        if next_move.promotion == chess.ROOK:
-            promotion_type = 1
-        elif next_move.promotion == chess.BISHOP:
-            promotion_type = 2
-        elif next_move.promotion == chess.KNIGHT:
-            promotion_type = 3
 
         # AlphaZero action plane for this move
         action_plane = move_to_action_plane(from_square, to_square, next_move.promotion)
@@ -261,28 +252,18 @@ class HDF5ChessDataset(Dataset):
         else:
             en_passant_file = 8  # No en passant
 
-        # Get halfmove clock (for 50-move rule)
-        halfmove_clock = board.halfmove_clock
-
         return {
             "position": position_tensor,
             "move": next_move_token,
             "is_white": is_white,
             "castling_rights": castling_rights,
             "en_passant_file": en_passant_file,
-            "halfmove_clock": halfmove_clock,
-            "game_id": actual_game_idx,
             "move_number": move_idx,
             "white_elo": white_elo,
             "black_elo": black_elo,
             "result": result,
-            "legal_moves_mask": legal_moves_tensor,
             "from_square": from_square,
-            "to_square": to_square,
-            "is_promotion": is_promotion,
-            "promotion_type": promotion_type,
             "action_plane": action_plane,
-            "legal_moves_grid": legal_moves_grid,
             "legal_moves_planes": legal_moves_planes,
         }
 
@@ -311,4 +292,3 @@ if __name__ == "__main__":
         print(f"  Turn: {'White' if sample['is_white'] else 'Black'}")
         print(f"  ELOs: {sample['white_elo']} vs {sample['black_elo']}")
         print(f"  Move number: {sample['move_number']} over {dataset.num_moves_per_game[i]} moves")
-        print(f" Nb legal moves: {sample['legal_moves_mask'].sum().item()}")
