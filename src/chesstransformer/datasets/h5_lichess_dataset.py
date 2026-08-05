@@ -80,6 +80,14 @@ class HDF5ChessDataset(Dataset):
             self.valid_game_indices = np.where(valid_games)[0]
             self.num_moves_per_game = num_moves[valid_games]
 
+            # Per-game metadata stays in RAM: 1.53M games is 1.5 MB of int8 plus
+            # 3 MB of int16, and reading these three scalars back out of HDF5 per
+            # sample cost more than the game decode itself. Kept *unfiltered*, so
+            # they are indexed by the actual game index, not the dataset index.
+            self.white_elos = white_elos
+            self.black_elos = black_elos
+            self.results = results
+
             total_positions = int(self.num_moves_per_game.sum())
             print(f"Loaded dataset: {len(self.valid_game_indices)} games with {total_positions} total positions")
             if min_elo or max_elo:
@@ -146,25 +154,22 @@ class HDF5ChessDataset(Dataset):
         return state
 
     def _get_game_moves(self, game_idx: int) -> np.ndarray:
-        """Load and cache a game's move sequence."""
-        if game_idx in self.game_cache:
-            game_data = self.game_cache[game_idx]
-            return game_data["moves"], game_data["white_elo"], game_data["black_elo"], game_data["result"]
+        """Load and cache a game's move sequence.
 
-        # Read from HDF5
-        f = self._h5()
-        moves = f["moves"][game_idx]
-        white_elo = int(f["white_elo"][game_idx])
-        black_elo = int(f["black_elo"][game_idx])
-        result = int(f["result"][game_idx])
+        Only ``moves`` comes from HDF5; the per-game scalars live in RAM (see __init__).
+        """
+        if game_idx in self.game_cache:
+            return self.game_cache[game_idx]
+
+        moves = self._h5()["moves"][game_idx]
 
         # Update cache (simple LRU-like behavior)
         if len(self.game_cache) >= self.cache_size:
             # Remove oldest item
             self.game_cache.pop(next(iter(self.game_cache)))
 
-        self.game_cache[game_idx] = {"moves": moves, "white_elo": white_elo, "black_elo": black_elo, "result": result}
-        return moves, white_elo, black_elo, result
+        self.game_cache[game_idx] = moves
+        return moves
 
     def __getitem__(self, idx):
         """
@@ -177,8 +182,11 @@ class HDF5ChessDataset(Dataset):
         # Map dataset index to actual game index
         actual_game_idx = self.valid_game_indices[idx]
 
-        # Load game moves
-        game_moves, white_elo, black_elo, result = self._get_game_moves(actual_game_idx)
+        # Load game moves; the scalars are RAM lookups (indexed by actual game index)
+        game_moves = self._get_game_moves(actual_game_idx)
+        white_elo = int(self.white_elos[actual_game_idx])
+        black_elo = int(self.black_elos[actual_game_idx])
+        result = int(self.results[actual_game_idx])
         num_moves = self.num_moves_per_game[idx]
 
         # Uniformly sample a position within the game (exclude last move - no next move)
@@ -207,15 +215,8 @@ class HDF5ChessDataset(Dataset):
         position = self.position_tokenizer.encode(board)
         position_tensor = torch.tensor(position, dtype=torch.long)
 
-        legal_moves = list(board.legal_moves)
-        legal_moves_tokens = torch.zeros(len(self.move_tokenizer.vocab), dtype=torch.bool)
-        legal_moves_grid = torch.zeros(64, 64, dtype=torch.bool)
         legal_moves_planes = torch.zeros(64, NUM_ACTION_PLANES, dtype=torch.bool)
-        for move in legal_moves:
-            if move.uci() in self.move_tokenizer.vocab:
-                token_id = self.move_tokenizer.vocab[move.uci()]
-                legal_moves_tokens[token_id] = True
-            legal_moves_grid[move.from_square, move.to_square] = True
+        for move in board.legal_moves:
             plane = move_to_action_plane(move.from_square, move.to_square, move.promotion)
             legal_moves_planes[move.from_square, plane] = True
 
