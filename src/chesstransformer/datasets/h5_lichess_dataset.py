@@ -102,19 +102,23 @@ class HDF5ChessDataset(Dataset):
     def _get_game_moves(self, game_idx: int) -> np.ndarray:
         """Load and cache a game's move sequence."""
         if game_idx in self.game_cache:
-            return self.game_cache[game_idx]
-
+            game_data = self.game_cache[game_idx]
+            return game_data["moves"], game_data["white_elo"], game_data["black_elo"], game_data["result"]
+        
         # Read from HDF5
         with h5py.File(self.hdf5_path, "r") as f:
             moves = f["moves"][game_idx]
+            white_elo = int(f["white_elo"][game_idx])
+            black_elo = int(f["black_elo"][game_idx])
+            result = int(f["result"][game_idx])
 
         # Update cache (simple LRU-like behavior)
         if len(self.game_cache) >= self.cache_size:
             # Remove oldest item
             self.game_cache.pop(next(iter(self.game_cache)))
 
-        self.game_cache[game_idx] = moves
-        return moves
+        self.game_cache[game_idx] = {"moves": moves, "white_elo": white_elo, "black_elo": black_elo, "result": result}
+        return moves, white_elo, black_elo, result
 
     def __getitem__(self, idx):
         """
@@ -128,7 +132,7 @@ class HDF5ChessDataset(Dataset):
         actual_game_idx = self.valid_game_indices[idx]
 
         # Load game moves
-        game_moves = self._get_game_moves(actual_game_idx)
+        game_moves, white_elo, black_elo, result = self._get_game_moves(actual_game_idx)
         num_moves = self.num_moves_per_game[idx]
 
         # Uniformly sample a position within the game (exclude last move - no next move)
@@ -215,12 +219,6 @@ class HDF5ChessDataset(Dataset):
         # Get halfmove clock (for 50-move rule)
         halfmove_clock = board.halfmove_clock
 
-        # Get game metadata
-        with h5py.File(self.hdf5_path, "r") as f:
-            white_elo = int(f["white_elo"][actual_game_idx])
-            black_elo = int(f["black_elo"][actual_game_idx])
-            result = int(f["result"][actual_game_idx])
-
         return {
             "position": position_tensor,
             "move": next_move_token,
@@ -267,5 +265,5 @@ if __name__ == "__main__":
         print(f"  Move token: {sample['move'].item()}")
         print(f"  Turn: {'White' if sample['is_white'] else 'Black'}")
         print(f"  ELOs: {sample['white_elo']} vs {sample['black_elo']}")
-        print(f"  Move number: {sample['move_number']} over {len(dataset._get_game_moves(sample['game_id']))}")
+        print(f"  Move number: {sample['move_number']} over {dataset.num_moves_per_game[i]} moves")
         print(f" Nb legal moves: {sample['legal_moves_mask'].sum().item()}")
