@@ -202,21 +202,6 @@ def cleanup_old_checkpoints(checkpoint_dir, max_checkpoints):
     while len(checkpoints) > max_checkpoints:
         shutil.rmtree(checkpoints.pop(0))
 
-class RepeatingDataloader:
-    """Repeats the batch N times to avoid underloaded GPU."""
-    def __init__(self, dataloader, repeat_factor):
-        self.dataloader = dataloader
-        self.repeat_factor = repeat_factor
-
-    def __iter__(self):
-        for batch in self.dataloader:
-            for _ in range(self.repeat_factor):
-                yield batch
-
-    def __len__(self):
-        return len(self.dataloader) * self.repeat_factor
-
-
 def main():
     default_data = Path(__file__).parents[3] / "data" / "elite_db.h5"
 
@@ -286,11 +271,15 @@ def main():
     train_size = len(dataset) - val_size - test_size
     train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
 
+    # pin_memory lets the H2D copy run on the DMA engine and overlap with compute;
+    # without it `.to(device, non_blocking=True)` is silently synchronous.
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, drop_last=True,
-                              persistent_workers=True, prefetch_factor=4)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+                              persistent_workers=True, prefetch_factor=4, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False,
+                             num_workers=args.num_workers, pin_memory=True)
 
     print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
 
@@ -395,9 +384,6 @@ def main():
     model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
         model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader
     )
-
-    # Wrap after prepare so Accelerate handles device placement first
-    train_loader = RepeatingDataloader(train_loader, repeat_factor=2)
 
     # ── EMA ──────────────────────────────────────────────────────────────
     use_ema = args.ema_decay > 0
