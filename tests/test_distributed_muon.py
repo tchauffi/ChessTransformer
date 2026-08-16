@@ -167,3 +167,71 @@ def test_weight_decay_schedule_decays_to_zero():
     assert muon_weight_decay(total, total, 0.1) == pytest.approx(0.0, abs=1e-9)
     mid = muon_weight_decay(total // 2, total, 0.1)
     assert 0.04 < mid < 0.06, f"cosine midpoint should be ~half, got {mid}"
+
+
+# ── LR schedule, and its coupling to the momentum schedule ───────────────────
+
+def _lr_curve(schedule, total=10_000, warmup=500, warmdown_ratio=0.2):
+    from chesstransformer.trainers.pos2move_v2_trainer import create_lr_scheduler
+    p = [torch.nn.Parameter(torch.zeros(1))]
+    opt = torch.optim.SGD(p, lr=1.0)
+    sched = create_lr_scheduler(opt, warmup, total, 0.05,
+                                schedule=schedule, warmdown_ratio=warmdown_ratio)
+    out = []
+    for _ in range(total):
+        out.append(opt.param_groups[0]["lr"])
+        sched.step()
+    return out
+
+
+def test_wsd_holds_peak_then_decays():
+    """Warmup, a genuinely flat stable phase, then linear warmdown."""
+    total, warmup = 10_000, 500
+    lr = _lr_curve("wsd", total, warmup)
+    assert lr[0] == pytest.approx(1 / warmup, abs=1e-6)
+    assert lr[warmup - 1] == pytest.approx(1.0)
+    stable = lr[warmup:total - 2000 + 1]
+    assert all(x == pytest.approx(1.0) for x in stable), "stable phase is not flat"
+    assert lr[-1] == pytest.approx(0.05, abs=1e-3)
+    warmdown = lr[total - 2000:]
+    assert warmdown == sorted(warmdown, reverse=True), "warmdown must be monotone"
+
+
+def test_linear_schedule_still_available():
+    """The previous shape stays reachable: decay begins right after warmup."""
+    lr = _lr_curve("linear")
+    assert lr[500] < 1.0 and lr[5000] < lr[2000] < lr[500]
+    assert lr[-1] == pytest.approx(0.05, abs=1e-3)
+
+
+def test_lr_and_momentum_warmdowns_start_together():
+    """The momentum schedule warms down *during LR warmdown* -- so they must align.
+
+    If the LR schedule has no warmdown phase (as with 'linear'), the momentum warmdown is
+    keyed to a window that does not exist, which is the incoherence this coupling fixes.
+    """
+    total, ratio = 10_000, 0.2
+    lr = _lr_curve("wsd", total, 500, ratio)
+    start = total - round(ratio * total)
+    assert lr[start] == pytest.approx(1.0), "LR should still be at peak at warmdown start"
+    assert lr[start + 1] < 1.0, "LR must begin decaying right after"
+    assert muon_momentum(start, total, warmdown_ratio=ratio) == pytest.approx(0.97, abs=1e-6)
+    assert muon_momentum(total - 1, total, warmdown_ratio=ratio) == pytest.approx(0.90, abs=1e-2)
+
+
+def test_old_checkpoint_config_keeps_linear_shape():
+    """A scheduler_config from before this change has no 'schedule' key.
+
+    It is replayed verbatim on resume, so the function default decides what those runs get;
+    it must stay 'linear' or an in-flight run silently changes LR shape when it resumes.
+    """
+    from chesstransformer.trainers.pos2move_v2_trainer import create_lr_scheduler
+    legacy = {"warmup_steps": 100, "total_steps": 1000, "final_lr_ratio": 0.05}
+    p = [torch.nn.Parameter(torch.zeros(1))]
+    opt = torch.optim.SGD(p, lr=1.0)
+    sched = create_lr_scheduler(opt, **legacy)
+    lrs = []
+    for _ in range(1000):
+        lrs.append(opt.param_groups[0]["lr"])
+        sched.step()
+    assert lrs[500] < 0.99, "legacy config must not get a flat stable phase (that would be wsd)"

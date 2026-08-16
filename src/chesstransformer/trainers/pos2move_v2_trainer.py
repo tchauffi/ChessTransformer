@@ -248,13 +248,38 @@ def compute_loss(
     return total_loss, metrics
 
 
-def create_lr_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio):
+def create_lr_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio,
+                        schedule="linear", warmdown_ratio=0.2):
+    """Build the LR multiplier schedule.
+
+    ``wsd`` -- warmup, then **stable at peak**, then a linear warmdown over the final
+    ``warmdown_ratio`` of the run (nanochat's ``get_lr_multiplier``). ``linear`` -- warmup
+    then decay across the entire remainder, which is what this trainer used to do.
+
+    WSD is the default for two reasons. It decouples the horizon from the schedule: peak LR
+    is held flat, so a run can be stopped or extended at any point in the stable phase and
+    only the warmdown re-run, where a decay-from-peak schedule bakes ``total_steps`` into
+    every step it takes. And it is the phase structure Muon's momentum schedule was designed
+    against -- momentum warms down *during the LR warmdown*, which only exists here.
+
+    Note the asymmetry in defaults, which is deliberate: the CLI defaults to ``wsd`` for new
+    runs, but this function defaults to ``linear``. scheduler_config dicts persisted in
+    checkpoints from before this change carry no ``schedule`` key, and are replayed through
+    here on resume -- so the function default is what those runs get. Defaulting it to
+    ``wsd`` would silently change the LR shape of an in-flight run at the point it resumed.
+    """
     warmup_steps = max(1, warmup_steps)
     total_steps = max(warmup_steps + 1, total_steps)
+    warmdown = max(1, round(warmdown_ratio * total_steps))
 
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step + 1) / float(warmup_steps)
+        if schedule == "wsd":
+            if step <= total_steps - warmdown:
+                return 1.0
+            progress = max(0.0, min(1.0, (total_steps - step) / warmdown))
+            return progress * 1.0 + (1 - progress) * final_lr_ratio
         progress = (step - warmup_steps + 1) / float(max(1, total_steps - warmup_steps))
         return 1.0 - (1.0 - final_lr_ratio) * min(1.0, progress)
 
@@ -357,6 +382,13 @@ def main():
     parser.add_argument("--lr-head", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=2000)
     parser.add_argument("--final-lr-ratio", type=float, default=0.05)
+    parser.add_argument("--lr-schedule", type=str, default="wsd", choices=["wsd", "linear"],
+                        help="'wsd' = warmup / stable at peak / linear warmdown over the last "
+                             "--warmdown-ratio of the run. 'linear' = the previous behaviour, "
+                             "decay from peak across the whole remainder.")
+    parser.add_argument("--warmdown-ratio", type=float, default=0.2,
+                        help="Fraction of the run spent decaying, for --lr-schedule wsd. Muon's "
+                             "momentum warmdown is aligned to the same window.")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     # Loss weights
@@ -708,6 +740,8 @@ def main():
         "warmup_steps": args.warmup_steps,
         "total_steps": total_steps,
         "final_lr_ratio": args.final_lr_ratio,
+        "schedule": args.lr_schedule,
+        "warmdown_ratio": args.warmdown_ratio,
     }
     if trainer_state and "scheduler_config" in trainer_state:
         # A resume keeps the schedule it started with, so the LR curve stays continuous.
@@ -728,8 +762,11 @@ def main():
     # schedule is never a surprise, and say so out loud when --max-steps is not pinning it.
     steps_per_pass = len(train_loader) // max(1, args.grad_accum)
     samples_seen = args.max_steps * effective_bs
-    rank0_print(f"Schedule: {total_steps:,} optimizer steps | warmup {args.warmup_steps:,} | "
-          f"eval every {args.eval_steps:,} | save every {args.save_steps:,}")
+    warmdown_note = (f"warmdown {round(args.warmdown_ratio * total_steps):,} | "
+                     if args.lr_schedule == "wsd" else "")
+    rank0_print(f"Schedule: {total_steps:,} optimizer steps | {args.lr_schedule} | "
+                f"warmup {args.warmup_steps:,} | {warmdown_note}"
+                f"eval every {args.eval_steps:,} | save every {args.save_steps:,}")
     rank0_print(f"  one pass over the training data = {steps_per_pass:,} steps/rank "
           f"({args.max_steps / max(1, steps_per_pass):.2f} passes, "
           f"{samples_seen:,} samples consumed)")
@@ -928,7 +965,8 @@ def main():
                     # Momentum is not a constant in a well-tuned Muon run: a long memory
                     # early averages over a fast-moving gradient, and a slightly shorter one
                     # late helps the run settle. Weight decay cosine-decays to zero.
-                    mom = muon_momentum(global_step, args.max_steps)
+                    mom = muon_momentum(global_step, args.max_steps,
+                                        warmdown_ratio=args.warmdown_ratio)
                     wdk = muon_weight_decay(global_step, args.max_steps, args.weight_decay)
                     for g in muon_optimizer.param_groups:
                         g["momentum"], g["weight_decay"] = mom, wdk
