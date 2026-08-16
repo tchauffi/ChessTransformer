@@ -51,8 +51,21 @@ snapshot_download("tchauffi/chesstransformer-shards", repo_type="dataset",
                   allow_patterns="elite_k16/*", local_dir="/kaggle/working/shards")
 ```
 
+```python
+# Decompressed in Python, not with the zstd CLI, which is not guaranteed to be on the image.
+# Each .zst is removed as it is expanded so peak disk stays near the 4.95 GB final size.
+import zstandard, pathlib, concurrent.futures
+d = pathlib.Path("/kaggle/working/shards/elite_k16")
+def dec(p):
+    with open(p, "rb") as fi, open(p.with_suffix(""), "wb") as fo:
+        zstandard.ZstdDecompressor().copy_stream(fi, fo)
+    p.unlink()
+with concurrent.futures.ThreadPoolExecutor(4) as ex:
+    list(ex.map(dec, sorted(d.glob("*.zst"))))
+print(len(list(d.glob("*.npy"))), "shards ready")
+```
+
 ```bash
-!cd /kaggle/working/shards/elite_k16 && ls *.zst | xargs -P 4 -I{} zstd -q -d --rm {}
 !df -h /kaggle/working | tail -1
 ```
 
