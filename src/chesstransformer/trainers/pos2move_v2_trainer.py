@@ -15,6 +15,14 @@ import json
 import os
 import random
 import shutil
+import sys
+
+# Make the checkout runnable without installing the package. `uv run` installs it into the
+# venv, so this never fires locally -- but a bare `git clone` on Kaggle or a rented box has
+# no chesstransformer on sys.path and every import below fails. scripts/build_shards.py,
+# scripts/verify_shards.py and tests/conftest.py already do this; the trainer did not, which
+# is exactly where it was first hit.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import torch

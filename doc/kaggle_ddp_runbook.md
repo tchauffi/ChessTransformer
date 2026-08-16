@@ -33,13 +33,25 @@ Enable **GPU T4 ×2** in the notebook settings (Accelerator → GPU T4 ×2), and
 %cd /kaggle/working/ct
 ```
 
+Do **not** `pip install -e .` here: the project pins a cu128 torch index, and resolving it would
+fight Kaggle's preinstalled CUDA build. The trainer and scripts put `src/` on `sys.path`
+themselves, so a bare clone runs as-is. If you ever see `ModuleNotFoundError: No module named
+'chesstransformer'`, that bootstrap is missing on whatever entry point you invoked — prepend
+`PYTHONPATH=/kaggle/working/ct/src` as a stopgap.
+
 The accelerate pin matters: 1.13 and 1.14 regressed the CPU multi-rank path this project's tests
 depend on. NCCL on Kaggle is unaffected, but keeping one version everywhere avoids surprises.
 
+```python
+# ~967 MB down, 4.95 GB on disk after decompression.
+# snapshot_download rather than the `hf` CLI: the CLI entry point is named `hf` in recent
+# huggingface_hub and `huggingface-cli` in older ones, and Kaggle's image pins its own.
+from huggingface_hub import snapshot_download
+snapshot_download("tchauffi/chesstransformer-shards", repo_type="dataset",
+                  allow_patterns="elite_k16/*", local_dir="/kaggle/working/shards")
+```
+
 ```bash
-# ~967 MB down, 4.95 GB on disk after decompression
-!hf download tchauffi/chesstransformer-shards --repo-type dataset \
-    --include 'elite_k16/*' --local-dir /kaggle/working/shards
 !cd /kaggle/working/shards/elite_k16 && ls *.zst | xargs -P 4 -I{} zstd -q -d --rm {}
 !df -h /kaggle/working | tail -1
 ```
