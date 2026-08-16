@@ -51,6 +51,7 @@ packages = ["src/chesstransformer"]
 dev = [
     "ipykernel>=6.30.1",
     "ipywidgets>=8.1.7",
+    "pytest>=9.1.1",
     "ruff>=0.9.0",
 ]
 optimized = [
