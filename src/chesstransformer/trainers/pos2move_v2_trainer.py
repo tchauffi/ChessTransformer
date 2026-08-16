@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 import argparse
 import json
+import os
 import random
 import shutil
 
@@ -33,6 +34,53 @@ from chesstransformer.datasets.flat_shard_dataset import (
 from chesstransformer.datasets.h5_lichess_dataset import HDF5ChessDataset
 from chesstransformer.models.tokenizer.position_tokenizer import PostionTokenizer
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2, NUM_ACTION_PLANES
+
+
+#: Model sizes. DDP replicates weights *and* optimizer state on every rank, so the
+#: per-GPU cost below is what decides where a preset can run -- not the parameter count.
+#: "state" is bf16 weights + fp32 master + two moments, measured not guessed.
+#:
+#: ===== ============ ======== ============ ==========================================
+#: name  dim x layers   params  per-GPU DDP  runs on
+#: ===== ============ ======== ============ ==========================================
+#: base     256 x 16    11.7 M      0.21 GB  anything
+#: 46m      512 x 16    46.5 M      0.84 GB  anything
+#: large    768 x 24   156.4 M      2.82 GB  T4 16 GB, 4090, A100
+#: xl      1536 x 32   832.8 M     14.99 GB  NOT DDP-trainable under 40 GB; needs FSDP
+#: ===== ============ ======== ============ ==========================================
+#:
+#: `xl` is deliberately oversized as a sharding/scaling testbed. It is not a bid for
+#: playing strength -- 46M already lost its head-to-head against v2.1 at 44.8%.
+PRESETS = {
+    "base":  {"embed_dim": 256,  "num_layers": 16, "num_heads": 8},
+    "46m":   {"embed_dim": 512,  "num_layers": 16, "num_heads": 8},
+    "large": {"embed_dim": 768,  "num_layers": 24, "num_heads": 12},
+    "xl":    {"embed_dim": 1536, "num_layers": 32, "num_heads": 16},
+}
+
+
+def resolve_precision(requested: str) -> str:
+    """Pick a mixed-precision mode this GPU can actually run.
+
+    bf16 needs compute capability 8.0 (Ampere). Kaggle's T4 is Turing, 7.5 -- so the
+    trainer's bf16 default silently does not apply there, and a run that looks fine is
+    quietly not using tensor cores as intended. Fall back to fp16 (which Turing does have
+    tensor cores for) and say so, rather than let the first multi-GPU session discover it.
+    """
+    # Accelerate spells "no mixed precision" as "no"; "fp32" is not a value it accepts.
+    # Passing it through raises ValueError, which means --precision fp32 has never worked
+    # and a CPU-only box (where the old code forced "fp32") could never start at all.
+    if not torch.cuda.is_available() or os.environ.get("ACCELERATE_USE_CPU"):
+        return "no"
+    if requested == "fp32":
+        return "no"
+    if requested == "bf16" and not torch.cuda.is_bf16_supported():
+        cap = torch.cuda.get_device_capability(0)
+        print(f"WARNING: {torch.cuda.get_device_name(0)} is compute capability "
+              f"{cap[0]}.{cap[1]}; bf16 needs 8.0+. Falling back to fp16 "
+              f"(Accelerate adds a GradScaler). Pass --precision fp32 to opt out.")
+        return "fp16"
+    return requested
 
 
 def unpack_batch(batch, device):
@@ -278,9 +326,12 @@ def main():
     parser.add_argument("--value-loss-weight", type=float, default=5.0)
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     # Model
-    parser.add_argument("--embed-dim", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=16)
-    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--preset", type=str, default="base", choices=list(PRESETS),
+                        help="Model size. See PRESETS for per-GPU DDP memory. Individual "
+                             "--embed-dim/--num-layers/--num-heads override the preset.")
+    parser.add_argument("--embed-dim", type=int, default=None)
+    parser.add_argument("--num-layers", type=int, default=None)
+    parser.add_argument("--num-heads", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.05)    
     parser.add_argument("--layer-drop", type=float, default=0.1,
                         help="Stochastic depth rate. Linearly scales from 0 (first layer) to this value (last layer). Try 0.1.")    # Checkpointing
@@ -304,7 +355,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--num-workers", type=int, default=12)
-    parser.add_argument("--compile", action="store_true", default=True)
+    # store_true with default=True could never be turned off. BooleanOptionalAction
+    # gives a real --no-compile, which CPU/gloo testing and debugging both need.
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-mode", type=str, default="default",
                         choices=["default", "reduce-overhead", "max-autotune"])
     args = parser.parse_args()
@@ -320,6 +373,13 @@ def main():
                   f"use {replacement}.")
     if args.max_steps <= 0:
         parser.error("--max-steps must be > 0")
+
+    # Preset supplies the geometry; an explicit flag always wins over it.
+    preset = PRESETS[args.preset]
+    for flag, key in (("embed_dim", "embed_dim"), ("num_layers", "num_layers"),
+                      ("num_heads", "num_heads")):
+        if getattr(args, flag) is None:
+            setattr(args, flag, preset[key])
 
     set_seed(args.seed)
     random.seed(args.seed)
@@ -415,7 +475,7 @@ def main():
     with (log_path / "model_config.json").open("w") as f:
         json.dump(model_config, f, indent=2)
 
-    precision = args.precision if torch.cuda.is_available() else "fp32"
+    precision = resolve_precision(args.precision)
     accelerator = accelerate.Accelerator(
         log_with="tensorboard",
         project_dir=str(log_path),
