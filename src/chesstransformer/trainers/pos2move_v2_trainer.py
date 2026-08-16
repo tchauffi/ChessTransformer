@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 import accelerate
-from accelerate.utils import set_seed
+from accelerate.utils import broadcast_object_list, set_seed
 
 from chesstransformer.datasets.flat_shard_dataset import (
     FlatShardDataset,
@@ -475,25 +475,43 @@ def main():
     }
 
     # ── Logging ──────────────────────────────────────────────────────────
+    # The run directory has to be decided by ONE rank and told to the others. Every rank
+    # scanning logs/ for the next free run number is a race: they can pick the same number
+    # (two ranks writing one run) or different ones (N runs, N-1 of them silently empty),
+    # and mkdir(exist_ok=False) then crashes whichever rank loses. The timestamp in the
+    # name makes independent derivation impossible too -- ranks start milliseconds apart.
+    #
+    # Ordering note: the Accelerator must exist before the broadcast (it is what sets up
+    # the process group), but init_trackers needs the run dir. Hence build it against the
+    # parent, then point it at the resolved run dir with set_directories().
     log_dir = Path("logs") / "pos2move_v2"
     log_dir.mkdir(parents=True, exist_ok=True)
-    run_number = get_next_run_number(str(log_dir))
-    run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log_path = log_dir / run_name
-    log_path.mkdir(parents=True, exist_ok=False)
-    checkpoint_dir = log_path / "checkpoints"
-    checkpoint_dir.mkdir()
-
-    with (log_path / "model_config.json").open("w") as f:
-        json.dump(model_config, f, indent=2)
 
     precision = resolve_precision(args.precision)
     accelerator = accelerate.Accelerator(
         log_with="tensorboard",
-        project_dir=str(log_path),
+        project_dir=str(log_dir),
         mixed_precision=precision,
         gradient_accumulation_steps=args.grad_accum,
     )
+
+    if accelerator.is_main_process:
+        run_number = get_next_run_number(str(log_dir))
+        run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        run_name = None
+    run_name = broadcast_object_list([run_name], from_process=0)[0]
+
+    log_path = log_dir / run_name
+    checkpoint_dir = log_path / "checkpoints"
+    if accelerator.is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+        with (log_path / "model_config.json").open("w") as f:
+            json.dump(model_config, f, indent=2)
+    # Every rank must see the directory before anyone writes a checkpoint into it.
+    accelerator.wait_for_everyone()
+    accelerator.project_configuration.set_directories(str(log_path))
+
     effective_bs = args.batch_size * args.grad_accum
     rank0_print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × accum={args.grad_accum})")
     accelerator.init_trackers(
