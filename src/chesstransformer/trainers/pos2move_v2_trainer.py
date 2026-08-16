@@ -18,14 +18,52 @@ import shutil
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 import accelerate
 from accelerate.utils import set_seed
 
+from chesstransformer.datasets.flat_shard_dataset import (
+    FlatShardDataset,
+    make_dataloader as make_shard_dataloader,
+    scatter_legal_planes,
+    worker_init_fn as shard_worker_init_fn,
+)
 from chesstransformer.datasets.h5_lichess_dataset import HDF5ChessDataset
+from chesstransformer.models.tokenizer.position_tokenizer import PostionTokenizer
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2, NUM_ACTION_PLANES
+
+
+def unpack_batch(batch, device):
+    """Normalise a batch from either data path into the tensors the loss expects.
+
+    The shard loader ships the legal mask as a ``(B, 64)`` uint16 index list — 64 KB per
+    batch of 512 against 2.4 MB for the dense ``(64, 73)`` bool mask — so the mask is
+    rebuilt here, on device, after the H2D copy. Doing it in the dataset would put the
+    2.4 MB straight back on the wire and undo the entire point of the shard format.
+    """
+    if "legal_idx" in batch:
+        legal_planes = scatter_legal_planes(batch["legal_idx"].to(device, non_blocking=True))
+    else:
+        legal_planes = batch["legal_moves_planes"].to(device, non_blocking=True)
+    return {
+        "board": batch["position"].to(device, non_blocking=True).long(),
+        "player": batch["is_white"].to(device, non_blocking=True).long(),
+        "castling": batch["castling_rights"].to(device, non_blocking=True).long(),
+        "en_passant": batch["en_passant_file"].to(device, non_blocking=True).long(),
+        "from_sq": batch["from_square"].to(device, non_blocking=True).long(),
+        "action_plane": batch["action_plane"].to(device, non_blocking=True).long(),
+        "legal_planes": legal_planes,
+        # Narrow on the wire (int8/int16 out of the shard), widened here so both data
+        # paths hand compute_loss exactly the same dtypes.
+        "result": batch["result"].to(device, non_blocking=True).long(),
+        # Must stay bool: compute_loss uses it as a *mask* (`target_value[white_win &
+        # is_white]`). An int tensor there would silently become fancy indexing and
+        # scatter the value targets onto the wrong rows.
+        "is_white": batch["is_white"].to(device, non_blocking=True).bool(),
+        "move_number": batch["move_number"].to(device, non_blocking=True).long(),
+    }
 
 
 def get_next_run_number(log_dir: str) -> int:
@@ -208,10 +246,17 @@ def main():
     parser = argparse.ArgumentParser(description="Train Pos2MoveV2 (clean)")
     # Data
     parser.add_argument("--data", type=str, default=str(default_data))
+    parser.add_argument("--shards", type=str, default=None,
+                        help="Directory of flat shards from scripts/build_shards.py. Bypasses "
+                             "--data/--min-elo/--sample-weighting entirely: the sampling "
+                             "distribution is frozen into the shard at build time.")
     parser.add_argument("--min-elo", type=int, default=None)
     parser.add_argument("--max-elo", type=int, default=None)
     parser.add_argument("--sample-weighting", type=str, default="uniform", choices=["uniform", "middlegame"])
     parser.add_argument("--skip-opening-plies", type=int, default=0)
+    parser.add_argument("--max-val-samples", type=int, default=10_000,
+                        help="Cap on val/test size. The HDF5 path has always applied this; "
+                             "the shard path needs it too since a reserved shard is much larger.")
     # Training
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--grad-accum", type=int, default=4)
@@ -257,35 +302,72 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
 
     # ── Dataset ──────────────────────────────────────────────────────────
-    dataset = HDF5ChessDataset(
-        hdf5_path=args.data,
-        min_elo=args.min_elo,
-        max_elo=args.max_elo,
-        sample_weighting=args.sample_weighting,
-        skip_opening_plies=args.skip_opening_plies,
-    )
+    use_shards = args.shards is not None
+    if use_shards:
+        # Flat memmap shards: the replay, tokenize and legal-move enumeration were all
+        # paid once at build time, and the val/test split is by whole shard (== whole
+        # game range) rather than by sample, so no game straddles the split.
+        train_set = FlatShardDataset(args.shards, "train")
+        val_set = FlatShardDataset(args.shards, "val")
+        test_set = FlatShardDataset(args.shards, "test")
 
-    MAX_VAL_SAMPLES = 10_000
-    val_size = min(int(0.1 * len(dataset)), MAX_VAL_SAMPLES)
-    test_size = min(int(0.1 * len(dataset)), MAX_VAL_SAMPLES)
-    train_size = len(dataset) - val_size - test_size
-    train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
+        # Whole reserved shards hold far more than validation needs (478k samples at
+        # K=16). Cap them the way the HDF5 path does, with a fixed seed so val loss stays
+        # comparable across runs — it is what selects the best checkpoint.
+        def cap(ds, name):
+            if len(ds) <= args.max_val_samples:
+                return ds
+            g = np.random.default_rng(0xC0FFEE)
+            keep = np.sort(g.choice(len(ds), size=args.max_val_samples, replace=False))
+            print(f"  {name}: capped {len(ds):,} -> {args.max_val_samples:,} samples")
+            return Subset(ds, keep.tolist())
 
-    # pin_memory lets the H2D copy run on the DMA engine and overlap with compute;
-    # without it `.to(device, non_blocking=True)` is silently synchronous.
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, drop_last=True,
-                              persistent_workers=True, prefetch_factor=4, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False,
-                             num_workers=args.num_workers, pin_memory=True)
+        val_set = cap(val_set, "val")
+        test_set = cap(test_set, "test")
+
+        train_loader = make_shard_dataloader(train_set, batch_size=args.batch_size, shuffle=True,
+                                             num_workers=args.num_workers, drop_last=True,
+                                             seed=args.seed)
+        val_loader = make_shard_dataloader(val_set, batch_size=args.batch_size, shuffle=False,
+                                           num_workers=args.num_workers)
+        test_loader = make_shard_dataloader(test_set, batch_size=args.batch_size, shuffle=False,
+                                            num_workers=args.num_workers)
+        vocab_size = PostionTokenizer().vocab_size
+        print(f"Shards: {args.shards} (K={train_set.meta['k']}, "
+              f"mode={train_set.meta['sample_mode']}, seed={train_set.meta['seed']})")
+    else:
+        dataset = HDF5ChessDataset(
+            hdf5_path=args.data,
+            min_elo=args.min_elo,
+            max_elo=args.max_elo,
+            sample_weighting=args.sample_weighting,
+            skip_opening_plies=args.skip_opening_plies,
+        )
+
+        val_size = min(int(0.1 * len(dataset)), args.max_val_samples)
+        test_size = min(int(0.1 * len(dataset)), args.max_val_samples)
+        train_size = len(dataset) - val_size - test_size
+        train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
+
+        # pin_memory lets the H2D copy run on the DMA engine and overlap with compute;
+        # without it `.to(device, non_blocking=True)` is silently synchronous.
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, drop_last=True,
+                                  persistent_workers=True, prefetch_factor=4, pin_memory=True,
+                                  worker_init_fn=shard_worker_init_fn)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers, pin_memory=True,
+                                worker_init_fn=shard_worker_init_fn)
+        test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, pin_memory=True,
+                                 worker_init_fn=shard_worker_init_fn)
+        vocab_size = dataset.position_tokenizer.vocab_size
 
     print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
 
     # ── Model ────────────────────────────────────────────────────────────
     model_config = {
-        "vocab_size": dataset.position_tokenizer.vocab_size,
+        "vocab_size": vocab_size,
         "embed_dim": args.embed_dim,
         "nb_transformer_layers": args.num_layers,
         "num_heads": args.num_heads,
@@ -381,9 +463,180 @@ def main():
         {"params": adamw_head_params, "lr": lr_head, "weight_decay": 0.0},
     ])
 
-    model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
-        model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader
+    if use_shards:
+        # Flat memmap shards: the replay, tokenize and legal-move enumeration were all
+        # paid once at build time, and the val/test split is by whole shard (== whole
+        # game range) rather than by sample, so no game straddles the split.
+        train_set = FlatShardDataset(args.shards, "train")
+        val_set = FlatShardDataset(args.shards, "val")
+        test_set = FlatShardDataset(args.shards, "test")
+
+        # Whole reserved shards hold far more than validation needs (478k samples at
+        # K=16). Cap them the way the HDF5 path does, with a fixed seed so val loss stays
+        # comparable across runs — it is what selects the best checkpoint.
+        def cap(ds, name):
+            if len(ds) <= args.max_val_samples:
+                return ds
+            g = np.random.default_rng(0xC0FFEE)
+            keep = np.sort(g.choice(len(ds), size=args.max_val_samples, replace=False))
+            print(f"  {name}: capped {len(ds):,} -> {args.max_val_samples:,} samples")
+            return Subset(ds, keep.tolist())
+
+        val_set = cap(val_set, "val")
+        test_set = cap(test_set, "test")
+
+        train_loader = make_shard_dataloader(train_set, batch_size=args.batch_size, shuffle=True,
+                                             num_workers=args.num_workers, drop_last=True,
+                                             seed=args.seed)
+        val_loader = make_shard_dataloader(val_set, batch_size=args.batch_size, shuffle=False,
+                                           num_workers=args.num_workers)
+        test_loader = make_shard_dataloader(test_set, batch_size=args.batch_size, shuffle=False,
+                                            num_workers=args.num_workers)
+        vocab_size = PostionTokenizer().vocab_size
+        print(f"Shards: {args.shards} (K={train_set.meta['k']}, "
+              f"mode={train_set.meta['sample_mode']}, seed={train_set.meta['seed']})")
+    else:
+        dataset = HDF5ChessDataset(
+            hdf5_path=args.data,
+            min_elo=args.min_elo,
+            max_elo=args.max_elo,
+            sample_weighting=args.sample_weighting,
+            skip_opening_plies=args.skip_opening_plies,
+        )
+
+        val_size = min(int(0.1 * len(dataset)), args.max_val_samples)
+        test_size = min(int(0.1 * len(dataset)), args.max_val_samples)
+        train_size = len(dataset) - val_size - test_size
+        train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
+
+        # pin_memory lets the H2D copy run on the DMA engine and overlap with compute;
+        # without it `.to(device, non_blocking=True)` is silently synchronous.
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, drop_last=True,
+                                  persistent_workers=True, prefetch_factor=4, pin_memory=True,
+                                  worker_init_fn=shard_worker_init_fn)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers, pin_memory=True,
+                                worker_init_fn=shard_worker_init_fn)
+        test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, pin_memory=True,
+                                 worker_init_fn=shard_worker_init_fn)
+        vocab_size = dataset.position_tokenizer.vocab_size
+
+    print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
+
+    # ── Model ────────────────────────────────────────────────────────────
+    model_config = {
+        "vocab_size": vocab_size,
+        "embed_dim": args.embed_dim,
+        "nb_transformer_layers": args.num_layers,
+        "num_heads": args.num_heads,
+        "dropout": args.dropout,
+        "kvq_bias": False,
+        "layer_drop": args.layer_drop,
+    }
+
+    # ── Logging ──────────────────────────────────────────────────────────
+    log_dir = Path("logs") / "pos2move_v2"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    run_number = get_next_run_number(str(log_dir))
+    run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_path = log_dir / run_name
+    log_path.mkdir(parents=True, exist_ok=False)
+    checkpoint_dir = log_path / "checkpoints"
+    checkpoint_dir.mkdir()
+
+    with (log_path / "model_config.json").open("w") as f:
+        json.dump(model_config, f, indent=2)
+
+    precision = args.precision if torch.cuda.is_available() else "fp32"
+    accelerator = accelerate.Accelerator(
+        log_with="tensorboard",
+        project_dir=str(log_path),
+        mixed_precision=precision,
+        gradient_accumulation_steps=args.grad_accum,
     )
+    effective_bs = args.batch_size * args.grad_accum
+    print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × accum={args.grad_accum})")
+    accelerator.init_trackers(
+        project_name="pos2move_v2",
+        config={
+            "batch_size": args.batch_size,
+            "grad_accum": args.grad_accum,
+            "effective_batch_size": effective_bs,
+            "max_steps": args.max_steps,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "value_loss_weight": args.value_loss_weight,
+            **model_config,
+        },
+    )
+
+    device = accelerator.device
+    print(f"Device: {device} | Precision: {precision} | Logging to: {log_path}")
+
+    model = Pos2MoveV2(**model_config)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+    model.to(device)
+
+    if args.compile:
+        model = torch.compile(model, mode=args.compile_mode, dynamic=False) # input does not change shape, so dynamic=False is safe and faster
+        print(f"Model compiled with torch.compile (mode={args.compile_mode})")
+
+    # ── Optimizer (Muon for 2D weights, AdamW for embeddings/heads/1D) ──
+    lr_emb = args.lr_embedding or args.lr
+    lr_head = args.lr_head or args.lr
+
+    muon_params = []
+    adamw_emb_params = []
+    adamw_head_params = []
+    adamw_other_params = []
+
+    for name, param in model.named_parameters():
+        if "embedding" in name:
+            adamw_emb_params.append(param)
+        elif "move_head" in name or "value_head" in name:
+            adamw_head_params.append(param)
+        elif param.ndim == 2:
+            muon_params.append(param)
+        else:
+            adamw_other_params.append(param)
+
+    print(f"LR: emb={lr_emb:.2e} | muon={args.lr_muon:.2e} | head={lr_head:.2e}")
+    print(
+        f"Params: emb={sum(p.numel() for p in adamw_emb_params):,} | "
+        f"muon={sum(p.numel() for p in muon_params):,} | "
+        f"adamw_other={sum(p.numel() for p in adamw_other_params):,} | "
+        f"head={sum(p.numel() for p in adamw_head_params):,}"
+    )
+
+    muon_optimizer = torch.optim.Muon(
+        muon_params,
+        lr=args.lr_muon,
+        momentum=0.95,
+        weight_decay=args.weight_decay,
+    )
+    adamw_optimizer = torch.optim.AdamW([
+        {"params": adamw_emb_params, "lr": lr_emb, "weight_decay": args.weight_decay},
+        {"params": adamw_other_params, "lr": args.lr, "weight_decay": 0.0},
+        {"params": adamw_head_params, "lr": lr_head, "weight_decay": 0.0},
+    ])
+
+    if use_shards:
+        # The shard loaders are deliberately kept out of prepare(). They run with
+        # batch_size=None and a BatchSampler so that a whole index list reaches
+        # __getitem__ in one call; Accelerate reads batch_size=None as "this iterable
+        # already yields batches" and would re-shard at the wrong granularity. Rank
+        # splitting is done by the DistributedSampler inside make_shard_dataloader, and
+        # the H2D copy by unpack_batch.
+        model, muon_optimizer, adamw_optimizer = accelerator.prepare(
+            model, muon_optimizer, adamw_optimizer
+        )
+    else:
+        model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
+            model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader
+        )
 
     # ── EMA ──────────────────────────────────────────────────────────────
     use_ema = args.ema_decay > 0
@@ -446,16 +699,12 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
         for batch in pbar:
             with accelerator.accumulate(model):
-                board = batch["position"]
-                player = batch["is_white"].long()
-                castling = batch["castling_rights"]
-                en_passant = batch["en_passant_file"]
-                from_sq = batch["from_square"]
-                action_plane = batch["action_plane"]
-                legal_planes = batch["legal_moves_planes"]
-                result = batch["result"]
-                is_white = batch["is_white"]
-                move_number = batch["move_number"]
+                b = unpack_batch(batch, device)
+                board, player = b["board"], b["player"]
+                castling, en_passant = b["castling"], b["en_passant"]
+                from_sq, action_plane = b["from_sq"], b["action_plane"]
+                legal_planes, result = b["legal_planes"], b["result"]
+                is_white, move_number = b["is_white"], b["move_number"]
 
                 move_logits, value = model(board, player, castling, en_passant)
                 loss, metrics = compute_loss(
@@ -560,16 +809,12 @@ def main():
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation", leave=False):
-                board = batch["position"]
-                player = batch["is_white"].long()
-                castling = batch["castling_rights"]
-                en_passant = batch["en_passant_file"]
-                from_sq = batch["from_square"]
-                action_plane = batch["action_plane"]
-                legal_planes = batch["legal_moves_planes"]
-                result = batch["result"]
-                is_white = batch["is_white"]
-                move_number = batch["move_number"]
+                b = unpack_batch(batch, device)
+                board, player = b["board"], b["player"]
+                castling, en_passant = b["castling"], b["en_passant"]
+                from_sq, action_plane = b["from_sq"], b["action_plane"]
+                legal_planes, result = b["legal_planes"], b["result"]
+                is_white, move_number = b["is_white"], b["move_number"]
 
                 move_logits, value = model(board, player, castling, en_passant)
                 loss, metrics = compute_loss(
@@ -655,16 +900,12 @@ def main():
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing", leave=False):
-            board = batch["position"]
-            player = batch["is_white"].long()
-            castling = batch["castling_rights"]
-            en_passant = batch["en_passant_file"]
-            from_sq = batch["from_square"]
-            action_plane = batch["action_plane"]
-            legal_planes = batch["legal_moves_planes"]
-            result = batch["result"]
-            is_white = batch["is_white"]
-            move_number = batch["move_number"]
+            b = unpack_batch(batch, device)
+            board, player = b["board"], b["player"]
+            castling, en_passant = b["castling"], b["en_passant"]
+            from_sq, action_plane = b["from_sq"], b["action_plane"]
+            legal_planes, result = b["legal_planes"], b["result"]
+            is_white, move_number = b["is_white"], b["move_number"]
 
             move_logits, value = model(board, player, castling, en_passant)
             loss, metrics = compute_loss(
