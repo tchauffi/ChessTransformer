@@ -317,7 +317,7 @@ def main():
     parser.add_argument("--max-elo", type=int, default=None)
     parser.add_argument("--sample-weighting", type=str, default="middlegame", choices=["uniform", "middlegame"])
     parser.add_argument("--skip-opening-plies", type=int, default=0)
-    parser.add_argument("--max-val-samples", type=int, default=10_000,
+    parser.add_argument("--max-val-samples", type=int, default=50_000,
                         help="Cap on val/test size. The HDF5 path has always applied this; "
                              "the shard path needs it too since a reserved shard is much larger.")
     # Training
@@ -347,7 +347,7 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.05)    
     parser.add_argument("--layer-drop", type=float, default=0.1,
                         help="Stochastic depth rate. Linearly scales from 0 (first layer) to this value (last layer). Try 0.1.")    # Checkpointing
-    parser.add_argument("--max-steps", type=int, default=100_000,
+    parser.add_argument("--max-steps", type=int, default=50_000,
                         help="Total optimizer steps to train for. This is THE training-length "
                              "knob: it bounds the loop and sets the LR decay horizon, and it "
                              "means the same thing on both data paths and at any world size.")
@@ -405,6 +405,42 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    # ── Logging ──────────────────────────────────────────────────────────
+    # The run directory has to be decided by ONE rank and told to the others. Every rank
+    # scanning logs/ for the next free run number is a race: they can pick the same number
+    # (two ranks writing one run) or different ones (N runs, N-1 of them silently empty),
+    # and mkdir(exist_ok=False) then crashes whichever rank loses. The timestamp in the
+    # name makes independent derivation impossible too -- ranks start milliseconds apart.
+    #
+    # Ordering note: the Accelerator must exist before the broadcast (it is what sets up
+    # the process group), but init_trackers needs the run dir. Hence build it against the
+    # parent, then point it at the resolved run dir with set_directories().
+    log_dir = Path("logs") / "pos2move_v2"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    precision = resolve_precision(args.precision)
+    accelerator = accelerate.Accelerator(
+        log_with="tensorboard",
+        project_dir=str(log_dir),
+        mixed_precision=precision,
+        gradient_accumulation_steps=args.grad_accum,
+    )
+
+    if accelerator.is_main_process:
+        run_number = get_next_run_number(str(log_dir))
+        run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        run_name = None
+    run_name = broadcast_object_list([run_name], from_process=0)[0]
+
+    log_path = log_dir / run_name
+    checkpoint_dir = log_path / "checkpoints"
+    if accelerator.is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    # Every rank must see the directory before anyone writes a checkpoint into it.
+    accelerator.wait_for_everyone()
+    accelerator.project_configuration.set_directories(str(log_path))
+
     # ── Dataset ──────────────────────────────────────────────────────────
     use_shards = args.shards is not None
     if use_shards:
@@ -429,9 +465,25 @@ def main():
         val_set = cap(val_set, "val")
         test_set = cap(test_set, "test")
 
+        # The shard loaders bypass accelerator.prepare() (see the note at prepare()), so
+        # rank splitting is NOT automatic here the way it is for the HDF5 path -- it has to
+        # be asked for. Without this every rank draws the identical batches from the same
+        # seeded RandomSampler, and DDP degenerates into N ranks computing one gradient N
+        # times: the loss curve looks healthy, the effective batch never grows, and the
+        # extra GPUs buy nothing.
+        # This is exactly why the Accelerator is constructed above the dataset section:
+        # DistributedSampler requires an initialised process group, and the Accelerator is
+        # what initialises it. Building the loaders first raises "Default process group has
+        # not been initialized".
+        world_size = accelerator.num_processes
         train_loader = make_shard_dataloader(train_set, batch_size=args.batch_size, shuffle=True,
                                              num_workers=args.num_workers, drop_last=True,
-                                             seed=args.seed)
+                                             seed=args.seed, distributed=world_size > 1)
+        # Val/test are deliberately NOT sharded. Each rank evaluates the whole (capped)
+        # set and therefore computes an identical val loss, so best-model selection agrees
+        # on every rank by construction and needs no gather or padding-trim. The cost is
+        # N x redundant work on <=10k samples -- about two seconds -- against a class of
+        # bug where ranks disagree about which checkpoint is best and race to write it.
         val_loader = make_shard_dataloader(val_set, batch_size=args.batch_size, shuffle=False,
                                            num_workers=args.num_workers)
         test_loader = make_shard_dataloader(test_set, batch_size=args.batch_size, shuffle=False,
@@ -479,47 +531,16 @@ def main():
         "kvq_bias": False,
         "layer_drop": args.layer_drop,
     }
-
-    # ── Logging ──────────────────────────────────────────────────────────
-    # The run directory has to be decided by ONE rank and told to the others. Every rank
-    # scanning logs/ for the next free run number is a race: they can pick the same number
-    # (two ranks writing one run) or different ones (N runs, N-1 of them silently empty),
-    # and mkdir(exist_ok=False) then crashes whichever rank loses. The timestamp in the
-    # name makes independent derivation impossible too -- ranks start milliseconds apart.
-    #
-    # Ordering note: the Accelerator must exist before the broadcast (it is what sets up
-    # the process group), but init_trackers needs the run dir. Hence build it against the
-    # parent, then point it at the resolved run dir with set_directories().
-    log_dir = Path("logs") / "pos2move_v2"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    precision = resolve_precision(args.precision)
-    accelerator = accelerate.Accelerator(
-        log_with="tensorboard",
-        project_dir=str(log_dir),
-        mixed_precision=precision,
-        gradient_accumulation_steps=args.grad_accum,
-    )
-
     if accelerator.is_main_process:
-        run_number = get_next_run_number(str(log_dir))
-        run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    else:
-        run_name = None
-    run_name = broadcast_object_list([run_name], from_process=0)[0]
-
-    log_path = log_dir / run_name
-    checkpoint_dir = log_path / "checkpoints"
-    if accelerator.is_main_process:
-        checkpoint_dir.mkdir(parents=True, exist_ok=False)
         with (log_path / "model_config.json").open("w") as f:
             json.dump(model_config, f, indent=2)
-    # Every rank must see the directory before anyone writes a checkpoint into it.
-    accelerator.wait_for_everyone()
-    accelerator.project_configuration.set_directories(str(log_path))
 
-    effective_bs = args.batch_size * args.grad_accum
-    rank0_print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × accum={args.grad_accum})")
+    # Effective batch scales with world size: every rank contributes its own micro-batch
+    # to the same all-reduced gradient. Reporting it without num_processes understates the
+    # real batch by N, which is exactly the number linear LR scaling is derived from.
+    effective_bs = args.batch_size * args.grad_accum * accelerator.num_processes
+    rank0_print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × "
+                f"accum={args.grad_accum} × ranks={accelerator.num_processes})")
     accelerator.init_trackers(
         project_name="pos2move_v2",
         config={
@@ -668,10 +689,10 @@ def main():
     # on shards, and epoch-end validation fires that much less often. Print both so the
     # schedule is never a surprise, and say so out loud when --max-steps is not pinning it.
     steps_per_pass = len(train_loader) // max(1, args.grad_accum)
-    samples_seen = args.max_steps * args.batch_size * args.grad_accum
+    samples_seen = args.max_steps * effective_bs
     rank0_print(f"Schedule: {total_steps:,} optimizer steps | warmup {args.warmup_steps:,} | "
           f"eval every {args.eval_steps:,} | save every {args.save_steps:,}")
-    rank0_print(f"  one pass over the training data = {steps_per_pass:,} steps "
+    rank0_print(f"  one pass over the training data = {steps_per_pass:,} steps/rank "
           f"({args.max_steps / max(1, steps_per_pass):.2f} passes, "
           f"{samples_seen:,} samples consumed)")
 
@@ -705,6 +726,9 @@ def main():
         if use_ema:
             swap_ema_weights(unwrapped, ema_state)
 
+        # No cross-rank reduction here on purpose: val_loader is replicated, not sharded,
+        # so every rank walks the identical set and arrives at the identical number. That
+        # is what keeps best-model selection consistent across ranks without a gather.
         sums = dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, correct=0, legal_correct=0, total=0)
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation", leave=False,
@@ -790,16 +814,25 @@ def main():
         """Train metrics accumulated since the last validation, sample-weighted."""
         return dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, acc=0.0, legal_acc=0.0, n=0)
 
+    WINDOW_KEYS = ("loss", "ce", "legal_ce", "value", "acc", "legal_acc")
+
     def flush_window(w):
-        n = max(1, w["n"])
-        return {
-            "train/loss": w["loss"] / n,
-            "train/ce": w["ce"] / n,
-            "train/legal_ce": w["legal_ce"] / n,
-            "train/value_loss": w["value"] / n,
-            "train/acc": w["acc"] / n,
-            "train/legal_acc": w["legal_acc"] / n,
-        }
+        """Average the window across ranks, not just within one.
+
+        Each rank trains on a different slice, so these sums are rank-local: rank 0's
+        numbers alone are a 1/N sample of the step. Reducing sum-of-(metric x batch) and
+        sum-of-batch separately, then dividing, is exact regardless of how unevenly the
+        last batches fall -- which is why this does not need gather_for_metrics and its
+        padding-trim bookkeeping (that machinery also would not work here, since the shard
+        loaders never went through prepare()).
+        """
+        vals = torch.tensor([w[k] for k in WINDOW_KEYS] + [float(w["n"])],
+                            dtype=torch.float64, device=accelerator.device)
+        if accelerator.num_processes > 1:
+            vals = accelerator.reduce(vals, reduction="sum")
+        total = max(1.0, vals[-1].item())
+        return {f"train/{'value_loss' if k == 'value' else k}": vals[i].item() / total
+                for i, k in enumerate(WINDOW_KEYS)}
 
     last_val_step = -1
 
@@ -861,6 +894,13 @@ def main():
                 muon_optimizer.zero_grad()
                 adamw_optimizer.zero_grad()
 
+                # EMA is redundant under DDP but not wrong, and that is worth stating.
+                # Gradients are all-reduced before the step, so every rank holds identical
+                # params and computes an identical EMA from an identical decay -- no drift.
+                # swap_ema_weights in run_validation is likewise symmetric because every
+                # rank validates (val_loader is replicated, not sharded). The failure mode
+                # to avoid is any rank taking a different branch here; sync_gradients is
+                # world-uniform, so none does. tests/test_distributed.py asserts it.
                 if use_ema and accelerator.sync_gradients:
                     update_ema(get_raw_model(model, accelerator), ema_state, args.ema_decay)
 
