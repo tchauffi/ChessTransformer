@@ -1,0 +1,31 @@
+# Accelerate equivalent of scripts/launch_train.sh, kept for comparison.
+#
+#   accelerate launch --config_file accelerate/ddp.yaml \
+#     src/chesstransformer/trainers/pos2move_v2_trainer.py \
+#     --shards data/shards/elite_k16 --preset large --max-steps 20000
+#
+# Two fields to keep in mind:
+#
+# mixed_precision is left at "no" deliberately. The trainer sets it from --precision via
+# resolve_precision(), which falls back bf16 -> fp16 on pre-Ampere cards (Kaggle's T4 is
+# compute capability 7.5 and has no bf16). Pinning bf16 here would override that guard and
+# reintroduce the failure on exactly the hardware the fallback exists for.
+#
+# num_processes is what this file exists to set; override per box with
+# `--num_processes N` rather than editing it.
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: 'no'
+num_machines: 1
+num_processes: 2
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

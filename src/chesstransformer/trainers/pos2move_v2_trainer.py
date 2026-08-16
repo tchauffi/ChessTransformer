@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 import argparse
 import json
+import os
 import random
 import shutil
 
@@ -22,7 +23,7 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 import accelerate
-from accelerate.utils import set_seed
+from accelerate.utils import broadcast_object_list, set_seed
 
 from chesstransformer.datasets.flat_shard_dataset import (
     FlatShardDataset,
@@ -33,6 +34,65 @@ from chesstransformer.datasets.flat_shard_dataset import (
 from chesstransformer.datasets.h5_lichess_dataset import HDF5ChessDataset
 from chesstransformer.models.tokenizer.position_tokenizer import PostionTokenizer
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2, NUM_ACTION_PLANES
+
+
+#: Model sizes. DDP replicates weights *and* optimizer state on every rank, so the
+#: per-GPU cost below is what decides where a preset can run -- not the parameter count.
+#: "state" is bf16 weights + fp32 master + two moments, measured not guessed.
+#:
+#: ===== ============ ======== ============ ==========================================
+#: name  dim x layers   params  per-GPU DDP  runs on
+#: ===== ============ ======== ============ ==========================================
+#: base     256 x 16    11.7 M      0.21 GB  anything
+#: 46m      512 x 16    46.5 M      0.84 GB  anything
+#: large    768 x 24   156.4 M      2.82 GB  T4 16 GB, 4090, A100
+#: xl      1536 x 32   832.8 M     14.99 GB  NOT DDP-trainable under 40 GB; needs FSDP
+#: ===== ============ ======== ============ ==========================================
+#:
+#: `xl` is deliberately oversized as a sharding/scaling testbed. It is not a bid for
+#: playing strength -- 46M already lost its head-to-head against v2.1 at 44.8%.
+PRESETS = {
+    "base":  {"embed_dim": 256,  "num_layers": 16, "num_heads": 8},
+    "46m":   {"embed_dim": 512,  "num_layers": 16, "num_heads": 8},
+    "large": {"embed_dim": 768,  "num_layers": 24, "num_heads": 12},
+    "xl":    {"embed_dim": 1536, "num_layers": 32, "num_heads": 16},
+}
+
+
+def rank0_print(*a, **kw):
+    """print() on the main process only.
+
+    Keyed off the RANK env var rather than accelerator.is_main_process so it also works
+    before the Accelerator is constructed -- dataset loading logs before that point. N
+    ranks echoing the same line is noise; N ranks echoing *different* lines is a
+    debugging trap, and the dataset banners are exactly where they would differ.
+    """
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(*a, **kw)
+
+
+def resolve_precision(requested: str) -> str:
+    """Pick a mixed-precision mode this GPU can actually run.
+
+    bf16 needs compute capability 8.0 (Ampere). Kaggle's T4 is Turing, 7.5 -- so the
+    trainer's bf16 default silently does not apply there, and a run that looks fine is
+    quietly not using tensor cores as intended. Fall back to fp16 (which Turing does have
+    tensor cores for) and say so, rather than let the first multi-GPU session discover it.
+    """
+    # Accelerate spells "no mixed precision" as "no"; "fp32" is not a value it accepts.
+    # Passing it through raises ValueError, which means --precision fp32 has never worked
+    # and a CPU-only box (where the old code forced "fp32") could never start at all.
+    if not torch.cuda.is_available() or os.environ.get("ACCELERATE_USE_CPU"):
+        return "no"
+    if requested == "fp32":
+        return "no"
+    if requested == "bf16" and not torch.cuda.is_bf16_supported():
+        cap = torch.cuda.get_device_capability(0)
+        rank0_print(f"WARNING: {torch.cuda.get_device_name(0)} is compute capability "
+              f"{cap[0]}.{cap[1]}; bf16 needs 8.0+. Falling back to fp16 "
+              f"(Accelerate adds a GradScaler). Pass --precision fp32 to opt out.")
+        return "fp16"
+    return requested
 
 
 def unpack_batch(batch, device):
@@ -257,7 +317,7 @@ def main():
     parser.add_argument("--max-elo", type=int, default=None)
     parser.add_argument("--sample-weighting", type=str, default="middlegame", choices=["uniform", "middlegame"])
     parser.add_argument("--skip-opening-plies", type=int, default=0)
-    parser.add_argument("--max-val-samples", type=int, default=10_000,
+    parser.add_argument("--max-val-samples", type=int, default=50_000,
                         help="Cap on val/test size. The HDF5 path has always applied this; "
                              "the shard path needs it too since a reserved shard is much larger.")
     # Training
@@ -278,13 +338,16 @@ def main():
     parser.add_argument("--value-loss-weight", type=float, default=5.0)
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     # Model
-    parser.add_argument("--embed-dim", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=16)
-    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--preset", type=str, default="base", choices=list(PRESETS),
+                        help="Model size. See PRESETS for per-GPU DDP memory. Individual "
+                             "--embed-dim/--num-layers/--num-heads override the preset.")
+    parser.add_argument("--embed-dim", type=int, default=None)
+    parser.add_argument("--num-layers", type=int, default=None)
+    parser.add_argument("--num-heads", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.05)    
     parser.add_argument("--layer-drop", type=float, default=0.1,
                         help="Stochastic depth rate. Linearly scales from 0 (first layer) to this value (last layer). Try 0.1.")    # Checkpointing
-    parser.add_argument("--max-steps", type=int, default=100_000,
+    parser.add_argument("--max-steps", type=int, default=50_000,
                         help="Total optimizer steps to train for. This is THE training-length "
                              "knob: it bounds the loop and sets the LR decay horizon, and it "
                              "means the same thing on both data paths and at any world size.")
@@ -304,9 +367,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--num-workers", type=int, default=12)
-    parser.add_argument("--compile", action="store_true", default=True)
+    # store_true with default=True could never be turned off. BooleanOptionalAction
+    # gives a real --no-compile, which CPU/gloo testing and debugging both need.
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-mode", type=str, default="default",
                         choices=["default", "reduce-overhead", "max-autotune"])
+    parser.add_argument("--compile-order", type=str, default="auto",
+                        choices=["auto", "before-prepare", "after-prepare"],
+                        help="Whether torch.compile runs before or after accelerator.prepare(). "
+                             "'auto' = before on a single process (the ordering the 2.2x "
+                             "single-GPU speedup was measured with), after under DDP so "
+                             "Dynamo's DDPOptimizer engages. See the note at the call site.")
     args = parser.parse_args()
 
     # Epochs are gone as a unit of training length. They were never comparable between the
@@ -316,16 +387,59 @@ def main():
     # validation cadence depending only on which --data/--shards flag you passed.
     for dead, replacement in (("epochs", "--max-steps"), ("save_every", "--save-steps")):
         if getattr(args, dead) is not None:
-            print(f"WARNING: --{dead.replace('_', '-')} is deprecated and ignored; "
+            rank0_print(f"WARNING: --{dead.replace('_', '-')} is deprecated and ignored; "
                   f"use {replacement}.")
     if args.max_steps <= 0:
         parser.error("--max-steps must be > 0")
+
+    # Preset supplies the geometry; an explicit flag always wins over it.
+    preset = PRESETS[args.preset]
+    for flag, key in (("embed_dim", "embed_dim"), ("num_layers", "num_layers"),
+                      ("num_heads", "num_heads")):
+        if getattr(args, flag) is None:
+            setattr(args, flag, preset[key])
 
     set_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+
+    # ── Logging ──────────────────────────────────────────────────────────
+    # The run directory has to be decided by ONE rank and told to the others. Every rank
+    # scanning logs/ for the next free run number is a race: they can pick the same number
+    # (two ranks writing one run) or different ones (N runs, N-1 of them silently empty),
+    # and mkdir(exist_ok=False) then crashes whichever rank loses. The timestamp in the
+    # name makes independent derivation impossible too -- ranks start milliseconds apart.
+    #
+    # Ordering note: the Accelerator must exist before the broadcast (it is what sets up
+    # the process group), but init_trackers needs the run dir. Hence build it against the
+    # parent, then point it at the resolved run dir with set_directories().
+    log_dir = Path("logs") / "pos2move_v2"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    precision = resolve_precision(args.precision)
+    accelerator = accelerate.Accelerator(
+        log_with="tensorboard",
+        project_dir=str(log_dir),
+        mixed_precision=precision,
+        gradient_accumulation_steps=args.grad_accum,
+    )
+
+    if accelerator.is_main_process:
+        run_number = get_next_run_number(str(log_dir))
+        run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        run_name = None
+    run_name = broadcast_object_list([run_name], from_process=0)[0]
+
+    log_path = log_dir / run_name
+    checkpoint_dir = log_path / "checkpoints"
+    if accelerator.is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    # Every rank must see the directory before anyone writes a checkpoint into it.
+    accelerator.wait_for_everyone()
+    accelerator.project_configuration.set_directories(str(log_path))
 
     # ── Dataset ──────────────────────────────────────────────────────────
     use_shards = args.shards is not None
@@ -345,21 +459,37 @@ def main():
                 return ds
             g = np.random.default_rng(0xC0FFEE)
             keep = np.sort(g.choice(len(ds), size=args.max_val_samples, replace=False))
-            print(f"  {name}: capped {len(ds):,} -> {args.max_val_samples:,} samples")
+            rank0_print(f"  {name}: capped {len(ds):,} -> {args.max_val_samples:,} samples")
             return Subset(ds, keep.tolist())
 
         val_set = cap(val_set, "val")
         test_set = cap(test_set, "test")
 
+        # The shard loaders bypass accelerator.prepare() (see the note at prepare()), so
+        # rank splitting is NOT automatic here the way it is for the HDF5 path -- it has to
+        # be asked for. Without this every rank draws the identical batches from the same
+        # seeded RandomSampler, and DDP degenerates into N ranks computing one gradient N
+        # times: the loss curve looks healthy, the effective batch never grows, and the
+        # extra GPUs buy nothing.
+        # This is exactly why the Accelerator is constructed above the dataset section:
+        # DistributedSampler requires an initialised process group, and the Accelerator is
+        # what initialises it. Building the loaders first raises "Default process group has
+        # not been initialized".
+        world_size = accelerator.num_processes
         train_loader = make_shard_dataloader(train_set, batch_size=args.batch_size, shuffle=True,
                                              num_workers=args.num_workers, drop_last=True,
-                                             seed=args.seed)
+                                             seed=args.seed, distributed=world_size > 1)
+        # Val/test are deliberately NOT sharded. Each rank evaluates the whole (capped)
+        # set and therefore computes an identical val loss, so best-model selection agrees
+        # on every rank by construction and needs no gather or padding-trim. The cost is
+        # N x redundant work on <=10k samples -- about two seconds -- against a class of
+        # bug where ranks disagree about which checkpoint is best and race to write it.
         val_loader = make_shard_dataloader(val_set, batch_size=args.batch_size, shuffle=False,
                                            num_workers=args.num_workers)
         test_loader = make_shard_dataloader(test_set, batch_size=args.batch_size, shuffle=False,
                                             num_workers=args.num_workers)
         vocab_size = PostionTokenizer().vocab_size
-        print(f"Shards: {args.shards} (K={train_set.meta['k']}, "
+        rank0_print(f"Shards: {args.shards} (K={train_set.meta['k']}, "
               f"mode={train_set.meta['sample_mode']}, seed={train_set.meta['seed']})")
     else:
         dataset = HDF5ChessDataset(
@@ -389,7 +519,7 @@ def main():
                                  worker_init_fn=shard_worker_init_fn)
         vocab_size = dataset.position_tokenizer.vocab_size
 
-    print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
+    rank0_print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
 
     # ── Model ────────────────────────────────────────────────────────────
     model_config = {
@@ -401,29 +531,16 @@ def main():
         "kvq_bias": False,
         "layer_drop": args.layer_drop,
     }
+    if accelerator.is_main_process:
+        with (log_path / "model_config.json").open("w") as f:
+            json.dump(model_config, f, indent=2)
 
-    # ── Logging ──────────────────────────────────────────────────────────
-    log_dir = Path("logs") / "pos2move_v2"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    run_number = get_next_run_number(str(log_dir))
-    run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log_path = log_dir / run_name
-    log_path.mkdir(parents=True, exist_ok=False)
-    checkpoint_dir = log_path / "checkpoints"
-    checkpoint_dir.mkdir()
-
-    with (log_path / "model_config.json").open("w") as f:
-        json.dump(model_config, f, indent=2)
-
-    precision = args.precision if torch.cuda.is_available() else "fp32"
-    accelerator = accelerate.Accelerator(
-        log_with="tensorboard",
-        project_dir=str(log_path),
-        mixed_precision=precision,
-        gradient_accumulation_steps=args.grad_accum,
-    )
-    effective_bs = args.batch_size * args.grad_accum
-    print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × accum={args.grad_accum})")
+    # Effective batch scales with world size: every rank contributes its own micro-batch
+    # to the same all-reduced gradient. Reporting it without num_processes understates the
+    # real batch by N, which is exactly the number linear LR scaling is derived from.
+    effective_bs = args.batch_size * args.grad_accum * accelerator.num_processes
+    rank0_print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × "
+                f"accum={args.grad_accum} × ranks={accelerator.num_processes})")
     accelerator.init_trackers(
         project_name="pos2move_v2",
         config={
@@ -439,16 +556,36 @@ def main():
     )
 
     device = accelerator.device
-    print(f"Device: {device} | Precision: {precision} | Logging to: {log_path}")
+    rank0_print(f"Device: {device} | Precision: {precision} | Logging to: {log_path}")
 
     model = Pos2MoveV2(**model_config)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,}")
+    rank0_print(f"Model parameters: {total_params:,}")
     model.to(device)
 
-    if args.compile:
-        model = torch.compile(model, mode=args.compile_mode, dynamic=False) # input does not change shape, so dynamic=False is safe and faster
-        print(f"Model compiled with torch.compile (mode={args.compile_mode})")
+    # torch.compile vs accelerator.prepare() ordering is not cosmetic under DDP.
+    #
+    # Dynamo's DDPOptimizer (torch._dynamo.backends.distributed, on by default) splits the
+    # graph at DDP's gradient all-reduce bucket boundaries so the collectives can overlap
+    # with backward compute. Its own docs: "DDPOptimizer applies when dynamo compiles
+    # models wrapped in DistributedDataParallel". Compiling first gives DDP(OptimizedModule)
+    # -- the wrap happens outside the compiled graph, DDPOptimizer never sees a DDP module,
+    # and the overlap is lost. Compiling after prepare() gives compile(DDP(model)), which is
+    # the shape it wants.
+    #
+    # Single process has no buckets to align to, so 'before' is kept there: it is the
+    # ordering the measured 2.2x speedup and the compile-time numbers come from.
+    compile_order = args.compile_order
+    if compile_order == "auto":
+        compile_order = "after-prepare" if accelerator.num_processes > 1 else "before-prepare"
+
+    def maybe_compile(m, when):
+        if args.compile and compile_order == when:
+            rank0_print(f"torch.compile (mode={args.compile_mode}, {when})")
+            return torch.compile(m, mode=args.compile_mode, dynamic=False)  # shapes are static
+        return m
+
+    model = maybe_compile(model, "before-prepare")
 
     # ── Optimizer (Muon for 2D weights, AdamW for embeddings/heads/1D) ──
     lr_emb = args.lr_embedding or args.lr
@@ -469,8 +606,8 @@ def main():
         else:
             adamw_other_params.append(param)
 
-    print(f"LR: emb={lr_emb:.2e} | muon={args.lr_muon:.2e} | head={lr_head:.2e}")
-    print(
+    rank0_print(f"LR: emb={lr_emb:.2e} | muon={args.lr_muon:.2e} | head={lr_head:.2e}")
+    rank0_print(
         f"Params: emb={sum(p.numel() for p in adamw_emb_params):,} | "
         f"muon={sum(p.numel() for p in muon_params):,} | "
         f"adamw_other={sum(p.numel() for p in adamw_other_params):,} | "
@@ -504,12 +641,14 @@ def main():
             model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader
         )
 
+    model = maybe_compile(model, "after-prepare")
+
     # ── EMA ──────────────────────────────────────────────────────────────
     use_ema = args.ema_decay > 0
     ema_state = None
     if use_ema:
         ema_state = create_ema_state(get_raw_model(model, accelerator))
-        print(f"EMA enabled (decay={args.ema_decay})")
+        rank0_print(f"EMA enabled (decay={args.ema_decay})")
 
     # ── Resume ───────────────────────────────────────────────────────────
     best_val_loss = float("inf")
@@ -539,7 +678,7 @@ def main():
         scheduler_config = trainer_state["scheduler_config"]
         resumed_total = scheduler_config.get("total_steps")
         if resumed_total != args.max_steps:
-            print(f"WARNING: resuming with the checkpoint's LR schedule "
+            rank0_print(f"WARNING: resuming with the checkpoint's LR schedule "
                   f"(total_steps={resumed_total:,}) while --max-steps={args.max_steps:,} "
                   f"bounds the loop. The LR decays over {resumed_total:,} steps regardless.")
         total_steps = resumed_total
@@ -550,10 +689,10 @@ def main():
     # on shards, and epoch-end validation fires that much less often. Print both so the
     # schedule is never a surprise, and say so out loud when --max-steps is not pinning it.
     steps_per_pass = len(train_loader) // max(1, args.grad_accum)
-    samples_seen = args.max_steps * args.batch_size * args.grad_accum
-    print(f"Schedule: {total_steps:,} optimizer steps | warmup {args.warmup_steps:,} | "
+    samples_seen = args.max_steps * effective_bs
+    rank0_print(f"Schedule: {total_steps:,} optimizer steps | warmup {args.warmup_steps:,} | "
           f"eval every {args.eval_steps:,} | save every {args.save_steps:,}")
-    print(f"  one pass over the training data = {steps_per_pass:,} steps "
+    rank0_print(f"  one pass over the training data = {steps_per_pass:,} steps/rank "
           f"({args.max_steps / max(1, steps_per_pass):.2f} passes, "
           f"{samples_seen:,} samples consumed)")
 
@@ -567,11 +706,11 @@ def main():
             ema_path = Path(args.resume_from) / "ema_state.pt"
             if ema_path.exists():
                 ema_state = load_ema_state(ema_path, device)
-                print(f"Restored EMA state from {ema_path}")
+                rank0_print(f"Restored EMA state from {ema_path}")
             else:
                 ema_state = create_ema_state(get_raw_model(model, accelerator))
-                print("EMA state not found in checkpoint, re-initialized from model")
-        print(f"Resumed from {args.resume_from} (step {global_step:,}/{args.max_steps:,}, "
+                rank0_print("EMA state not found in checkpoint, re-initialized from model")
+        rank0_print(f"Resumed from {args.resume_from} (step {global_step:,}/{args.max_steps:,}, "
               f"data pass {start_pass})")
 
     # ── Validation ───────────────────────────────────────────────────────
@@ -587,9 +726,13 @@ def main():
         if use_ema:
             swap_ema_weights(unwrapped, ema_state)
 
+        # No cross-rank reduction here on purpose: val_loader is replicated, not sharded,
+        # so every rank walks the identical set and arrives at the identical number. That
+        # is what keeps best-model selection consistent across ranks without a gather.
         sums = dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, correct=0, legal_correct=0, total=0)
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation", leave=False):
+            for batch in tqdm(val_loader, desc="Validation", leave=False,
+                              disable=not accelerator.is_main_process):
                 b = unpack_batch(batch, device)
                 move_logits, value = model(b["board"], b["player"], b["castling"], b["en_passant"])
                 loss, metrics = compute_loss(
@@ -632,7 +775,7 @@ def main():
         accelerator.log(log_dict, step=global_step)
 
         ema_tag = " (EMA)" if use_ema else ""
-        print(f"{label}val_loss={vals['val/loss']:.4f}{ema_tag} "
+        rank0_print(f"{label}val_loss={vals['val/loss']:.4f}{ema_tag} "
               f"| val_acc={vals['val/accuracy']:.4f} "
               f"| val_legal_acc={vals['val/legal_accuracy']:.4f}")
 
@@ -643,7 +786,7 @@ def main():
             save_trainer_state(best_path, data_pass, global_step, best_val_loss, scheduler_config)
             if use_ema and accelerator.is_main_process:
                 save_ema_state(ema_state, best_path / "ema_state.pt")
-            print(f"  -> New best model (val_loss={vals['val/loss']:.4f})")
+            rank0_print(f"  -> New best model (val_loss={vals['val/loss']:.4f})")
             return True
         return False
 
@@ -671,16 +814,25 @@ def main():
         """Train metrics accumulated since the last validation, sample-weighted."""
         return dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, acc=0.0, legal_acc=0.0, n=0)
 
+    WINDOW_KEYS = ("loss", "ce", "legal_ce", "value", "acc", "legal_acc")
+
     def flush_window(w):
-        n = max(1, w["n"])
-        return {
-            "train/loss": w["loss"] / n,
-            "train/ce": w["ce"] / n,
-            "train/legal_ce": w["legal_ce"] / n,
-            "train/value_loss": w["value"] / n,
-            "train/acc": w["acc"] / n,
-            "train/legal_acc": w["legal_acc"] / n,
-        }
+        """Average the window across ranks, not just within one.
+
+        Each rank trains on a different slice, so these sums are rank-local: rank 0's
+        numbers alone are a 1/N sample of the step. Reducing sum-of-(metric x batch) and
+        sum-of-batch separately, then dividing, is exact regardless of how unevenly the
+        last batches fall -- which is why this does not need gather_for_metrics and its
+        padding-trim bookkeeping (that machinery also would not work here, since the shard
+        loaders never went through prepare()).
+        """
+        vals = torch.tensor([w[k] for k in WINDOW_KEYS] + [float(w["n"])],
+                            dtype=torch.float64, device=accelerator.device)
+        if accelerator.num_processes > 1:
+            vals = accelerator.reduce(vals, reduction="sum")
+        total = max(1.0, vals[-1].item())
+        return {f"train/{'value_loss' if k == 'value' else k}": vals[i].item() / total
+                for i, k in enumerate(WINDOW_KEYS)}
 
     last_val_step = -1
 
@@ -708,7 +860,8 @@ def main():
     model.train()
     window = new_window()
     data_pass = start_pass
-    pbar = tqdm(total=args.max_steps, initial=global_step, desc="train", unit="step")
+    pbar = tqdm(total=args.max_steps, initial=global_step, desc="train", unit="step",
+                disable=not accelerator.is_main_process)
 
     while global_step < args.max_steps:
         start_pass_shuffle(train_loader, data_pass)
@@ -741,6 +894,13 @@ def main():
                 muon_optimizer.zero_grad()
                 adamw_optimizer.zero_grad()
 
+                # EMA is redundant under DDP but not wrong, and that is worth stating.
+                # Gradients are all-reduced before the step, so every rank holds identical
+                # params and computes an identical EMA from an identical decay -- no drift.
+                # swap_ema_weights in run_validation is likewise symmetric because every
+                # rank validates (val_loader is replicated, not sharded). The failure mode
+                # to avoid is any rank taking a different branch here; sync_gradients is
+                # world-uniform, so none does. tests/test_distributed.py asserts it.
                 if use_ema and accelerator.sync_gradients:
                     update_ema(get_raw_model(model, accelerator), ema_state, args.ema_decay)
 
@@ -790,7 +950,7 @@ def main():
                 if use_ema and accelerator.is_main_process:
                     save_ema_state(ema_state, ckpt / "ema_state.pt")
                 if accelerator.is_main_process:
-                    print(f"\n  Saved step checkpoint at step {global_step}")
+                    rank0_print(f"\n  Saved step checkpoint at step {global_step}")
                     cleanup_old_checkpoints(checkpoint_dir, args.max_checkpoints)
 
             # Validation is on a step counter, and global_step is identical on every rank,
@@ -809,11 +969,11 @@ def main():
 
     # Always finish on a validation, so the final steps can still win best_model even when
     # max_steps is not a multiple of eval_steps.
-    print(f"\nReached max-steps ({args.max_steps:,}) after {data_pass} pass(es) over the data.")
+    rank0_print(f"\nReached max-steps ({args.max_steps:,}) after {data_pass} pass(es) over the data.")
     validate_now(window, data_pass, f"Final (step {global_step:,}): ")
 
     # ── Final test (using EMA weights) ───────────────────────────────────
-    print("\nFinal test evaluation...")
+    rank0_print("\nFinal test evaluation...")
     model.eval()
     if use_ema:
         swap_ema_weights(get_raw_model(model, accelerator), ema_state)
@@ -823,7 +983,8 @@ def main():
     test_total = 0
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing", leave=False):
+        for batch in tqdm(test_loader, desc="Testing", leave=False,
+                          disable=not accelerator.is_main_process):
             b = unpack_batch(batch, device)
             board, player = b["board"], b["player"]
             castling, en_passant = b["castling"], b["en_passant"]
@@ -853,10 +1014,10 @@ def main():
         {"test/loss": test_loss, "test/accuracy": test_acc, "test/legal_accuracy": test_legal_acc},
         step=global_step,
     )
-    print(f"Test: loss={test_loss:.4f} | accuracy={test_acc:.4f} | legal_accuracy={test_legal_acc:.4f}")
+    rank0_print(f"Test: loss={test_loss:.4f} | accuracy={test_acc:.4f} | legal_accuracy={test_legal_acc:.4f}")
 
     accelerator.end_training()
-    print(f"\nTraining complete. Logs: {log_path}")
+    rank0_print(f"\nTraining complete. Logs: {log_path}")
 
 
 if __name__ == "__main__":
