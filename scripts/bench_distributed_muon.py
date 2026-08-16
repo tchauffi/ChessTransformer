@@ -91,9 +91,9 @@ def main():
         print(f"  DistributedMuon step : {d_ms:8.2f} ms   momentum state {d_state/2**20:8.1f} MiB/rank")
         if ref_ms is not None:
             print(f"  torch.optim.Muon     : {ref_ms:8.2f} ms   momentum state {ref_state/2**20:8.1f} MiB/rank")
-            print(f"  (world_size=1, so these should match; the win only appears at ws>1)")
+            print("  (world_size=1, so these should match; the win only appears at ws>1)")
         else:
-            print(f"  Run with 1 rank for the torch.optim.Muon baseline to compare against.")
+            print("  Run with 1 rank for the torch.optim.Muon baseline to compare against.")
             print(f"  Expect step time ~/{ws} on NS compute, plus one all_gather per shape bucket.")
     if distributed:
         dist.destroy_process_group()
