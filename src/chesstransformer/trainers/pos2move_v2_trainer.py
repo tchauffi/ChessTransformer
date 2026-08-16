@@ -40,6 +40,11 @@ from chesstransformer.datasets.flat_shard_dataset import (
     worker_init_fn as shard_worker_init_fn,
 )
 from chesstransformer.datasets.h5_lichess_dataset import HDF5ChessDataset
+from chesstransformer.distributed_muon import (
+    DistributedMuon,
+    muon_momentum,
+    muon_weight_decay,
+)
 from chesstransformer.models.tokenizer.position_tokenizer import PostionTokenizer
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2, NUM_ACTION_PLANES
 
@@ -383,6 +388,14 @@ def main():
     parser.add_argument("--resume-from", type=str, default=None)
     # EMA
     parser.add_argument("--ema-decay", type=float, default=0.9995)
+    # Muon
+    parser.add_argument("--distributed-muon", action=argparse.BooleanOptionalAction, default=True,
+                        help="Partition Newton-Schulz across ranks by whole parameter, so the "
+                             "NS work and momentum state are divided instead of every rank "
+                             "redundantly computing the same thing. No-op at world size 1.")
+    parser.add_argument("--muon-schedules", action=argparse.BooleanOptionalAction, default=True,
+                        help="Schedule Muon momentum (0.85->0.97, down to 0.90 during warmdown) "
+                             "and cosine-decay its weight decay to zero, as nanochat does.")
     # Misc
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
@@ -634,12 +647,17 @@ def main():
         f"head={sum(p.numel() for p in adamw_head_params):,}"
     )
 
-    muon_optimizer = torch.optim.Muon(
+    # DistributedMuon degenerates to exactly torch.optim.Muon at world size 1 (verified in
+    # tests/test_distributed_muon.py), so there is one code path rather than two.
+    muon_cls = DistributedMuon if args.distributed_muon else torch.optim.Muon
+    muon_optimizer = muon_cls(
         muon_params,
         lr=args.lr_muon,
         momentum=0.95,
         weight_decay=args.weight_decay,
     )
+    if args.distributed_muon and accelerator.num_processes > 1:
+        rank0_print(muon_optimizer.sharding_summary().split(" | ")[0])
     adamw_optimizer = torch.optim.AdamW([
         {"params": adamw_emb_params, "lr": lr_emb, "weight_decay": args.weight_decay},
         {"params": adamw_other_params, "lr": args.lr, "weight_decay": 0.0},
@@ -906,6 +924,14 @@ def main():
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and args.max_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                if args.muon_schedules:
+                    # Momentum is not a constant in a well-tuned Muon run: a long memory
+                    # early averages over a fast-moving gradient, and a slightly shorter one
+                    # late helps the run settle. Weight decay cosine-decays to zero.
+                    mom = muon_momentum(global_step, args.max_steps)
+                    wdk = muon_weight_decay(global_step, args.max_steps, args.weight_decay)
+                    for g in muon_optimizer.param_groups:
+                        g["momentum"], g["weight_decay"] = mom, wdk
                 muon_optimizer.step()
                 adamw_optimizer.step()
                 if accelerator.sync_gradients:
@@ -956,6 +982,9 @@ def main():
                     "train/lr_muon": muon_lrs[0],
                     "train/lr_emb": adamw_lrs[0],
                     "train/lr_head": adamw_lrs[2],
+                    **({"train/muon_momentum": muon_optimizer.param_groups[0]["momentum"],
+                        "train/muon_wd": muon_optimizer.param_groups[0]["weight_decay"]}
+                       if args.muon_schedules else {}),
                 },
                 step=global_step,
             )
