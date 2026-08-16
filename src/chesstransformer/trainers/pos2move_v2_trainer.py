@@ -372,6 +372,12 @@ def main():
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-mode", type=str, default="default",
                         choices=["default", "reduce-overhead", "max-autotune"])
+    parser.add_argument("--compile-order", type=str, default="auto",
+                        choices=["auto", "before-prepare", "after-prepare"],
+                        help="Whether torch.compile runs before or after accelerator.prepare(). "
+                             "'auto' = before on a single process (the ordering the 2.2x "
+                             "single-GPU speedup was measured with), after under DDP so "
+                             "Dynamo's DDPOptimizer engages. See the note at the call site.")
     args = parser.parse_args()
 
     # Epochs are gone as a unit of training length. They were never comparable between the
@@ -536,9 +542,29 @@ def main():
     rank0_print(f"Model parameters: {total_params:,}")
     model.to(device)
 
-    if args.compile:
-        model = torch.compile(model, mode=args.compile_mode, dynamic=False) # input does not change shape, so dynamic=False is safe and faster
-        rank0_print(f"Model compiled with torch.compile (mode={args.compile_mode})")
+    # torch.compile vs accelerator.prepare() ordering is not cosmetic under DDP.
+    #
+    # Dynamo's DDPOptimizer (torch._dynamo.backends.distributed, on by default) splits the
+    # graph at DDP's gradient all-reduce bucket boundaries so the collectives can overlap
+    # with backward compute. Its own docs: "DDPOptimizer applies when dynamo compiles
+    # models wrapped in DistributedDataParallel". Compiling first gives DDP(OptimizedModule)
+    # -- the wrap happens outside the compiled graph, DDPOptimizer never sees a DDP module,
+    # and the overlap is lost. Compiling after prepare() gives compile(DDP(model)), which is
+    # the shape it wants.
+    #
+    # Single process has no buckets to align to, so 'before' is kept there: it is the
+    # ordering the measured 2.2x speedup and the compile-time numbers come from.
+    compile_order = args.compile_order
+    if compile_order == "auto":
+        compile_order = "after-prepare" if accelerator.num_processes > 1 else "before-prepare"
+
+    def maybe_compile(m, when):
+        if args.compile and compile_order == when:
+            rank0_print(f"torch.compile (mode={args.compile_mode}, {when})")
+            return torch.compile(m, mode=args.compile_mode, dynamic=False)  # shapes are static
+        return m
+
+    model = maybe_compile(model, "before-prepare")
 
     # ── Optimizer (Muon for 2D weights, AdamW for embeddings/heads/1D) ──
     lr_emb = args.lr_embedding or args.lr
@@ -593,6 +619,8 @@ def main():
         model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
             model, muon_optimizer, adamw_optimizer, train_loader, val_loader, test_loader
         )
+
+    model = maybe_compile(model, "after-prepare")
 
     # ── EMA ──────────────────────────────────────────────────────────────
     use_ema = args.ema_decay > 0
