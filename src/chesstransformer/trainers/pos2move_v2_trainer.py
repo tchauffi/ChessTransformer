@@ -83,6 +83,8 @@ PRESETS = {
     "xl":    {"embed_dim": 1536, "num_layers": 32, "num_heads": 16},
 }
 
+torch.set_float32_matmul_precision('high')
+
 
 def rank0_print(*a, **kw):
     """print() on the main process only.
@@ -193,9 +195,9 @@ def compute_loss(
     B = move_logits.size(0)
 
     # Flatten (B, 64, 73) -> (B, 64*73). Upcast to fp32 for loss stability under bf16.
-    flat_logits = move_logits.view(B, -1).float()
+    flat_logits = move_logits.reshape(B, -1).float()
     flat_target = from_sq * NUM_ACTION_PLANES + action_plane
-    flat_mask = legal_moves_planes.view(B, -1).float()
+    flat_mask = legal_moves_planes.reshape(B, -1).float()
 
     # ── Policy loss: label-smoothed CE over LEGAL moves only ────────────
     if label_smoothing > 0:
