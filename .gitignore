@@ -224,7 +224,12 @@ next-env.d.ts
 
 # Data files
 data/raw/
+data/raw_full/
 *.h5
+
+# Preprocessed training shards (scripts/build_shards.py). Rebuildable from the HDF5,
+# and large: elite_k16 is 4.9 GB, full_k4 is 21 GB.
+data/shards/
 
 # HF Space build artifact (assembled by hf_space/prepare.sh)
 hf_space/space_build/
