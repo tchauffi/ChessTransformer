@@ -44,18 +44,30 @@ from chesstransformer.models.tokenizer.position_tokenizer import PostionTokenize
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2, NUM_ACTION_PLANES
 
 
-#: Model sizes. DDP replicates weights *and* optimizer state on every rank, so the
-#: per-GPU cost below is what decides where a preset can run -- not the parameter count.
-#: "state" is bf16 weights + fp32 master + two moments, measured not guessed.
+#: Model sizes. DDP replicates weights *and* optimizer state on every rank.
 #:
-#: ===== ============ ======== ============ ==========================================
-#: name  dim x layers   params  per-GPU DDP  runs on
-#: ===== ============ ======== ============ ==========================================
-#: base     256 x 16    11.7 M      0.21 GB  anything
-#: 46m      512 x 16    46.5 M      0.84 GB  anything
-#: large    768 x 24   156.4 M      2.82 GB  T4 16 GB, 4090, A100
-#: xl      1536 x 32   832.8 M     14.99 GB  NOT DDP-trainable under 40 GB; needs FSDP
-#: ===== ============ ======== ============ ==========================================
+#: The static column is **measured**, not derived: one optimizer step then
+#: torch.cuda.memory_allocated(), on a 16 GB card. It comes out at ~8.4 bytes/param, not
+#: the ~18 a generic "fp32 master + two Adam moments + grads" estimate gives, because the
+#: optimizer is split -- 2D params go to Muon, which keeps a single momentum buffer, and
+#: the AdamW params (norms, biases, embeddings' non-2D parts) are a small remainder.
+#: An earlier version of this table used the 18 B/param estimate and overstated xl by 2.3x.
+#:
+#: Activations dominate and scale with micro-batch: measured ~76 MB/sample for `large`
+#: under torch.compile (~90 MB uncompiled). That is what actually decides whether a config
+#: fits, so the static column alone is not a fit test.
+#:
+#: ===== ============ ======== ============= =============================================
+#: name  dim x layers   params  static/rank   notes
+#: ===== ============ ======== ============= =============================================
+#: base     256 x 16    11.7 M       0.10 GB  anything
+#: 46m      512 x 16    46.5 M       0.35 GB  anything
+#: large    768 x 24   156.4 M       1.23 GB  measured 8.5 GB/rank total at micro-batch 96
+#:                                            on a T4; micro-batch 128 fits, 160 OOMs on 16 GB
+#: xl      1536 x 32   832.8 M     ~6.4 GB    extrapolated. Static alone would fit a 40 GB
+#:                                            card under DDP; whether activations do is
+#:                                            unmeasured -- measure before assuming FSDP.
+#: ===== ============ ======== ============= =============================================
 #:
 #: `xl` is deliberately oversized as a sharding/scaling testbed. It is not a bid for
 #: playing strength -- 46M already lost its head-to-head against v2.1 at 44.8%.
