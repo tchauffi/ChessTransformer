@@ -13,7 +13,14 @@ description = "This project is a chess engine that uses transformer models to pl
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "accelerate>=1.10.1",
+    # Pinned to the 1.10.x line. 1.13 and 1.14 both regressed the ACCELERATE_USE_CPU
+    # path that free gloo/CPU multi-rank testing depends on: they try cuda:local_rank
+    # regardless and die with "invalid device ordinal", and CUDA_VISIBLE_DEVICES="" is not
+    # a workaround because it stops Accelerate detecting the distributed env at all (each
+    # rank then picks its own run directory). Everything in tests/test_distributed.py and
+    # the multi-rank trainer runs was verified on 1.10.1. Revisit when the CPU path is
+    # fixed upstream; see docs/distributed-log.md.
+    "accelerate>=1.10.1,<1.11",
     "cairosvg>=2.8.2",
     "fastapi>=0.115.0",
     "gradio>=5.49.0",
