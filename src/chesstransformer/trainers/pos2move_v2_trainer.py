@@ -59,6 +59,18 @@ PRESETS = {
 }
 
 
+def rank0_print(*a, **kw):
+    """print() on the main process only.
+
+    Keyed off the RANK env var rather than accelerator.is_main_process so it also works
+    before the Accelerator is constructed -- dataset loading logs before that point. N
+    ranks echoing the same line is noise; N ranks echoing *different* lines is a
+    debugging trap, and the dataset banners are exactly where they would differ.
+    """
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(*a, **kw)
+
+
 def resolve_precision(requested: str) -> str:
     """Pick a mixed-precision mode this GPU can actually run.
 
@@ -76,7 +88,7 @@ def resolve_precision(requested: str) -> str:
         return "no"
     if requested == "bf16" and not torch.cuda.is_bf16_supported():
         cap = torch.cuda.get_device_capability(0)
-        print(f"WARNING: {torch.cuda.get_device_name(0)} is compute capability "
+        rank0_print(f"WARNING: {torch.cuda.get_device_name(0)} is compute capability "
               f"{cap[0]}.{cap[1]}; bf16 needs 8.0+. Falling back to fp16 "
               f"(Accelerate adds a GradScaler). Pass --precision fp32 to opt out.")
         return "fp16"
@@ -369,7 +381,7 @@ def main():
     # validation cadence depending only on which --data/--shards flag you passed.
     for dead, replacement in (("epochs", "--max-steps"), ("save_every", "--save-steps")):
         if getattr(args, dead) is not None:
-            print(f"WARNING: --{dead.replace('_', '-')} is deprecated and ignored; "
+            rank0_print(f"WARNING: --{dead.replace('_', '-')} is deprecated and ignored; "
                   f"use {replacement}.")
     if args.max_steps <= 0:
         parser.error("--max-steps must be > 0")
@@ -405,7 +417,7 @@ def main():
                 return ds
             g = np.random.default_rng(0xC0FFEE)
             keep = np.sort(g.choice(len(ds), size=args.max_val_samples, replace=False))
-            print(f"  {name}: capped {len(ds):,} -> {args.max_val_samples:,} samples")
+            rank0_print(f"  {name}: capped {len(ds):,} -> {args.max_val_samples:,} samples")
             return Subset(ds, keep.tolist())
 
         val_set = cap(val_set, "val")
@@ -419,7 +431,7 @@ def main():
         test_loader = make_shard_dataloader(test_set, batch_size=args.batch_size, shuffle=False,
                                             num_workers=args.num_workers)
         vocab_size = PostionTokenizer().vocab_size
-        print(f"Shards: {args.shards} (K={train_set.meta['k']}, "
+        rank0_print(f"Shards: {args.shards} (K={train_set.meta['k']}, "
               f"mode={train_set.meta['sample_mode']}, seed={train_set.meta['seed']})")
     else:
         dataset = HDF5ChessDataset(
@@ -449,7 +461,7 @@ def main():
                                  worker_init_fn=shard_worker_init_fn)
         vocab_size = dataset.position_tokenizer.vocab_size
 
-    print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
+    rank0_print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
 
     # ── Model ────────────────────────────────────────────────────────────
     model_config = {
@@ -483,7 +495,7 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
     )
     effective_bs = args.batch_size * args.grad_accum
-    print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × accum={args.grad_accum})")
+    rank0_print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × accum={args.grad_accum})")
     accelerator.init_trackers(
         project_name="pos2move_v2",
         config={
@@ -499,16 +511,16 @@ def main():
     )
 
     device = accelerator.device
-    print(f"Device: {device} | Precision: {precision} | Logging to: {log_path}")
+    rank0_print(f"Device: {device} | Precision: {precision} | Logging to: {log_path}")
 
     model = Pos2MoveV2(**model_config)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,}")
+    rank0_print(f"Model parameters: {total_params:,}")
     model.to(device)
 
     if args.compile:
         model = torch.compile(model, mode=args.compile_mode, dynamic=False) # input does not change shape, so dynamic=False is safe and faster
-        print(f"Model compiled with torch.compile (mode={args.compile_mode})")
+        rank0_print(f"Model compiled with torch.compile (mode={args.compile_mode})")
 
     # ── Optimizer (Muon for 2D weights, AdamW for embeddings/heads/1D) ──
     lr_emb = args.lr_embedding or args.lr
@@ -529,8 +541,8 @@ def main():
         else:
             adamw_other_params.append(param)
 
-    print(f"LR: emb={lr_emb:.2e} | muon={args.lr_muon:.2e} | head={lr_head:.2e}")
-    print(
+    rank0_print(f"LR: emb={lr_emb:.2e} | muon={args.lr_muon:.2e} | head={lr_head:.2e}")
+    rank0_print(
         f"Params: emb={sum(p.numel() for p in adamw_emb_params):,} | "
         f"muon={sum(p.numel() for p in muon_params):,} | "
         f"adamw_other={sum(p.numel() for p in adamw_other_params):,} | "
@@ -569,7 +581,7 @@ def main():
     ema_state = None
     if use_ema:
         ema_state = create_ema_state(get_raw_model(model, accelerator))
-        print(f"EMA enabled (decay={args.ema_decay})")
+        rank0_print(f"EMA enabled (decay={args.ema_decay})")
 
     # ── Resume ───────────────────────────────────────────────────────────
     best_val_loss = float("inf")
@@ -599,7 +611,7 @@ def main():
         scheduler_config = trainer_state["scheduler_config"]
         resumed_total = scheduler_config.get("total_steps")
         if resumed_total != args.max_steps:
-            print(f"WARNING: resuming with the checkpoint's LR schedule "
+            rank0_print(f"WARNING: resuming with the checkpoint's LR schedule "
                   f"(total_steps={resumed_total:,}) while --max-steps={args.max_steps:,} "
                   f"bounds the loop. The LR decays over {resumed_total:,} steps regardless.")
         total_steps = resumed_total
@@ -611,9 +623,9 @@ def main():
     # schedule is never a surprise, and say so out loud when --max-steps is not pinning it.
     steps_per_pass = len(train_loader) // max(1, args.grad_accum)
     samples_seen = args.max_steps * args.batch_size * args.grad_accum
-    print(f"Schedule: {total_steps:,} optimizer steps | warmup {args.warmup_steps:,} | "
+    rank0_print(f"Schedule: {total_steps:,} optimizer steps | warmup {args.warmup_steps:,} | "
           f"eval every {args.eval_steps:,} | save every {args.save_steps:,}")
-    print(f"  one pass over the training data = {steps_per_pass:,} steps "
+    rank0_print(f"  one pass over the training data = {steps_per_pass:,} steps "
           f"({args.max_steps / max(1, steps_per_pass):.2f} passes, "
           f"{samples_seen:,} samples consumed)")
 
@@ -627,11 +639,11 @@ def main():
             ema_path = Path(args.resume_from) / "ema_state.pt"
             if ema_path.exists():
                 ema_state = load_ema_state(ema_path, device)
-                print(f"Restored EMA state from {ema_path}")
+                rank0_print(f"Restored EMA state from {ema_path}")
             else:
                 ema_state = create_ema_state(get_raw_model(model, accelerator))
-                print("EMA state not found in checkpoint, re-initialized from model")
-        print(f"Resumed from {args.resume_from} (step {global_step:,}/{args.max_steps:,}, "
+                rank0_print("EMA state not found in checkpoint, re-initialized from model")
+        rank0_print(f"Resumed from {args.resume_from} (step {global_step:,}/{args.max_steps:,}, "
               f"data pass {start_pass})")
 
     # ── Validation ───────────────────────────────────────────────────────
@@ -649,7 +661,8 @@ def main():
 
         sums = dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, correct=0, legal_correct=0, total=0)
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation", leave=False):
+            for batch in tqdm(val_loader, desc="Validation", leave=False,
+                              disable=not accelerator.is_main_process):
                 b = unpack_batch(batch, device)
                 move_logits, value = model(b["board"], b["player"], b["castling"], b["en_passant"])
                 loss, metrics = compute_loss(
@@ -692,7 +705,7 @@ def main():
         accelerator.log(log_dict, step=global_step)
 
         ema_tag = " (EMA)" if use_ema else ""
-        print(f"{label}val_loss={vals['val/loss']:.4f}{ema_tag} "
+        rank0_print(f"{label}val_loss={vals['val/loss']:.4f}{ema_tag} "
               f"| val_acc={vals['val/accuracy']:.4f} "
               f"| val_legal_acc={vals['val/legal_accuracy']:.4f}")
 
@@ -703,7 +716,7 @@ def main():
             save_trainer_state(best_path, data_pass, global_step, best_val_loss, scheduler_config)
             if use_ema and accelerator.is_main_process:
                 save_ema_state(ema_state, best_path / "ema_state.pt")
-            print(f"  -> New best model (val_loss={vals['val/loss']:.4f})")
+            rank0_print(f"  -> New best model (val_loss={vals['val/loss']:.4f})")
             return True
         return False
 
@@ -768,7 +781,8 @@ def main():
     model.train()
     window = new_window()
     data_pass = start_pass
-    pbar = tqdm(total=args.max_steps, initial=global_step, desc="train", unit="step")
+    pbar = tqdm(total=args.max_steps, initial=global_step, desc="train", unit="step",
+                disable=not accelerator.is_main_process)
 
     while global_step < args.max_steps:
         start_pass_shuffle(train_loader, data_pass)
@@ -850,7 +864,7 @@ def main():
                 if use_ema and accelerator.is_main_process:
                     save_ema_state(ema_state, ckpt / "ema_state.pt")
                 if accelerator.is_main_process:
-                    print(f"\n  Saved step checkpoint at step {global_step}")
+                    rank0_print(f"\n  Saved step checkpoint at step {global_step}")
                     cleanup_old_checkpoints(checkpoint_dir, args.max_checkpoints)
 
             # Validation is on a step counter, and global_step is identical on every rank,
@@ -869,11 +883,11 @@ def main():
 
     # Always finish on a validation, so the final steps can still win best_model even when
     # max_steps is not a multiple of eval_steps.
-    print(f"\nReached max-steps ({args.max_steps:,}) after {data_pass} pass(es) over the data.")
+    rank0_print(f"\nReached max-steps ({args.max_steps:,}) after {data_pass} pass(es) over the data.")
     validate_now(window, data_pass, f"Final (step {global_step:,}): ")
 
     # ── Final test (using EMA weights) ───────────────────────────────────
-    print("\nFinal test evaluation...")
+    rank0_print("\nFinal test evaluation...")
     model.eval()
     if use_ema:
         swap_ema_weights(get_raw_model(model, accelerator), ema_state)
@@ -883,7 +897,8 @@ def main():
     test_total = 0
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing", leave=False):
+        for batch in tqdm(test_loader, desc="Testing", leave=False,
+                          disable=not accelerator.is_main_process):
             b = unpack_batch(batch, device)
             board, player = b["board"], b["player"]
             castling, en_passant = b["castling"], b["en_passant"]
@@ -913,10 +928,10 @@ def main():
         {"test/loss": test_loss, "test/accuracy": test_acc, "test/legal_accuracy": test_legal_acc},
         step=global_step,
     )
-    print(f"Test: loss={test_loss:.4f} | accuracy={test_acc:.4f} | legal_accuracy={test_legal_acc:.4f}")
+    rank0_print(f"Test: loss={test_loss:.4f} | accuracy={test_acc:.4f} | legal_accuracy={test_legal_acc:.4f}")
 
     accelerator.end_training()
-    print(f"\nTraining complete. Logs: {log_path}")
+    rank0_print(f"\nTraining complete. Logs: {log_path}")
 
 
 if __name__ == "__main__":
