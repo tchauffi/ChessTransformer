@@ -176,8 +176,11 @@ def create_lr_scheduler(optimizer, warmup_steps, total_steps, final_lr_ratio):
     return LambdaLR(optimizer, lr_lambda)
 
 
-def save_trainer_state(checkpoint_dir, epoch, global_step, best_val_loss, scheduler_config=None):
-    state = {"epoch": epoch, "global_step": global_step, "best_val_loss": best_val_loss}
+def save_trainer_state(checkpoint_dir, data_pass, global_step, best_val_loss, scheduler_config=None):
+    # "epoch" is written alongside "data_pass" only so a checkpoint from this trainer still
+    # loads in anything that predates the step paradigm. Nothing here reads it back.
+    state = {"data_pass": data_pass, "epoch": data_pass,
+             "global_step": global_step, "best_val_loss": best_val_loss}
     if scheduler_config:
         state["scheduler_config"] = scheduler_config
     with (Path(checkpoint_dir) / "trainer_state.json").open("w") as f:
@@ -252,7 +255,7 @@ def main():
                              "distribution is frozen into the shard at build time.")
     parser.add_argument("--min-elo", type=int, default=None)
     parser.add_argument("--max-elo", type=int, default=None)
-    parser.add_argument("--sample-weighting", type=str, default="uniform", choices=["uniform", "middlegame"])
+    parser.add_argument("--sample-weighting", type=str, default="middlegame", choices=["uniform", "middlegame"])
     parser.add_argument("--skip-opening-plies", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=10_000,
                         help="Cap on val/test size. The HDF5 path has always applied this; "
@@ -260,10 +263,12 @@ def main():
     # Training
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--lr-muon", type=float, default=1e-3)
-    parser.add_argument("--lr-embedding", type=float, default=2e-4)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="DEPRECATED and ignored. Training length is --max-steps. Kept so "
+                             "existing invocations do not hard-fail; it warns and does nothing.")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-muon", type=float, default=2e-3)
+    parser.add_argument("--lr-embedding", type=float, default=4e-4)
     parser.add_argument("--lr-head", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=2000)
     parser.add_argument("--final-lr-ratio", type=float, default=0.05)
@@ -277,23 +282,44 @@ def main():
     parser.add_argument("--num-layers", type=int, default=16)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.05)    
-    parser.add_argument("--layer-drop", type=float, default=0.0,
+    parser.add_argument("--layer-drop", type=float, default=0.1,
                         help="Stochastic depth rate. Linearly scales from 0 (first layer) to this value (last layer). Try 0.1.")    # Checkpointing
-    parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--max-steps", type=int, default=100_000,
+                        help="Total optimizer steps to train for. This is THE training-length "
+                             "knob: it bounds the loop and sets the LR decay horizon, and it "
+                             "means the same thing on both data paths and at any world size.")
+    parser.add_argument("--save-every", type=int, default=None,
+                        help="DEPRECATED and ignored (was epoch-based checkpointing). "
+                             "Use --save-steps.")
     parser.add_argument("--save-steps", type=int, default=5000)
+    parser.add_argument("--eval-steps", type=int, default=1000,
+                        help="Validate every N optimizer steps. Val loss selects the best "
+                             "checkpoint, so this sets the resolution of that choice. 0 "
+                             "disables periodic validation (a final one still runs).")
     parser.add_argument("--max-checkpoints", type=int, default=5)
     parser.add_argument("--resume-from", type=str, default=None)
     # EMA
-    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--ema-decay", type=float, default=0.9995)
     # Misc
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--num-workers", type=int, default=12)
-    parser.add_argument("--compile", action="store_true", default=False)
+    parser.add_argument("--compile", action="store_true", default=True)
     parser.add_argument("--compile-mode", type=str, default="default",
                         choices=["default", "reduce-overhead", "max-autotune"])
     args = parser.parse_args()
+
+    # Epochs are gone as a unit of training length. They were never comparable between the
+    # two data paths — the HDF5 dataset is indexed by *game* (738 optimizer steps/epoch) and
+    # the shard dataset by *sample* (11,495 for elite_k16, 50,505 for full_k4) — so the same
+    # --epochs N bought a 15-68x different amount of training, LR decay horizon and
+    # validation cadence depending only on which --data/--shards flag you passed.
+    for dead, replacement in (("epochs", "--max-steps"), ("save_every", "--save-steps")):
+        if getattr(args, dead) is not None:
+            print(f"WARNING: --{dead.replace('_', '-')} is deprecated and ignored; "
+                  f"use {replacement}.")
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be > 0")
 
     set_seed(args.seed)
     random.seed(args.seed)
@@ -303,166 +329,6 @@ def main():
 
     # ── Dataset ──────────────────────────────────────────────────────────
     use_shards = args.shards is not None
-    if use_shards:
-        # Flat memmap shards: the replay, tokenize and legal-move enumeration were all
-        # paid once at build time, and the val/test split is by whole shard (== whole
-        # game range) rather than by sample, so no game straddles the split.
-        train_set = FlatShardDataset(args.shards, "train")
-        val_set = FlatShardDataset(args.shards, "val")
-        test_set = FlatShardDataset(args.shards, "test")
-
-        # Whole reserved shards hold far more than validation needs (478k samples at
-        # K=16). Cap them the way the HDF5 path does, with a fixed seed so val loss stays
-        # comparable across runs — it is what selects the best checkpoint.
-        def cap(ds, name):
-            if len(ds) <= args.max_val_samples:
-                return ds
-            g = np.random.default_rng(0xC0FFEE)
-            keep = np.sort(g.choice(len(ds), size=args.max_val_samples, replace=False))
-            print(f"  {name}: capped {len(ds):,} -> {args.max_val_samples:,} samples")
-            return Subset(ds, keep.tolist())
-
-        val_set = cap(val_set, "val")
-        test_set = cap(test_set, "test")
-
-        train_loader = make_shard_dataloader(train_set, batch_size=args.batch_size, shuffle=True,
-                                             num_workers=args.num_workers, drop_last=True,
-                                             seed=args.seed)
-        val_loader = make_shard_dataloader(val_set, batch_size=args.batch_size, shuffle=False,
-                                           num_workers=args.num_workers)
-        test_loader = make_shard_dataloader(test_set, batch_size=args.batch_size, shuffle=False,
-                                            num_workers=args.num_workers)
-        vocab_size = PostionTokenizer().vocab_size
-        print(f"Shards: {args.shards} (K={train_set.meta['k']}, "
-              f"mode={train_set.meta['sample_mode']}, seed={train_set.meta['seed']})")
-    else:
-        dataset = HDF5ChessDataset(
-            hdf5_path=args.data,
-            min_elo=args.min_elo,
-            max_elo=args.max_elo,
-            sample_weighting=args.sample_weighting,
-            skip_opening_plies=args.skip_opening_plies,
-        )
-
-        val_size = min(int(0.1 * len(dataset)), args.max_val_samples)
-        test_size = min(int(0.1 * len(dataset)), args.max_val_samples)
-        train_size = len(dataset) - val_size - test_size
-        train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
-
-        # pin_memory lets the H2D copy run on the DMA engine and overlap with compute;
-        # without it `.to(device, non_blocking=True)` is silently synchronous.
-        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                                  num_workers=args.num_workers, drop_last=True,
-                                  persistent_workers=True, prefetch_factor=4, pin_memory=True,
-                                  worker_init_fn=shard_worker_init_fn)
-        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                                num_workers=args.num_workers, pin_memory=True,
-                                worker_init_fn=shard_worker_init_fn)
-        test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, pin_memory=True,
-                                 worker_init_fn=shard_worker_init_fn)
-        vocab_size = dataset.position_tokenizer.vocab_size
-
-    print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
-
-    # ── Model ────────────────────────────────────────────────────────────
-    model_config = {
-        "vocab_size": vocab_size,
-        "embed_dim": args.embed_dim,
-        "nb_transformer_layers": args.num_layers,
-        "num_heads": args.num_heads,
-        "dropout": args.dropout,
-        "kvq_bias": False,
-        "layer_drop": args.layer_drop,
-    }
-
-    # ── Logging ──────────────────────────────────────────────────────────
-    log_dir = Path("logs") / "pos2move_v2"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    run_number = get_next_run_number(str(log_dir))
-    run_name = f"run_{run_number:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log_path = log_dir / run_name
-    log_path.mkdir(parents=True, exist_ok=False)
-    checkpoint_dir = log_path / "checkpoints"
-    checkpoint_dir.mkdir()
-
-    with (log_path / "model_config.json").open("w") as f:
-        json.dump(model_config, f, indent=2)
-
-    precision = args.precision if torch.cuda.is_available() else "fp32"
-    accelerator = accelerate.Accelerator(
-        log_with="tensorboard",
-        project_dir=str(log_path),
-        mixed_precision=precision,
-        gradient_accumulation_steps=args.grad_accum,
-    )
-    effective_bs = args.batch_size * args.grad_accum
-    print(f"Effective batch size: {effective_bs} (micro={args.batch_size} × accum={args.grad_accum})")
-    accelerator.init_trackers(
-        project_name="pos2move_v2",
-        config={
-            "batch_size": args.batch_size,
-            "grad_accum": args.grad_accum,
-            "effective_batch_size": effective_bs,
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "value_loss_weight": args.value_loss_weight,
-            **model_config,
-        },
-    )
-
-    device = accelerator.device
-    print(f"Device: {device} | Precision: {precision} | Logging to: {log_path}")
-
-    model = Pos2MoveV2(**model_config)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,}")
-    model.to(device)
-
-    if args.compile:
-        model = torch.compile(model, mode=args.compile_mode)
-        print(f"Model compiled with torch.compile (mode={args.compile_mode})")
-
-    # ── Optimizer (Muon for 2D weights, AdamW for embeddings/heads/1D) ──
-    lr_emb = args.lr_embedding or args.lr
-    lr_head = args.lr_head or args.lr
-
-    muon_params = []
-    adamw_emb_params = []
-    adamw_head_params = []
-    adamw_other_params = []
-
-    for name, param in model.named_parameters():
-        if "embedding" in name:
-            adamw_emb_params.append(param)
-        elif "move_head" in name or "value_head" in name:
-            adamw_head_params.append(param)
-        elif param.ndim == 2:
-            muon_params.append(param)
-        else:
-            adamw_other_params.append(param)
-
-    print(f"LR: emb={lr_emb:.2e} | muon={args.lr_muon:.2e} | head={lr_head:.2e}")
-    print(
-        f"Params: emb={sum(p.numel() for p in adamw_emb_params):,} | "
-        f"muon={sum(p.numel() for p in muon_params):,} | "
-        f"adamw_other={sum(p.numel() for p in adamw_other_params):,} | "
-        f"head={sum(p.numel() for p in adamw_head_params):,}"
-    )
-
-    muon_optimizer = torch.optim.Muon(
-        muon_params,
-        lr=args.lr_muon,
-        momentum=0.95,
-        weight_decay=args.weight_decay,
-    )
-    adamw_optimizer = torch.optim.AdamW([
-        {"params": adamw_emb_params, "lr": lr_emb, "weight_decay": args.weight_decay},
-        {"params": adamw_other_params, "lr": args.lr, "weight_decay": 0.0},
-        {"params": adamw_head_params, "lr": lr_head, "weight_decay": 0.0},
-    ])
-
     if use_shards:
         # Flat memmap shards: the replay, tokenize and legal-move enumeration were all
         # paid once at build time, and the val/test split is by whole shard (== whole
@@ -647,27 +513,49 @@ def main():
 
     # ── Resume ───────────────────────────────────────────────────────────
     best_val_loss = float("inf")
-    start_epoch = 1
+    start_pass = 0
     global_step = 0
     trainer_state = None
 
     if args.resume_from:
         trainer_state = load_trainer_state(args.resume_from)
         if trainer_state:
-            start_epoch = trainer_state["epoch"] + 1
+            # "epoch" is the pre-step-paradigm key; read it so old checkpoints still resume.
+            start_pass = trainer_state.get("data_pass", trainer_state.get("epoch", 0)) + 1
             global_step = trainer_state["global_step"]
             best_val_loss = trainer_state["best_val_loss"]
 
     # ── Scheduler ────────────────────────────────────────────────────────
-    total_steps_from_epochs = (len(train_loader) * args.epochs) // max(1, args.grad_accum)
-    total_steps = args.max_steps if args.max_steps else total_steps_from_epochs
+    total_steps = args.max_steps
     scheduler_config = {
         "warmup_steps": args.warmup_steps,
         "total_steps": total_steps,
         "final_lr_ratio": args.final_lr_ratio,
     }
     if trainer_state and "scheduler_config" in trainer_state:
+        # A resume keeps the schedule it started with, so the LR curve stays continuous.
+        # That means --max-steps still bounds the *loop* but no longer sets the LR horizon,
+        # and the two can silently disagree. Say so rather than let it be discovered later.
         scheduler_config = trainer_state["scheduler_config"]
+        resumed_total = scheduler_config.get("total_steps")
+        if resumed_total != args.max_steps:
+            print(f"WARNING: resuming with the checkpoint's LR schedule "
+                  f"(total_steps={resumed_total:,}) while --max-steps={args.max_steps:,} "
+                  f"bounds the loop. The LR decays over {resumed_total:,} steps regardless.")
+        total_steps = resumed_total
+
+    # An "epoch" is not comparable between the two data paths: the HDF5 dataset is indexed
+    # by *game* (738 optimizer steps/epoch) and the shard dataset by *sample* (11.5k for
+    # elite_k16, 50.5k for full_k4). So --epochs N silently buys a 15-68x longer LR decay
+    # on shards, and epoch-end validation fires that much less often. Print both so the
+    # schedule is never a surprise, and say so out loud when --max-steps is not pinning it.
+    steps_per_pass = len(train_loader) // max(1, args.grad_accum)
+    samples_seen = args.max_steps * args.batch_size * args.grad_accum
+    print(f"Schedule: {total_steps:,} optimizer steps | warmup {args.warmup_steps:,} | "
+          f"eval every {args.eval_steps:,} | save every {args.save_steps:,}")
+    print(f"  one pass over the training data = {steps_per_pass:,} steps "
+          f"({args.max_steps / max(1, steps_per_pass):.2f} passes, "
+          f"{samples_seen:,} samples consumed)")
 
     muon_scheduler = create_lr_scheduler(muon_optimizer, **scheduler_config)
     adamw_scheduler = create_lr_scheduler(adamw_optimizer, **scheduler_config)
@@ -683,21 +571,148 @@ def main():
             else:
                 ema_state = create_ema_state(get_raw_model(model, accelerator))
                 print("EMA state not found in checkpoint, re-initialized from model")
-        print(f"Resumed from {args.resume_from} (epoch {start_epoch}, step {global_step})")
+        print(f"Resumed from {args.resume_from} (step {global_step:,}/{args.max_steps:,}, "
+              f"data pass {start_pass})")
 
-    # ── Training loop ────────────────────────────────────────────────────
-    for epoch in range(start_epoch, args.epochs + 1):
+    # ── Validation ───────────────────────────────────────────────────────
+    # Runs on the --eval-steps counter. It used to run only at epoch end, which was a fine
+    # cadence on the HDF5 path (738 steps/epoch) and a bad one on shards (11,495 steps for
+    # elite_k16, 50,505 for full_k4) — the dataset index is a sample there, not a game. Val
+    # loss selects the best checkpoint, so that gap mattered. Hence the step paradigm.
+
+    def run_validation():
+        """Evaluate on val_loader (under EMA weights if enabled). Restores train mode."""
+        model.eval()
+        unwrapped = get_raw_model(model, accelerator)
+        if use_ema:
+            swap_ema_weights(unwrapped, ema_state)
+
+        sums = dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, correct=0, legal_correct=0, total=0)
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validation", leave=False):
+                b = unpack_batch(batch, device)
+                move_logits, value = model(b["board"], b["player"], b["castling"], b["en_passant"])
+                loss, metrics = compute_loss(
+                    move_logits, value,
+                    b["from_sq"], b["action_plane"],
+                    b["legal_planes"], b["result"], b["is_white"], b["move_number"],
+                    args.value_loss_weight,
+                )
+                B = move_logits.size(0)
+                sums["loss"] += loss.item() * B
+                sums["ce"] += metrics["ce"].item() * B
+                sums["legal_ce"] += metrics["legal_ce"].item() * B
+                sums["value"] += metrics["value_loss"].item() * B
+                sums["correct"] += int(metrics["acc"].item() * B)
+                sums["legal_correct"] += int(metrics["legal_acc"].item() * B)
+                sums["total"] += B
+
+        if use_ema:
+            swap_ema_weights(unwrapped, ema_state)
         model.train()
-        epoch_loss = 0.0
-        epoch_ce = 0.0
-        epoch_legal_ce = 0.0
-        epoch_value = 0.0
-        epoch_acc = 0.0
-        epoch_legal_acc = 0.0
-        epoch_samples = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
-        for batch in pbar:
+        n = max(1, sums["total"])
+        return {
+            "val/loss": sums["loss"] / n,
+            "val/ce": sums["ce"] / n,
+            "val/legal_ce": sums["legal_ce"] / n,
+            "val/value_loss": sums["value"] / n,
+            "val/accuracy": sums["correct"] / n,
+            "val/legal_accuracy": sums["legal_correct"] / n,
+        }
+
+    def record_validation(vals, data_pass, extra_log=None, label=""):
+        """Log, print, and update best-model selection. Returns True if it was a new best."""
+        nonlocal best_val_loss
+        log_dict = dict(extra_log or {})
+        log_dict.update(vals)
+        if use_ema:
+            log_dict["val/ema_loss"] = vals["val/loss"]
+            log_dict["val/ema_accuracy"] = vals["val/accuracy"]
+        accelerator.log(log_dict, step=global_step)
+
+        ema_tag = " (EMA)" if use_ema else ""
+        print(f"{label}val_loss={vals['val/loss']:.4f}{ema_tag} "
+              f"| val_acc={vals['val/accuracy']:.4f} "
+              f"| val_legal_acc={vals['val/legal_accuracy']:.4f}")
+
+        if vals["val/loss"] < best_val_loss:
+            best_val_loss = vals["val/loss"]
+            best_path = checkpoint_dir / "best_model"
+            accelerator.save_state(str(best_path))
+            save_trainer_state(best_path, data_pass, global_step, best_val_loss, scheduler_config)
+            if use_ema and accelerator.is_main_process:
+                save_ema_state(ema_state, best_path / "ema_state.pt")
+            print(f"  -> New best model (val_loss={vals['val/loss']:.4f})")
+            return True
+        return False
+
+    # ── Training loop (step-driven) ──────────────────────────────────────
+    # The loop is bounded by optimizer steps and cycles the dataloader as many times as
+    # that takes. Nothing downstream keys off "epoch" any more: LR decay, validation and
+    # checkpointing are all on step counters, which mean the same thing whichever dataset
+    # is mounted and at any world size.
+
+    def start_pass_shuffle(loader, n):
+        """Reshuffle for a fresh pass over the data.
+
+        DistributedSampler needs set_epoch or every rank replays the identical order on
+        every pass. RandomSampler carries its generator across iterators and reshuffles on
+        its own, so this is a no-op there.
+        """
+        for obj in (loader,
+                    getattr(loader, "sampler", None),
+                    getattr(getattr(loader, "sampler", None), "sampler", None)):
+            if obj is not None and hasattr(obj, "set_epoch"):
+                obj.set_epoch(n)
+                return
+
+    def new_window():
+        """Train metrics accumulated since the last validation, sample-weighted."""
+        return dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, acc=0.0, legal_acc=0.0, n=0)
+
+    def flush_window(w):
+        n = max(1, w["n"])
+        return {
+            "train/loss": w["loss"] / n,
+            "train/ce": w["ce"] / n,
+            "train/legal_ce": w["legal_ce"] / n,
+            "train/value_loss": w["value"] / n,
+            "train/acc": w["acc"] / n,
+            "train/legal_acc": w["legal_acc"] / n,
+        }
+
+    last_val_step = -1
+
+    def validate_now(window, data_pass, label_prefix):
+        """Flush the train window, validate, log both against the same step.
+
+        No-ops if this step has already been validated, which happens whenever max_steps is
+        an exact multiple of eval_steps and the final validation lands on the same step as
+        the last periodic one. Worth guarding rather than tolerating: on the HDF5 path the
+        two calls do not even agree, because ``HDF5ChessDataset.__getitem__`` samples a
+        fresh ply per call, so its val set re-rolls on every pass. (The shard val set is
+        fixed, so shard val loss is comparable across evaluations and HDF5 val loss is not
+        — worth remembering when reading either curve.)
+        """
+        nonlocal last_val_step
+        if global_step == last_val_step:
+            return
+        last_val_step = global_step
+        extra = flush_window(window) if window["n"] else {}
+        extra["data_pass"] = data_pass
+        train_tag = f"train_loss={extra['train/loss']:.4f} | " if window["n"] else ""
+        record_validation(run_validation(), data_pass, extra_log=extra,
+                          label=f"{label_prefix}{train_tag}")
+
+    model.train()
+    window = new_window()
+    data_pass = start_pass
+    pbar = tqdm(total=args.max_steps, initial=global_step, desc="train", unit="step")
+
+    while global_step < args.max_steps:
+        start_pass_shuffle(train_loader, data_pass)
+        for batch in train_loader:
             with accelerator.accumulate(model):
                 b = unpack_batch(batch, device)
                 board, player = b["board"], b["player"]
@@ -730,13 +745,13 @@ def main():
                     update_ema(get_raw_model(model, accelerator), ema_state, args.ema_decay)
 
             bs = board.size(0)
-            epoch_loss += loss.item() * bs
-            epoch_ce += metrics["ce"].item() * bs
-            epoch_legal_ce += metrics["legal_ce"].item() * bs
-            epoch_value += metrics["value_loss"].item() * bs
-            epoch_acc += metrics["acc"].item() * bs
-            epoch_legal_acc += metrics["legal_acc"].item() * bs
-            epoch_samples += bs
+            window["loss"] += loss.item() * bs
+            window["ce"] += metrics["ce"].item() * bs
+            window["legal_ce"] += metrics["legal_ce"].item() * bs
+            window["value"] += metrics["value_loss"].item() * bs
+            window["acc"] += metrics["acc"].item() * bs
+            window["legal_acc"] += metrics["legal_acc"].item() * bs
+            window["n"] += bs
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
@@ -766,127 +781,36 @@ def main():
             )
 
             global_step += 1
-
-            if args.max_steps and global_step >= args.max_steps:
-                break
+            pbar.update(1)
 
             if args.save_steps > 0 and global_step % args.save_steps == 0:
                 ckpt = checkpoint_dir / f"checkpoint_step_{global_step:07d}"
                 accelerator.save_state(str(ckpt))
-                save_trainer_state(ckpt, epoch, global_step, best_val_loss, scheduler_config)
+                save_trainer_state(ckpt, data_pass, global_step, best_val_loss, scheduler_config)
                 if use_ema and accelerator.is_main_process:
                     save_ema_state(ema_state, ckpt / "ema_state.pt")
                 if accelerator.is_main_process:
                     print(f"\n  Saved step checkpoint at step {global_step}")
                     cleanup_old_checkpoints(checkpoint_dir, args.max_checkpoints)
 
-        max_steps_reached = args.max_steps and global_step >= args.max_steps
+            # Validation is on a step counter, and global_step is identical on every rank,
+            # so all ranks enter the collective forward together.
+            if args.eval_steps > 0 and global_step % args.eval_steps == 0:
+                validate_now(window, data_pass,
+                             f"\nStep {global_step:,}/{args.max_steps:,}: ")
+                window = new_window()
 
-        if max_steps_reached and accelerator.is_main_process:
-            print(f"\nReached max-steps ({args.max_steps}), stopping after validation.")
+            if global_step >= args.max_steps:
+                break
 
-        epoch_loss /= epoch_samples
-        epoch_ce /= epoch_samples
-        epoch_legal_ce /= epoch_samples
-        epoch_value /= epoch_samples
-        epoch_acc /= epoch_samples
-        epoch_legal_acc /= epoch_samples
+        data_pass += 1
 
-        # ── Validation (with EMA weights if enabled) ────────────────────
-        model.eval()
-        unwrapped = get_raw_model(model, accelerator)
+    pbar.close()
 
-        if use_ema:
-            swap_ema_weights(unwrapped, ema_state)
-
-        val_loss_sum = 0.0
-        val_ce_sum = 0.0
-        val_legal_ce_sum = 0.0
-        val_value_sum = 0.0
-        val_correct = 0
-        val_legal_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation", leave=False):
-                b = unpack_batch(batch, device)
-                board, player = b["board"], b["player"]
-                castling, en_passant = b["castling"], b["en_passant"]
-                from_sq, action_plane = b["from_sq"], b["action_plane"]
-                legal_planes, result = b["legal_planes"], b["result"]
-                is_white, move_number = b["is_white"], b["move_number"]
-
-                move_logits, value = model(board, player, castling, en_passant)
-                loss, metrics = compute_loss(
-                    move_logits, value,
-                    from_sq, action_plane,
-                    legal_planes, result, is_white, move_number,
-                    args.value_loss_weight,
-                )
-
-                B = move_logits.size(0)
-                val_loss_sum += loss.item() * B
-                val_ce_sum += metrics["ce"].item() * B
-                val_legal_ce_sum += metrics["legal_ce"].item() * B
-                val_value_sum += metrics["value_loss"].item() * B
-                val_correct += int(metrics["acc"].item() * B)
-                val_legal_correct += int(metrics["legal_acc"].item() * B)
-                val_total += B
-
-        val_loss = val_loss_sum / val_total
-        val_ce = val_ce_sum / val_total
-        val_legal_ce = val_legal_ce_sum / val_total
-        val_value = val_value_sum / val_total
-        val_acc = val_correct / val_total
-        val_legal_acc = val_legal_correct / val_total
-
-        log_dict = {
-            "train/epoch_loss": epoch_loss,
-            "train/epoch_ce": epoch_ce,
-            "train/epoch_legal_ce": epoch_legal_ce,
-            "train/epoch_value_loss": epoch_value,
-            "train/epoch_acc": epoch_acc,
-            "train/epoch_legal_acc": epoch_legal_acc,
-            "val/loss": val_loss,
-            "val/ce": val_ce,
-            "val/legal_ce": val_legal_ce,
-            "val/value_loss": val_value,
-            "val/accuracy": val_acc,
-            "val/legal_accuracy": val_legal_acc,
-            "epoch": epoch,
-        }
-        if use_ema:
-            log_dict["val/ema_loss"] = val_loss
-            log_dict["val/ema_accuracy"] = val_acc
-        accelerator.log(log_dict, step=global_step)
-
-        ema_tag = " (EMA)" if use_ema else ""
-        print(
-            f"Epoch {epoch}: train_loss={epoch_loss:.4f} | val_loss={val_loss:.4f}{ema_tag}"
-            f" | val_acc={val_acc:.4f} | val_legal_acc={val_legal_acc:.4f}"
-        )
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_path = checkpoint_dir / "best_model"
-            accelerator.save_state(str(best_path))
-            save_trainer_state(best_path, epoch, global_step, best_val_loss, scheduler_config)
-            if use_ema and accelerator.is_main_process:
-                save_ema_state(ema_state, best_path / "ema_state.pt")
-            print(f"  -> New best model (val_loss={val_loss:.4f})")
-
-        if epoch % args.save_every == 0:
-            ckpt = checkpoint_dir / f"checkpoint_epoch_{epoch:03d}"
-            accelerator.save_state(str(ckpt))
-            save_trainer_state(ckpt, epoch, global_step, best_val_loss, scheduler_config)
-            if use_ema and accelerator.is_main_process:
-                save_ema_state(ema_state, ckpt / "ema_state.pt")
-
-        if use_ema:
-            swap_ema_weights(unwrapped, ema_state)
-
-        if max_steps_reached:
-            break
+    # Always finish on a validation, so the final steps can still win best_model even when
+    # max_steps is not a multiple of eval_steps.
+    print(f"\nReached max-steps ({args.max_steps:,}) after {data_pass} pass(es) over the data.")
+    validate_now(window, data_pass, f"Final (step {global_step:,}): ")
 
     # ── Final test (using EMA weights) ───────────────────────────────────
     print("\nFinal test evaluation...")

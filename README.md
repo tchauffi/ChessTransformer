@@ -133,7 +133,15 @@ Output goes to `data/elite_db.h5`; raw PGNs are cleaned up unless `--keep-raw` i
 **2. Train.**
 
 ```bash
-uv run src/chesstransformer/trainers/pos2move_v2_trainer.py
+# Training length is measured in optimizer steps, not epochs.
+uv run src/chesstransformer/trainers/pos2move_v2_trainer.py \
+  --data data/elite_db.h5 --max-steps 70000 --eval-steps 500
+
+# Or from preprocessed flat shards (see doc/dataset_shards.md), which need no
+# dataloader workers when the shard set fits page cache:
+uv run scripts/build_shards.py --h5 data/elite_db.h5 --out data/shards/elite_k16 --min-elo 2400
+uv run src/chesstransformer/trainers/pos2move_v2_trainer.py \
+  --shards data/shards/elite_k16 --num-workers 0 --max-steps 70000 --eval-steps 500
 ```
 
 **3. Evaluate.**
