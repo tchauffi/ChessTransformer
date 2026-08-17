@@ -283,6 +283,34 @@ def test_precision_falls_back_on_pre_ampere(monkeypatch):
     assert resolve_precision("fp32") == "no"
 
 
+def test_tensorboard_lands_in_the_run_dir(tmp_path):
+    """TB events must land beside the run's checkpoints, not in a dir shared by all runs.
+
+    The run name is only known after the process group exists, so the Accelerator is built
+    against the *parent* and repointed afterwards. ProjectConfiguration.set_directories()
+    is not enough to do that repointing -- it skips logging_dir whenever it is already set,
+    which __post_init__ guarantees it is. That left every run writing into one shared
+    logs/pos2move_v2/pos2move_v2, so runs overlaid each other in TensorBoard.
+
+    Asserted against a real ProjectConfiguration built the way Accelerator builds it, so
+    this fails on the set_directories() version rather than restating the fix.
+    """
+    from accelerate.utils import ProjectConfiguration
+
+    from chesstransformer.trainers.pos2move_v2_trainer import point_project_config_at
+
+    parent = tmp_path / "pos2move_v2"
+    run_dir = parent / "run_001_20260817_120000"
+    cfg = ProjectConfiguration(project_dir=str(parent))
+    assert cfg.logging_dir == str(parent), "precondition: __post_init__ defaults it"
+
+    point_project_config_at(cfg, run_dir)
+    assert Path(cfg.project_dir) == run_dir
+    assert Path(cfg.logging_dir) == run_dir, (
+        "logging_dir still on the parent; TensorBoard writes to "
+        f"{Path(cfg.logging_dir) / 'pos2move_v2'}, shared by every run")
+
+
 def test_synthetic_shards_are_format_valid(synthetic_shards):
     """The CI fixture must produce data the real pipeline would accept.
 

@@ -167,6 +167,21 @@ def get_next_run_number(log_dir: str) -> int:
     return max(run_numbers, default=0) + 1
 
 
+def point_project_config_at(project_config, run_dir) -> None:
+    """Move both project_dir and logging_dir onto the resolved run directory.
+
+    Not ``set_directories(run_dir)``: that fills logging_dir only when it is None, and it is
+    not. ``ProjectConfiguration.__post_init__`` already defaulted it to whatever project_dir
+    the Accelerator was built with -- here the *parent*, logs/pos2move_v2, because the run
+    name is not known until after the process group exists (see main()). Moving project_dir
+    alone leaves the TensorBoard writer on the parent, where it appends the project name, so
+    every run's events pile into one shared logs/pos2move_v2/pos2move_v2 instead of landing
+    in the run directory beside that run's checkpoints.
+    """
+    project_config.project_dir = str(run_dir)
+    project_config.logging_dir = str(run_dir)
+
+
 def compute_loss(
     move_logits,
     value,
@@ -421,7 +436,7 @@ def main():
     parser.add_argument("--max-checkpoints", type=int, default=5)
     parser.add_argument("--resume-from", type=str, default=None)
     # EMA
-    parser.add_argument("--ema-decay", type=float, default=0.9995)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     # Muon
     parser.add_argument("--distributed-muon", action=argparse.BooleanOptionalAction, default=True,
                         help="Partition Newton-Schulz across ranks by whole parameter, so the "
@@ -506,7 +521,7 @@ def main():
         checkpoint_dir.mkdir(parents=True, exist_ok=False)
     # Every rank must see the directory before anyone writes a checkpoint into it.
     accelerator.wait_for_everyone()
-    accelerator.project_configuration.set_directories(str(log_path))
+    point_project_config_at(accelerator.project_configuration, log_path)
 
     # ── Dataset ──────────────────────────────────────────────────────────
     use_shards = args.shards is not None
