@@ -13,21 +13,38 @@ Usage
         --model-a /path/to/candidate/model.int8.onnx --label-a run_007 \
         --nodes-a 1800 --nodes-b 1800 --openings 32
 
-The Elo figure carries a 95% CI derived from the per-game score variance. With
-16 games that interval is roughly +/-90 Elo, which cannot resolve two models of
-similar strength -- raise --openings before reading anything into a small gap.
+Results are scored **pentanomially** -- the two colour-swapped games of one
+opening are one sample -- and can be stopped early by an SPRT (``--sprt``).
+
+Because both engines are deterministic, replaying an opening reproduces the same
+game exactly, so the size of the book is a hard ceiling on how much can ever be
+learned from a match. The built-in book below caps out at 132 games, which
+simulation puts at roughly the +80 Elo resolution mark; resolving +15 Elo needs
+around 850 games (p90 ~1900). Use ``--book`` with a book from
+``scripts/build_opening_book.py`` for anything smaller than a large effect.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import chess
 import chess.engine
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from chesstransformer.evaluation.sprt import (  # noqa: E402
+    format_report,
+    pair_up,
+    sprt_decision,
+    sprt_llr,
+    summarize,
+)
 
 BASE = "data/models/pos2move_v2.1/model.int8.onnx"  # base (non-EMA) int8
 
@@ -115,10 +132,6 @@ def play(white, white_nodes, black, black_nodes, opening: str, max_plies: int) -
     return board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "1/2-1/2"
 
 
-def elo(score: float) -> float:
-    return -400 * math.log10(1 / score - 1)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -130,8 +143,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-a", default=None, help="display name for side A")
     p.add_argument("--label-b", default=None, help="display name for side B")
     p.add_argument("--openings", type=int, default=8,
-                   help=f"opening lines to use, from the front of the book (max {len(OPENINGS)}). "
-                        "Each is played twice, colours swapped.")
+                   help="opening lines to use, from the front of the book "
+                        f"(built-in book: {len(OPENINGS)}). Each is played twice, "
+                        "colours swapped.")
+    p.add_argument("--book", type=Path, default=None,
+                   help="JSON book from scripts/build_opening_book.py. The built-in "
+                        "book only supports 132 games, which cannot resolve anything "
+                        "under roughly +80 Elo.")
+    p.add_argument("--sprt", action="store_true",
+                   help="stop as soon as the match decides H0 vs H1 instead of "
+                        "playing every opening.")
+    p.add_argument("--elo0", type=float, default=0.0, help="SPRT null hypothesis")
+    p.add_argument("--elo1", type=float, default=15.0,
+                   help="SPRT alternative: the smallest gain worth promoting")
+    p.add_argument("--alpha", type=float, default=0.05)
+    p.add_argument("--beta", type=float, default=0.05)
+    p.add_argument("--min-pairs", type=int, default=20,
+                   help="never stop before this many completed pairs; the normal "
+                        "approximation is unreliable on a handful of samples.")
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--workers", type=int, default=1,
                    help="game-pairs to play concurrently, each with its own engine pair. "
@@ -160,11 +189,21 @@ def parse_args() -> argparse.Namespace:
                         "better but change search behaviour -- more collisions per wave -- so "
                         "leave unset when the match is meant to mirror production search.")
     args = p.parse_args()
-    if not 1 <= args.openings <= len(OPENINGS):
-        p.error(f"--openings must be in 1..{len(OPENINGS)}")
+    args.lines = load_book(args.book)
+    if not 1 <= args.openings <= len(args.lines):
+        p.error(f"--openings must be in 1..{len(args.lines)}"
+                + ("" if args.book else "; pass --book for a larger book"))
     args.label_a = args.label_a or f"A@{args.nodes_a}"
     args.label_b = args.label_b or f"B@{args.nodes_b}"
     return args
+
+
+def load_book(path: Path | None) -> list[str]:
+    """UCI opening lines, from a generated book or the built-in list."""
+    if path is None:
+        return list(OPENINGS)
+    payload = json.loads(path.read_text())
+    return [o["uci"] for o in payload["openings"]]
 
 
 def main() -> None:
@@ -186,17 +225,29 @@ def main() -> None:
               *search_flags(args.cpuct_a, args.fpu_a, args.prior_temp_a)], args.nodes_a)
     B = (lb, [args.bot, "uci", "--model", args.model_b, *common,
               *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b)], args.nodes_b)
-    book = OPENINGS[: args.openings]
+    book = args.lines[: args.openings]
 
-    jobs = [(op, a_white) for op in book for a_white in (True, False)]
+    jobs = [(i, op, a_white) for i, op in enumerate(book) for a_white in (True, False)]
     workers = max(1, min(args.workers, len(jobs)))
 
     print(f"{la}: {args.model_a} @ {args.nodes_a} nodes")
     print(f"{lb}: {args.model_b} @ {args.nodes_b} nodes")
-    print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)\n", flush=True)
+    print(f"book: {args.book or 'built-in'} ({len(args.lines)} lines available)")
+    print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)")
+    if args.sprt:
+        print(f"SPRT H0={args.elo0:+.0f} vs H1={args.elo1:+.0f} Elo, "
+              f"alpha={args.alpha}, beta={args.beta}, min {args.min_pairs} pairs")
+    print(flush=True)
 
     lock = threading.Lock()
     done = [0]
+    # Per-game scores keyed by (opening index, A played white). A pair is only
+    # scored once both colours of that opening are in, so an early stop or an
+    # interrupted match never contributes a one-sided opening.
+    results: dict[tuple[int, bool], float] = {}
+    pairs: list[float] = []
+    stop = threading.Event()
+    verdict = [None]
 
     def run_shard(shard):
         """Play a slice of the job list with a private pair of engine processes."""
@@ -204,7 +255,9 @@ def main() -> None:
         eb = chess.engine.SimpleEngine.popen_uci(B[1])
         out = []
         try:
-            for op, a_white in shard:
+            for idx, op, a_white in shard:
+                if stop.is_set():
+                    break
                 if a_white:
                     white, wn, black, bn = ea, A[2], eb, B[2]
                 else:
@@ -215,8 +268,23 @@ def main() -> None:
                 out.append(s)
                 with lock:
                     done[0] += 1
-                    print(f"[{done[0]:3}/{len(jobs)}] {la if a_white else lb:10}=W  "
-                          f"{op[:11]:11} -> {r:7} ({la} {tag})", flush=True)
+                    results[(idx, a_white)] = s
+                    other = results.get((idx, not a_white))
+                    note = ""
+                    if other is not None:
+                        pairs.append(s + other)
+                        if args.sprt:
+                            llr = sprt_llr(pairs, args.elo0, args.elo1)
+                            note = f"  LLR {llr:+.2f}"
+                            decision = sprt_decision(
+                                llr, args.alpha, args.beta,
+                                min_pairs_met=len(pairs) >= args.min_pairs)
+                            if decision:
+                                verdict[0] = decision
+                                stop.set()
+                                note += f"  -> {decision}, stopping"
+                    print(f"[{done[0]:4}/{len(jobs)}] {la if a_white else lb:10}=W  "
+                          f"{op[:11]:11} -> {r:7} ({la} {tag}){note}", flush=True)
         finally:
             ea.quit()
             eb.quit()
@@ -226,25 +294,19 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=workers) as pool:
         scores = [s for shard in pool.map(run_shard, shards) for s in shard]
 
-    n = len(scores)
-    wa = sum(1 for s in scores if s == 1.0)
-    wb = sum(1 for s in scores if s == 0.0)
-    d = sum(1 for s in scores if s == 0.5)
-    score = sum(scores) / n
-    print(f"\n{la} vs {lb}: {wa}W {d}D {wb}L / {n}  |  {la} score {score:.3f}")
-    if not 0.0 < score < 1.0:
-        print(f"{la} - {lb} = decisive")
-        return
+    # Score the completed pairs, not the raw games: the two colour-swapped games
+    # of one opening share that opening's difficulty, so pairing removes it from
+    # the variance instead of letting it inflate the interval.
+    final_pairs = pair_up(results)
+    stats = summarize(final_pairs, scores)
+    llr = sprt_llr(final_pairs, args.elo0, args.elo1) if args.sprt else None
 
-    # 95% CI from the per-game score variance (draws count as 0.5, so this is the
-    # standard "score sample" estimator, not a W/L binomial).
-    var = sum((s - score) ** 2 for s in scores) / (n - 1) if n > 1 else 0.0
-    se = math.sqrt(var / n)
-    lo, hi = max(1e-9, score - 1.96 * se), min(1 - 1e-9, score + 1.96 * se)
-    print(f"{la} - {lb} ~ {elo(score):+.0f} Elo  "
-          f"(95% CI {elo(lo):+.0f} .. {elo(hi):+.0f}, +/-{1.96 * se * 100:.1f}pp on score)")
-    if lo < 0.5 < hi:
-        print(f"NOT SIGNIFICANT: the interval spans 0 Elo. {n} games cannot separate these two.")
+    print()
+    if len(scores) > stats.n_games:
+        print(f"note: {len(scores) - stats.n_games} game(s) had no colour-swapped "
+              f"partner and were dropped from the estimate")
+    print(format_report(stats, la, lb, llr, args.elo0, args.elo1,
+                        args.alpha, args.beta))
 
 
 if __name__ == "__main__":
