@@ -183,3 +183,60 @@ the existing training scripts.
   directly reusable for both. A/B match vs base @ 400 sims: **+9 =27 −12
   (46.9%)** over 48 games — statistically even (σ ≈ 7%), confirming the null on
   the board as well.
+- **2026-06-17** — Step 2 started. Fixed a dead import that left
+  `scripts/selfplay_rust.py` (the visit-distribution generator) unrunnable on
+  `main` — it imported `load_model` from the deleted `train_value_head.py`; now
+  pulls it from `grpo_puzzles.py`. Built the expert-iteration trainer
+  `scripts/train_expert_iter.py`: unfreezes the whole net, policy CE on MCTS
+  visit distributions + ramped value MSE on outcomes + KL anchor to the frozen
+  base policy, game-split validation, EMA, standard model-dir export. Smoke test
+  on the 100k-position `v2.1-400sims-exit` shard (1 epoch) **moves both heads
+  past the frozen base on held-out games**: val policy CE 1.3136 → 1.2718, value
+  MSE 0.1787 → 0.1706 — the very signal the frozen-trunk Step 1 could not
+  produce. Strength unverified pending the `engine_match.py` gate. Next: (a)
+  generate a larger visit-distribution dataset with the fixed Rust generator
+  (the 518k `v2.1-128sims` set predates visit recording and lacks policy
+  targets), then (b) full train + gate vs base.
+- **2026-06-17 (first gate)** — Trained `pos2move_v2.1-exit1` on the 100k
+  `v2.1-400sims-exit` shard (12 epochs, early-stopped at 7, best epoch 4;
+  kl-coef 0.1, value-weight 1.0). Held-out policy CE improved 1.3075 → 1.2371
+  but the **value head overfit** the small set (train value MSE 0.016 vs val
+  ~0.20, sign-acc drifted *down* 0.887 → 0.866). Gate vs base @ 400 sims:
+  **+8 =28 −12 (45.8%)** over 48 games — statistically even, point estimate
+  slightly negative → **not promoted**. Diagnosis: method works (the policy
+  moved, unlike frozen-trunk Step 1), but 100k positions / 818 games is far too
+  little to fine-tune the value head without overfitting, and the degraded value
+  head cancels the policy gain at the MCTS leaves. The fix is **data volume**,
+  not the approach. Next: generate a large visit-distribution dataset with the
+  (now-fixed) Rust generator and retrain.
+- **2026-06-17 (second gate — informative negative).** Generated 878k positions
+  / 8,000 games @ 128 sims (`v2.1-exit-128`, 12k games/h) and retrained
+  `exit2` with identical hyperparameters (only data volume changed). Held-out
+  metrics improved *more* than exit1 — best epoch 1: policy CE 1.2400 → 1.1452,
+  value MSE 0.2453 → 0.2333, sign-acc 0.813 → 0.830 (value head still overfits
+  from epoch 2 on; early-stop kept epoch 1). **But the gate got worse, not
+  better: +9 =23 −16 (42.7%) @ 400 sims** — below both 50% and exit1's 45.8%.
+  Better supervised fit to the self-play targets **anti-correlates** with MCTS
+  strength here. Leading hypothesis: the policy is distilled toward the **128-sim
+  visit distribution of the base net**, a *weaker* teacher than base's own
+  400-sim search; the more the policy moves toward it (exit2 moved more than
+  exit1), the more the 400-sim prior is degraded. I.e. a generate/eval search-
+  budget mismatch, not necessarily a dead method. Diagnostic to disentangle:
+  re-gate exit2 vs base **at 128 sims** (matching the teacher). If exit2 ≥ base
+  at 128 but < base at 400, the mismatch explains it and the fix is to generate
+  visits at the eval budget (or higher). If exit2 < base at 128 too, expert
+  iteration genuinely doesn't help the 11.7M net → Step 3 (46M capacity).
+- **2026-06-17 (diagnostic).** Re-gated exit2 vs base **at 128 sims** (the
+  teacher's budget): **+11 =24 −13 (47.9%)**, vs 42.7% at 400 sims. So the
+  mismatch is real — the policy was pulled toward a 128-sim teacher and degrades
+  more the harder you search past it — **but even at the matched budget exit2 is
+  only even with base (≈50%, marginally negative), not better.** Expert
+  iteration as set up here yields no strength on the 11.7M net and hurts above
+  the teacher budget. This is the **4th consistent non-gain** (after Stockfish
+  distillation, GRPO, frozen-trunk value retraining). Key methodological lesson
+  surfaced: **supervised val loss (policy CE / value MSE) anti-correlates with
+  MCTS strength** — exit2 had the best held-out metrics and the worst gate — so
+  checkpoint selection must be done by MCTS games, not loss. Open confounds not
+  yet removed: (a) checkpoint selected by loss, not MCTS (only the loss-best
+  epoch was saved/gated); (b) policy vs value contributions not isolated (value
+  head overfits from epoch 2); (c) teacher generated below eval budget.

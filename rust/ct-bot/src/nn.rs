@@ -54,10 +54,8 @@ impl OnnxEvaluator {
         if use_cuda {
             #[cfg(feature = "cuda")]
             {
-                use ort::execution_providers::CUDAExecutionProvider;
-                builder = ort_ok(
-                    builder.with_execution_providers([CUDAExecutionProvider::default().build()]),
-                )?;
+                use ort::ep::CUDA;
+                builder = ort_ok(builder.with_execution_providers([CUDA::default().build()]))?;
                 log::info!("CUDA execution provider requested (falls back to CPU if unavailable)");
             }
             #[cfg(not(feature = "cuda"))]
