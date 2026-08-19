@@ -240,3 +240,109 @@ the existing training scripts.
   yet removed: (a) checkpoint selected by loss, not MCTS (only the loss-best
   epoch was saved/gated); (b) policy vs value contributions not isolated (value
   head overfits from epoch 2); (c) teacher generated below eval budget.
+- **2026-08-19 (the gates could not have detected any of this).** Before running
+  a fifth experiment, we asked what the previous four could have measured. The
+  answer reframes every null above. Simulating the sequential test below against
+  a 66%-draw match gives the games needed to decide H0 = 0 vs H1 = +15 Elo:
+
+  | true effect | median games | p90 |
+  |---|---:|---:|
+  | +80 Elo | 96 | 142 |
+  | +40 Elo | 220 | 378 |
+  | +25 Elo | 388 | 738 |
+  | +15 Elo | 850 | 1876 |
+  | 0 Elo | 834 | 2102 |
+
+  Every gate in this document ran at 48–162 games. That resolves roughly +80 Elo
+  and nothing finer — which is exactly the pattern in the record: the −89 Elo
+  blitz regression came back clean and unambiguous, while every +20…+50 Elo
+  question came back "not significant". **Those were not weak results, they were
+  unmeasurable ones**, and "the 11.7M net is at capacity" is therefore not yet a
+  measured conclusion.
+
+  The binding constraint was the **opening book**, not the statistics. Both
+  engines are deterministic at fixed nodes (`move_temp=0`, no root noise), so
+  replaying an opening reproduces the same game move for move. The hand-written
+  books cap `head_to_head.py` at 132 games and `engine_match.py` at 184, and no
+  amount of re-running adds information. Fixed by
+  `scripts/build_opening_book.py`: 2000 Stockfish-balanced lines (|cp| ≤ 80,
+  deduped by reached position) → 4000 games of capacity.
+
+  Also landed: **pentanomial scoring** in
+  `src/chesstransformer/evaluation/sprt.py`. The two colour-swapped games of an
+  opening are one sample, so opening difficulty cancels instead of inflating the
+  interval. The self-test makes the mechanism visible — v2.1 gated against
+  itself over 24 pairs returns pentanomial `[0, 0, 24, 0, 0]`, score exactly
+  0.5000, CI ±0.00pp, **despite 16 of those 48 games being decisive**. And an
+  **SPRT** that stops when the answer is clear and says *undecided* rather than
+  offering a point estimate to over-read. Measured calibration: 4.0% type-I
+  error at 0 Elo, 96.7% power at the +15 Elo boundary (α = β = 0.05).
+
+  One consequence for the record above: the sharpened cp value head (S=3.0) was
+  promoted to "worth ~+22 Elo" off 48 games at 400 sims (53.1%). The 162-game
+  confirmation reads **46.9% at 400 sims and 53.4% at 800** — the original result
+  did not replicate at its own budget, and the surviving effect is +24 ± 27 Elo
+  (1σ). Re-gating it under SPRT at the production budget is the first use of the
+  new harness.
+
+- **2026-08-19 (a mechanism for the expert-iteration nulls).** `grep` for
+  `dirichlet|gumbel|root_noise|exploration_noise` across every `.rs` and `.py`
+  in the repo returns **zero matches**, and `rust/selfplay-core/src/lib.rs`
+  (`finish_move`) builds the policy target directly from raw `root.n[i]`. **There
+  is no root exploration in self-play at all** — the only variety comes from the
+  opening book and `move_temp` sampling, neither of which perturbs the priors
+  PUCT descends.
+
+  Without root noise PUCT can only visit what the prior already ranks highly,
+  and `scripts/eval_search_coverage.py` measures the floor: moves under
+  `fpu/(c_puct*sqrt(1+sims))` (~0.47% prior at production settings) are never
+  searched. The stored data agrees — `v2.1-400sims-exit` has 700,595 visit
+  entries over 100,060 positions, a **mean support of 7.0 moves** out of ~30
+  legal. So the visit distribution is a monotone sharpening of the prior over
+  moves the prior already liked, and training the prior on it is
+  self-distillation: it lowers policy entropy and adds no information.
+
+  This predicts the observed signature exactly. `exit2` fit the targets *better*
+  than `exit1` (val CE 1.2400→1.1452 vs 1.3075→1.2371) and gated *worse* (42.7%
+  vs 45.8%). AlphaZero's policy-improvement operator requires search to discover
+  moves the prior undervalues; that mechanism was simply absent. Fixing it
+  (Dirichlet, then Gumbel with completed-Q targets) is queued as step 3 — but
+  only after the two cheaper axes below, and only against a gate that can now
+  see the answer.
+
+- **2026-08-19 (step 4: dense Stockfish reward, in progress).** Distinct from all
+  four attempts above by construction. `scripts/gen_sf_move_rewards.py` scores a
+  candidate move set per self-play position with Stockfish at fixed depth;
+  `scripts/grpo_selfplay.py` trains on it. What makes it a different bet:
+
+  - **Not distillation.** `distill_policy.py` minimised CE against Stockfish's
+    distribution over all 4672 actions — asking an 11.7M head to *reproduce* a
+    stronger player. This only asks it to **re-rank the moves it already
+    considers**, which is a far smaller demand on capacity.
+  - **Not puzzle GRPO.** The reward is dense cp rather than a binary
+    solution match, and every position comes from the engine's own games rather
+    than a tactics set it never plays from.
+  - **Not expert iteration.** No visit counts, so the sharpened-prior failure
+    above cannot arise.
+
+  Candidates are the union of the policy's top-K **and Stockfish's top-M**. The
+  second half is deliberate: a table holding only the policy's own preferences
+  could never teach it a good move it currently ranks low, which would rebuild
+  the same blind spot the visibility floor already imposes. Verified on 40
+  positions — SF's best move is in the candidate set 40/40 times, and the median
+  cp gap between the stored argmax and a fresh SF search is 0.
+
+  Two implementation traps, both now covered by `tests/test_grpo_selfplay.py`
+  because both fail *silently* as a null result:
+  1. The advantage baseline must be the **policy-weighted** mean. The update
+     weights each candidate by π(c), so a uniform-mean baseline leaves
+     `Σ π̃(c)·A_c ≠ 0` — a net push on the whole candidate block that says nothing
+     about which move is better. End to end, the uniform baseline drove the
+     expected cp of the policy's own moves **down 68cp**; the policy-weighted one
+     drives it **up 93cp**.
+  2. A group whose candidates are all equally good has σ ≈ 0, and dividing its
+     rounding-level deviations by that σ amplifies float32 noise into a ~0.03
+     advantage. Gated explicitly — dead-drawn and won endgames hit this often.
+
+  Selection is by match play only (`scripts/gate_candidate.sh`), never by any
+  number the trainer prints, per the lesson recorded above.
