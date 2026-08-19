@@ -56,9 +56,23 @@ entropy up. Carrying over ``beta_kl=0.02`` from the puzzle GRPO, a first run on
 
 So the coefficient is not a constant to guess: ``--target-kl`` sets a drift
 budget and beta is steered to hold it, PPO-style. Small KL also bounds the
-entropy change, so this protects the prior directly. ``--target-kl`` is the knob
-worth sweeping, and every run prints entropy against the base's next to a
-collapse warning.
+entropy change, so this protects the prior directly. Every run prints entropy
+against the base's next to a collapse warning.
+
+**But the anchor cannot hold a budget on its own under Adam.** Adam normalises
+per parameter, so scaling the loss does not scale the step: a larger beta
+changes the update's *direction*, not its magnitude, and the policy keeps
+moving at roughly ``lr`` per step whatever the coefficient. Measured here, KL
+climbed 0.017 -> 0.028 -> 0.060 -> 0.080 over 1000 steps while beta was driven
+to ~200 and pinned there. Treat the controller as shaping *where* the policy
+goes, and **step count and learning rate as what bounds how far**.
+
+The practical consequence is that a run is not one candidate but a ladder of
+them at increasing drift, which is why checkpoints are saved periodically and
+gated. Gains saturate long before entropy does -- +5.2, +9.6, +13.8, +15.9
+expected cp at steps 250/500/750/1000, so the increments halve while entropy
+falls monotonically. The best trade lives early on that curve, and only the
+match harness can say where.
 
 The value head is frozen throughout, so this experiment isolates the policy --
 the one variable being tested. Value is a separate stage.
