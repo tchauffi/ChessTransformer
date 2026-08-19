@@ -174,6 +174,30 @@ class RewardTable:
         return b, pl, ca, ep, ci, cm, cp, li.to(device), lm.to(device)
 
 
+def disable_regularisation(model) -> None:
+    """Turn off dropout and stochastic depth for RL fine-tuning.
+
+    Not a style choice -- it is required for the KL controller to mean anything.
+    Measured on this model with *identical weights*, a train-mode forward
+    against the eval-mode reference reports **KL = 0.0356** from dropout and
+    layer-drop alone. Against a 0.05 budget that is 71% of the allowance spent
+    on noise before the policy has moved at all, and the controller responds by
+    strangling the update (expected cp gained only +3.4 in such a run).
+
+    Removing it also makes ``pi(c)`` in the closed-form gradient an exact
+    estimate rather than a sampled one. The regularisation is not missed: the KL
+    anchor is a far stronger constraint here than dropout, and unlike the value
+    head in expert iteration this objective is anchored to a frozen reference.
+    """
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.Dropout):
+            mod.p = 0.0
+        if hasattr(mod, "layer_drop"):
+            mod.layer_drop = 0.0
+        if hasattr(mod, "dropout") and isinstance(getattr(mod, "dropout"), float):
+            mod.dropout = 0.0
+
+
 def group_advantages(value: torch.Tensor, p_cand: torch.Tensor,
                      cand_mask: torch.Tensor, adv_clip: float) -> torch.Tensor:
     """Group-normalised advantages within each position (the GRPO part).
@@ -307,6 +331,11 @@ def main() -> int:
                         "0.20 within 250 steps, which destroys the MCTS prior.")
     p.add_argument("--adaptive-kl", action=argparse.BooleanOptionalAction,
                    default=True, help="steer beta_kl to hold --target-kl")
+    p.add_argument("--no-regularisation", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="disable dropout and stochastic depth. On by default: "
+                        "they contribute KL 0.0356 on identical weights, which "
+                        "eats most of a 0.05 budget before the policy moves.")
     p.add_argument("--sample-k", type=int, default=0,
                    help="0 = closed-form policy gradient over the candidate set "
                         "(default, lower variance); >0 samples K candidates "
@@ -338,6 +367,9 @@ def main() -> int:
     ref = load_model(args.base, args.device).eval()
     for pr in ref.parameters():
         pr.requires_grad_(False)
+    if args.no_regularisation:
+        disable_regularisation(model)
+        disable_regularisation(ref)
     # The value head is frozen: this experiment isolates the policy.
     for name, pr in model.named_parameters():
         if name.startswith("value_head"):
