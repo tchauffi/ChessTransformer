@@ -417,3 +417,51 @@ the existing training scripts.
   Elo stronger the result is driven by strength rather than by the opening, and
   there is little for pairing to remove. It is worth most exactly where it is
   needed most — near-equal candidates — but it is not a free doubling in general.
+
+- **2026-08-20 (step 5: value head with the trunk unfrozen — no gain).** Step 1's
+  null was explained away as "the binding constraint is the trunk
+  representation, not the value labels." That named an experiment nobody had
+  run: `logs/train_value_trunk.log` shows an attempt printing its baseline and
+  then dying of **CUDA OOM at 14.4 GB of 15.46 GB before its first optimizer
+  step**. Unfreezing 16 layers stores their activations and the head-only
+  script's 8192 batch does not survive it. Rebuilt with bf16 autocast, batch
+  384 and gradient accumulation (`scripts/train_value_trunk.py`).
+
+  Trained on the 3M-position Stockfish set, sharpened S=3, tanh-bounded head,
+  with a forward-KL anchor holding the policy in place:
+
+  | | val MSE | decisive sign-acc |
+  |---|---|---|
+  | base v2.1 (+tanh) | 0.1648 | 90.0% |
+  | head-only `sfvalue-s3.0`, 15 epochs | 0.1074 | 94.7% |
+  | **trunk unfrozen**, 2000 steps (~1 epoch) | **0.1022** | **94.9%** |
+
+  So unfreezing does beat the frozen features — but by ~5% MSE, not the
+  transformation the step-1 write-up implied. It also reaches the head-only
+  fit in roughly a quarter of the samples, which is the clearer evidence that
+  the trunk contributes at all.
+
+  **The gate says it does not matter.** Stopped by hand at 208 games with
+  LLR −2.73, trending to reject +15 Elo. (Do not trust a post-hoc score
+  reconstructed from a partial log: the progress lines print an 11-character
+  opening prefix, which is not unique in a 2000-line book, so pairs mismatch.
+  Printing the opening index would make interrupted runs analysable and is worth
+  doing.)
+
+  Policy drift settled at 0.930 argmax agreement with the base and did not
+  worsen — so unlike expert iteration, this was not a case of the policy being
+  wrecked to buy value accuracy. The value head simply got measurably better at
+  predicting Stockfish and the engine did not get stronger.
+
+  Two axes, two objectives substantially improved, no Elo from either. Combined
+  with step 4's −132 Elo, that is the **sixth and seventh** time on this project
+  that a training metric has moved the right way while strength did not follow.
+  The honest reading is no longer "the proxies are bad" — it is that **the
+  quantities these objectives improve are not what limits this engine at its
+  deployed search budget.**
+
+  What that leaves untried, in order of how directly it attacks that reading:
+  the self-play generator still has **no root exploration at all** (step 3
+  above), which is a real defect rather than a hypothesis, and the search itself
+  — where the sims curve says +170 Elo per doubling — has never been optimised
+  against a gate that could measure it.
