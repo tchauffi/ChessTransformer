@@ -41,9 +41,27 @@ set. Renormalising over candidates would optimise a distribution the engine
 never plays; taking mass from a good candidate has to come out of the real
 alternatives.
 
-A forward KL to the frozen base over the legal set is the safety knob, and the
-value head is frozen throughout -- this isolates the policy, which is the one
-variable being tested.
+Entropy is a hard constraint here, not a nicety
+-----------------------------------------------
+The policy is not the final answer in this system -- it is the **prior that
+feeds PUCT**. A near-deterministic prior is a broken engine no matter how good
+its top move is, because search stops exploring anything else.
+
+This is not hypothetical. The objective's optimum *is* a deterministic policy
+(put all mass on the best candidate), so the KL anchor is the only thing holding
+entropy up. Carrying over ``beta_kl=0.02`` from the puzzle GRPO, a first run on
+148k positions reached KL 0.74 and **collapsed validation entropy from 1.714 to
+0.199 within 250 steps** while its cp numbers still looked like an improvement
+(+34.6 expected cp). Reward went up; the thing we actually ship went down.
+
+So the coefficient is not a constant to guess: ``--target-kl`` sets a drift
+budget and beta is steered to hold it, PPO-style. Small KL also bounds the
+entropy change, so this protects the prior directly. ``--target-kl`` is the knob
+worth sweeping, and every run prints entropy against the base's next to a
+collapse warning.
+
+The value head is frozen throughout, so this experiment isolates the policy --
+the one variable being tested. Value is a separate stage.
 
 One subtlety worth knowing: training runs with the model's configured
 regularisation (``dropout=0.05``, ``layer_drop=0.1``), matching
@@ -279,10 +297,16 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--beta-kl", type=float, default=0.02,
-                   help="forward-KL anchor to the frozen base. The main safety "
-                        "knob: too low and the policy drifts off-distribution, "
-                        "too high and nothing moves.")
+    p.add_argument("--beta-kl", type=float, default=0.5,
+                   help="INITIAL forward-KL coefficient; adapted at runtime to "
+                        "hold --target-kl unless --no-adaptive-kl is passed.")
+    p.add_argument("--target-kl", type=float, default=0.05,
+                   help="KL budget against the frozen base. This is the real "
+                        "knob. See the module docstring: a fixed beta of 0.02 "
+                        "let KL reach 0.74 and entropy collapse from 1.71 to "
+                        "0.20 within 250 steps, which destroys the MCTS prior.")
+    p.add_argument("--adaptive-kl", action=argparse.BooleanOptionalAction,
+                   default=True, help="steer beta_kl to hold --target-kl")
     p.add_argument("--sample-k", type=int, default=0,
                    help="0 = closed-form policy gradient over the candidate set "
                         "(default, lower variance); >0 samples K candidates "
@@ -326,30 +350,46 @@ def main() -> int:
     print(f"base (val): exp_cp {base_m['exp_cp']:+.1f}  "
           f"top1 {base_m['top1']:.3f}  entropy {base_m['entropy']:.3f}")
 
+    base_entropy = base_m["entropy"]
+    beta = args.beta_kl
     args.out.mkdir(parents=True, exist_ok=True)
     model.train()
     for step in range(1, args.steps + 1):
         rows = rng.choice(train_rows, size=min(args.batch_size, len(train_rows)),
                           replace=False)
         loss, m = compute_loss(model, ref, table.batch(rows, args.device),
-                               args.beta_kl, args.sample_k, args.adv_clip)
+                               beta, args.sample_k, args.adv_clip)
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         opt.step()
 
+        if args.adaptive_kl:
+            # Standard PPO/RLHF controller. Without it the coefficient has to be
+            # guessed per dataset, and guessing low is not a slow failure: the
+            # objective's optimum IS a deterministic policy, so the anchor is the
+            # only thing holding entropy up.
+            if m["kl"] > 1.5 * args.target_kl:
+                beta = min(beta * 1.5, 1e3)
+            elif m["kl"] < args.target_kl / 1.5:
+                beta = max(beta / 1.5, 1e-4)
+
         if step % 50 == 0:
-            print(f"step {step:5d}  loss {float(loss):+.4f}  pg {m['pg']:+.4f}  "
-                  f"kl {m['kl']:.4f}  exp_cp {m['exp_cp']:+.1f} "
+            print(f"step {step:5d}  loss {float(loss.detach()):+.4f}  pg {m['pg']:+.4f}  "
+                  f"kl {m['kl']:.4f} (beta {beta:.3f})  exp_cp {m['exp_cp']:+.1f} "
                   f"(base {m['ref_exp_cp']:+.1f}, d {m['d_cp']:+.1f})  "
-                  f"top1 {m['top1']:.3f}", flush=True)
+                  f"top1 {m['top1']:.3f}  H {m['entropy']:.3f}", flush=True)
         if step % args.eval_every == 0:
             v = evaluate(model, ref, table, val_rows, args.device,
-                         args.batch_size, args.beta_kl, args.adv_clip)
+                         args.batch_size, beta, args.adv_clip)
+            warn = ""
+            if v["entropy"] < 0.6 * base_entropy:
+                warn = ("   <-- ENTROPY COLLAPSE: this policy is a degraded MCTS "
+                        "prior regardless of its cp numbers")
             print(f"  [val @ {step}] exp_cp {v['exp_cp']:+.1f} "
                   f"(base {v['ref_exp_cp']:+.1f}, d {v['d_cp']:+.1f})  "
                   f"top1 {v['top1']:.3f}  kl {v['kl']:.4f}  "
-                  f"entropy {v['entropy']:.3f}", flush=True)
+                  f"entropy {v['entropy']:.3f}/{base_entropy:.3f}{warn}", flush=True)
         if step % args.save_every == 0:
             save_checkpoint(model, args, step)
 

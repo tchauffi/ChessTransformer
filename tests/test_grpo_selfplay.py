@@ -234,3 +234,46 @@ def test_sampled_estimator_agrees_in_direction_with_closed_form():
     dots = [float((a * b).sum()) for a, b in zip(g_e, g_s)
             if a is not None and b is not None and a.numel() > 1]
     assert sum(dots) > 0, "sampled and closed-form gradients should broadly agree"
+
+
+# --- adaptive KL control ------------------------------------------------------
+
+def _steer(beta: float, kl: float, target: float) -> float:
+    """The controller from grpo_selfplay.main, in isolation."""
+    if kl > 1.5 * target:
+        return min(beta * 1.5, 1e3)
+    if kl < target / 1.5:
+        return max(beta / 1.5, 1e-4)
+    return beta
+
+
+def test_kl_controller_tightens_when_the_policy_drifts():
+    assert _steer(0.5, kl=0.74, target=0.05) > 0.5
+
+
+def test_kl_controller_relaxes_when_the_policy_is_stuck():
+    assert _steer(0.5, kl=0.001, target=0.05) < 0.5
+
+
+def test_kl_controller_holds_inside_the_deadband():
+    assert _steer(0.5, kl=0.05, target=0.05) == 0.5
+
+
+def test_kl_controller_converges_on_the_target():
+    """Against a policy whose KL falls as beta rises, beta must settle."""
+    beta, target = 0.02, 0.05
+    for _ in range(200):
+        kl = 0.03 / beta          # monotone decreasing in beta
+        beta = _steer(beta, kl, target)
+    assert 0.05 / 1.5 <= 0.03 / beta <= 0.05 * 1.5
+
+
+def test_kl_controller_is_bounded():
+    beta = 1.0
+    for _ in range(500):
+        beta = _steer(beta, kl=99.0, target=0.05)
+    assert beta <= 1e3
+    beta = 1.0
+    for _ in range(500):
+        beta = _steer(beta, kl=0.0, target=0.05)
+    assert beta >= 1e-4
