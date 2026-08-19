@@ -45,6 +45,15 @@ A forward KL to the frozen base over the legal set is the safety knob, and the
 value head is frozen throughout -- this isolates the policy, which is the one
 variable being tested.
 
+One subtlety worth knowing: training runs with the model's configured
+regularisation (``dropout=0.05``, ``layer_drop=0.1``), matching
+``grpo_puzzles.py``, so the ``pi(c)`` weights in the closed-form gradient come
+from a stochastic forward pass and are a noisy estimate of the true policy. The
+update stays right in expectation and the regularisation is worth keeping --
+expert iteration overfit this dataset size badly -- but it is why validation
+here always runs under ``eval()``, and why a gradient-direction check measured
+in train mode reads as pure noise.
+
 What to watch
 -------------
 ``exp_cp`` is the metric that matters: the expected centipawn value of the
