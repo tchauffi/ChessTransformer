@@ -346,3 +346,74 @@ the existing training scripts.
 
   Selection is by match play only (`scripts/gate_candidate.sh`), never by any
   number the trainer prints, per the lesson recorded above.
+
+- **2026-08-19 (step 4 result: a decisive negative, and the harness earned its
+  keep).** Trained `v2.1-grpo-sf` on the 148,433-position reward table (Stockfish
+  depth 10, candidates = policy top-12 ∪ SF top-4, mean 11.35 candidates and a
+  mean 620cp spread per position). Gated checkpoint `step_000750` against
+  production v2.1 at the deployed budget (1800 nodes):
+
+  ```
+  step_000750 vs prod_v2.1: 60 games in 29 pairs
+    pentanomial [LL, LD, LW/DD, DW, WW] = [5, 12, 11, 1, 0]
+    score 0.3190  ~ -132 Elo (95% CI -194 .. -77)
+    SPRT LLR -3.02 -> ACCEPT H0
+  ```
+
+  **−132 Elo.** Not a null — a large regression. Three things follow.
+
+  **The new gate paid for itself immediately.** It reached a confident verdict in
+  **60 games** because the effect is far outside the ±80 Elo floor the old book
+  imposed. The previous harness would have burned 162 games to report "not
+  significant" on an effect this size, and the cost of the wrong answer here
+  would have been a promoted model 132 Elo below production.
+
+  **Fifth confirmation that proxies anti-correlate with strength here.** At the
+  gated checkpoint the trainer reported expected-cp **+13.8** against the frozen
+  base on held-out games — its objective improved, monotonically, while the
+  engine got dramatically worse. Held-out CE did this in expert iteration, the
+  SF-agreement screen did it for MCTS parameters (+3.5% agreement, −19 Elo), and
+  now expected cp does it too. **On this project, no cheap proxy has ever
+  survived contact with a match.** Anything that selects checkpoints by a number
+  the trainer prints is selecting noise at best.
+
+  **The likely mechanism, and why it is interesting.** The reward is Stockfish's
+  evaluation of the position *immediately after* the candidate move — a one-ply
+  greedy objective. Optimising the prior toward it produces a policy that ranks
+  moves the way a shallow static evaluator would, which is precisely not what a
+  PUCT prior is for: the prior's job is to *guide a search* that will itself
+  resolve tactics, and it is calibrated against the value head at the leaves.
+  Sharpening it toward greedy immediate cp degrades that calibration. Note this
+  is a different failure from the entropy collapse guarded against during
+  training — entropy at this checkpoint was 1.464 against a base of 1.714, i.e.
+  the prior was still broad; it was pointed in the wrong direction, not
+  flattened.
+
+  Two implementation traps were caught before the gate and are covered by
+  `tests/test_grpo_selfplay.py`, both of which fail as a silent null: the
+  advantage baseline must be π-weighted (the uniform baseline drove expected cp
+  *down* 68cp), and near-flat candidate groups must be gated off (σ≈0 amplifies
+  float32 rounding into a ~0.03 advantage). Two more were found during training:
+  a fixed `beta_kl=0.02` collapsed validation entropy 1.714 → 0.199 within 250
+  steps while its cp numbers still read as an improvement, and the KL budget was
+  measuring dropout rather than drift — with identical weights, a train-mode
+  forward reports KL 0.0356 from `dropout=0.05` + `layer_drop=0.1` alone, 71% of
+  a 0.05 allowance. A last one worth recording: **under Adam the KL coefficient
+  does not bound drift**, because Adam normalises per parameter, so scaling the
+  loss redirects the update without shortening it (KL climbed 0.017 → 0.080 over
+  1000 steps with beta pinned near 200). Step count and learning rate are what
+  bound distance.
+
+  Verdict on the axis: **greedy one-ply cp is the wrong reward for a search
+  prior.** What is *not* yet ruled out is a reward that respects search — e.g.
+  scoring candidates by Stockfish at the depth the engine actually plays, or
+  training the prior against search-consistent targets rather than static ones.
+  But per the staging rule, the cheaper and better-motivated axes come first,
+  and each one now has a gate that can actually see the answer.
+
+  Also worth recording honestly: the **pentanomial gain was only 1.01×** on this
+  match (unpaired SE ±7.35pp vs paired ±7.25pp). Pairing cancels opening
+  difficulty, which dominates when two engines are close; when one side is 132
+  Elo stronger the result is driven by strength rather than by the opening, and
+  there is little for pairing to remove. It is worth most exactly where it is
+  needed most — near-equal candidates — but it is not a free doubling in general.
