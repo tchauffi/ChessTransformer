@@ -136,18 +136,29 @@ class PGNtoHDF5Converter:
         if not pgn_files:
             raise ValueError(f"No PGN files found in {folder_path}")
 
+        done = self._completed_files()
+        pending = [f for f in pgn_files if f.name not in done]
+
         print(f"Found {len(pgn_files)} PGN file(s) in {folder_path}")
-        for f in pgn_files:
+        if done:
+            print(f"Resuming: {len(done)} already converted, {len(pending)} remaining")
+        for f in pending:
             print(f"  - {f.name}")
         print()
 
+        if not pending:
+            print("Nothing to do — every file is already in the output.")
+            return 0
+
         total_games = 0
-        for pgn_file in pgn_files:
+        started = bool(done)
+        for pgn_file in pending:
             remaining = None if max_games is None else max(0, max_games - total_games)
             if remaining == 0:
                 break
             print(f"\nProcessing: {pgn_file.name}")
-            total_games += self._convert_single_file(pgn_file, remaining, append=total_games > 0)
+            total_games += self._convert_single_file(pgn_file, remaining, append=started)
+            started = True
             if max_games and total_games >= max_games:
                 print(f"\nReached maximum game limit ({max_games})")
                 break
@@ -169,6 +180,45 @@ class PGNtoHDF5Converter:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    _DATASET_NAMES = ("moves", "white_elo", "black_elo", "result", "num_moves")
+
+    def _completed_files(self) -> list[str]:
+        """Names of PGN files already fully written into the output, for resume."""
+        path = Path(self.output_path)
+        if not path.exists():
+            return []
+        try:
+            with h5py.File(path, "r") as f:
+                return [str(n) for n in f.attrs.get("converted_files", [])]
+        except OSError:
+            return []
+
+    def _mark_converted(self, hdf5_file, name: str):
+        """Commit a finished PGN file: record its name and the row watermark."""
+        done = [str(n) for n in hdf5_file.attrs.get("converted_files", [])]
+        if name not in done:
+            done.append(name)
+        hdf5_file.attrs["converted_files"] = np.array(done, dtype=h5py.string_dtype())
+        hdf5_file.attrs["committed_rows"] = int(min(hdf5_file[n].shape[0] for n in self._DATASET_NAMES))
+
+    def _rewind_to_watermark(self, hdf5_file):
+        """Discard everything written after the last fully converted PGN file.
+
+        Length agreement is not enough to detect an interrupted run: `_write_batch`
+        resizes all five datasets before writing any of them, so a crash mid-batch
+        leaves them equal-length with a junk tail. Worse, the rows a dead run *did*
+        write would be duplicated when its PGN file — never added to `converted_files`
+        — gets reconverted. Rewinding to the committed watermark drops both.
+        """
+        lengths = {n: hdf5_file[n].shape[0] for n in self._DATASET_NAMES}
+        mark = int(hdf5_file.attrs.get("committed_rows", -1))
+        if mark < 0:  # written before watermarks existed; fall back to length agreement
+            mark = min(lengths.values())
+        if any(length != mark for length in lengths.values()):
+            print(f"Rewinding interrupted output: {lengths} -> {mark} rows")
+            for name in self._DATASET_NAMES:
+                hdf5_file[name].resize((mark,))
 
     def _create_datasets(self, hdf5_file):
         """Create all HDF5 datasets (called only when not appending)."""
@@ -195,8 +245,21 @@ class PGNtoHDF5Converter:
         new = old + len(games)
         for ds in ("moves", "white_elo", "black_elo", "result", "num_moves"):
             hdf5_file[ds].resize((new,))
-        for i, g in enumerate(games):
-            hdf5_file["moves"][old + i] = g
+        # One slice assignment, not one write per game: each per-game write re-read and
+        # re-compressed the whole gzip chunk, costing ~1 ms/game in the main process and
+        # starving the workers.
+        moves_arr = np.empty(len(games), dtype=object)
+        moves_arr[:] = games
+        try:
+            hdf5_file["moves"][old:new] = moves_arr
+        except TypeError:
+            # h5py re-normalises the object array internally, and when every game in the
+            # batch happens to have the same length (always so for a single game) that
+            # collapses it to 2-D and the vlen write is refused. Only degenerate batches
+            # hit this — typically the 1-game remainder of a file's final flush — so the
+            # slow path costs nothing in practice.
+            for i, g in enumerate(games):
+                hdf5_file["moves"][old + i] = g
         hdf5_file["white_elo"][old:new] = np.array(white_elos, dtype=np.int16)
         hdf5_file["black_elo"][old:new] = np.array(black_elos, dtype=np.int16)
         hdf5_file["result"][old:new] = np.array(results, dtype=np.int8)
@@ -279,9 +342,13 @@ class PGNtoHDF5Converter:
                 stream = io.TextIOWrapper(reader, encoding="utf-8")
                 mode = "a" if append else "w"
                 with h5py.File(self.output_path, mode) as hdf5_file:
-                    if not (append and "moves" in hdf5_file):
+                    if append and "moves" in hdf5_file:
+                        self._rewind_to_watermark(hdf5_file)
+                    else:
                         self._create_datasets(hdf5_file)
                     game_count, total_positions = self._run_conversion(stream, hdf5_file, max_games)
+                    if not max_games or game_count < max_games:
+                        self._mark_converted(hdf5_file, Path(pgn_path).name)
 
         self._print_summary(game_count, total_positions)
         return game_count
@@ -290,9 +357,13 @@ class PGNtoHDF5Converter:
         with open(pgn_path, "r", encoding="utf-8") as pgn_file:
             mode = "a" if append else "w"
             with h5py.File(self.output_path, mode) as hdf5_file:
-                if not (append and "moves" in hdf5_file):
+                if append and "moves" in hdf5_file:
+                    self._rewind_to_watermark(hdf5_file)
+                else:
                     self._create_datasets(hdf5_file)
                 game_count, total_positions = self._run_conversion(pgn_file, hdf5_file, max_games)
+                if not max_games or game_count < max_games:
+                    self._mark_converted(hdf5_file, Path(pgn_path).name)
 
         self._print_summary(game_count, total_positions)
         return game_count
