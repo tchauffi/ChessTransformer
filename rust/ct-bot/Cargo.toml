@@ -9,7 +9,7 @@ shakmaty = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
+ort = { version = "=2.0.0-rc.13", features = ["ndarray"] }
 ndarray = "0.17"
 clap = { version = "4.5", features = ["derive", "env"] }
 anyhow = "1"
@@ -22,4 +22,4 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tower-http = { version = "0.6", features = ["cors"] }
 
 [features]
-cuda = ["ort/cuda"]
+cuda = ["ort/cuda", "ort/load-dynamic"]

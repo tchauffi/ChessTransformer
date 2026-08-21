@@ -185,6 +185,8 @@ class Pos2MoveV2(nn.Module):
         dropout: float = 0.1,
         kvq_bias: bool = False,
         layer_drop: float = 0.0,
+        value_bounded: bool = False,
+        value_clamp: bool = False,
     ):
         super().__init__()
 
@@ -226,12 +228,33 @@ class Pos2MoveV2(nn.Module):
         )
 
         # Deeper value head: D → D//4 → GELU → 1
+        # value_bounded appends a tanh so the output cannot leave the target's
+        # [-1, 1] range. Kept off by default: the shipped v2.1 weights were
+        # trained without it, and squashing them post-hoc changes their scale.
+        # The Tanh lands at index 3, so the Linear state-dict keys (0.*, 2.*)
+        # are identical either way and checkpoints stay interchangeable.
         value_hidden = embed_dim // 4
-        self.value_head = nn.Sequential(
+        value_layers = [
             nn.Linear(embed_dim, value_hidden),
             nn.GELU(),
             nn.Linear(value_hidden, 1),
-        )
+        ]
+        if value_bounded:
+            value_layers.append(nn.Tanh())
+        elif value_clamp:
+            # Minimal alternative to tanh for weights already trained unbounded:
+            # a hard clamp leaves every in-range output untouched and only edits
+            # the semantically impossible ones (a leaf "better than won"). v2.1
+            # emits those on 0.76% of positions, reaching 1.039 -- and since MCTS
+            # maximises over leaf values, that tail is precisely what it chases.
+            # MEASURED 2026-08-19: on v2.1 this is a NO-OP -- the chosen move was
+            # identical on 25/25 opening positions at both 4000 and 8000 sims. A
+            # 4% excursion is too small to steer the search; it mattered for the
+            # cp-trained head only because that one reached 1.211. Don't re-run.
+            # Kept for unbounded heads that overshoot more; prefer value_bounded
+            # (tanh) when training a head from scratch.
+            value_layers.append(nn.Hardtanh(-1.0, 1.0))
+        self.value_head = nn.Sequential(*value_layers)
 
         self._init_weights(nb_transformer_layers)
 

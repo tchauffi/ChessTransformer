@@ -1,0 +1,860 @@
+<title>Pos2MoveV2 Glass Box</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..700&family=JetBrains+Mono:wght@400..600&display=swap">
+
+<style>
+:root {
+  --bg: #e9edec;
+  --panel: #f8faf9;
+  --panel-2: #f0f3f2;
+  --ink: #101a1c;
+  --ink-2: #47585b;
+  --ink-3: #7c8b8d;
+  --line: #d3dbd9;
+  --line-strong: #b9c4c2;
+  --accent: #8a6208;
+  --pos: #0d6b66;
+  --neg: #a4382a;
+  --neutral: #93a0a1;
+  --seq: #2b3a8f;
+  --sq-light: #dad5c8;
+  --sq-dark: #b0a996;
+  --piece-w: #fbf8f1;
+  --piece-b: #171c1e;
+  --shadow: 0 1px 2px rgba(16,26,28,.06), 0 8px 24px rgba(16,26,28,.06);
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10171a;
+    --panel: #172023;
+    --panel-2: #1d282b;
+    --ink: #e8efee;
+    --ink-2: #a7b7b8;
+    --ink-3: #75878a;
+    --line: #27353a;
+    --line-strong: #3a4b50;
+    --accent: #d6a63c;
+    --pos: #3fb3a6;
+    --neg: #e0705c;
+    --neutral: #6f8083;
+    --seq: #8fa2ff;
+    --sq-light: #414c4f;
+    --sq-dark: #2d383b;
+    --piece-w: #f2f5f2;
+    --piece-b: #0b1012;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.28);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #10171a;
+  --panel: #172023;
+  --panel-2: #1d282b;
+  --ink: #e8efee;
+  --ink-2: #a7b7b8;
+  --ink-3: #75878a;
+  --line: #27353a;
+  --line-strong: #3a4b50;
+  --accent: #d6a63c;
+  --pos: #3fb3a6;
+  --neg: #e0705c;
+  --neutral: #6f8083;
+  --seq: #8fa2ff;
+  --sq-light: #414c4f;
+  --sq-dark: #2d383b;
+  --piece-w: #f2f5f2;
+  --piece-b: #0b1012;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.28);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 1400px; margin: 0 auto; padding: 28px 24px 64px; }
+
+/* ── header ─────────────────────────────────────────────── */
+header { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 20px; justify-content: space-between; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+h1 {
+  margin: 0;
+  font-size: clamp(26px, 3.4vw, 40px);
+  font-variation-settings: "wdth" 112, "wght" 700;
+  letter-spacing: -.02em;
+  line-height: 1.02;
+  text-wrap: balance;
+}
+h1 .sub { display: block; font-size: 13px; font-variation-settings: "wdth" 88, "wght" 500; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+.meta-grid { display: flex; flex-wrap: wrap; gap: 6px 22px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11.5px; color: var(--ink-3); }
+.meta-grid b { color: var(--ink-2); font-weight: 500; }
+
+/* ── generic panel ──────────────────────────────────────── */
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.panel > h2, .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); font-size: 11px; letter-spacing: .13em; text-transform: uppercase; font-variation-settings: "wdth" 88, "wght" 600; color: var(--ink-2); }
+.head .note { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 10.5px; letter-spacing: 0; text-transform: none; color: var(--ink-3); }
+
+/* ── position strip ─────────────────────────────────────── */
+.strip { display: flex; gap: 6px; overflow-x: auto; padding: 14px 0 4px; }
+.ply {
+  flex: 0 0 auto; border: 1px solid var(--line); background: var(--panel); color: var(--ink-2);
+  border-radius: 999px; padding: 5px 13px; cursor: pointer;
+  font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 12px;
+}
+.ply:hover { border-color: var(--line-strong); color: var(--ink); }
+.ply[aria-current="true"] { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+
+/* ── main layout ────────────────────────────────────────── */
+.main { display: grid; grid-template-columns: minmax(360px, 520px) minmax(340px, 1fr); gap: 20px; margin-top: 20px; align-items: start; }
+@media (max-width: 980px) { .main { grid-template-columns: 1fr; } }
+
+/* ── board ──────────────────────────────────────────────── */
+.board-shell { padding: 16px; }
+@media (min-width: 981px) { .board-shell { position: sticky; top: 20px; } }
+.board-frame { position: relative; }
+.board { position: relative; display: grid; grid-template-columns: repeat(8, 1fr); aspect-ratio: 1; border-radius: 6px; overflow: hidden; border: 1px solid var(--line-strong); }
+.sq { position: relative; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.sq.light { background: var(--sq-light); }
+.sq.dark { background: var(--sq-dark); }
+.sq .heat { position: absolute; inset: 0; pointer-events: none; }
+.sq .glyph { position: relative; font-size: min(6.2vw, 40px); line-height: 1; user-select: none; pointer-events: none; font-family: "Noto Sans Symbols 2", "DejaVu Sans", "Segoe UI Symbol", serif; }
+.sq .glyph.w { color: var(--piece-w); -webkit-text-stroke: 1.1px var(--piece-b); }
+.sq .glyph.b { color: var(--piece-b); -webkit-text-stroke: 1.1px rgba(250,250,245,.55); }
+.sq .val { position: absolute; bottom: 2px; right: 3px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 9px; color: var(--ink); opacity: .72; pointer-events: none; font-variant-numeric: tabular-nums; }
+.sq.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sq.lastmove::after { content: ""; position: absolute; inset: 0; border: 2px solid var(--accent); opacity: .45; pointer-events: none; }
+.sq .rank-lbl, .sq .file-lbl { position: absolute; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 9px; color: var(--ink-2); opacity: .6; pointer-events: none; }
+.sq .rank-lbl { top: 2px; left: 3px; }
+.sq .file-lbl { bottom: 1px; left: 3px; }
+#arrows { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+.modes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+.mode {
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--ink-2);
+  border-radius: 7px; padding: 6px 11px; cursor: pointer; font-size: 12.5px;
+  font-variation-settings: "wdth" 92, "wght" 500;
+}
+.mode:hover { border-color: var(--line-strong); color: var(--ink); }
+.mode[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.scalebar { display: flex; align-items: center; gap: 9px; margin-top: 12px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 10.5px; color: var(--ink-3); }
+.ramp { flex: 1; height: 7px; border-radius: 4px; border: 1px solid var(--line); }
+.fen { margin-top: 12px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 10.5px; color: var(--ink-3); word-break: break-all; }
+.hint { margin-top: 10px; font-size: 12px; color: var(--ink-3); }
+
+/* ── stat tiles ─────────────────────────────────────────── */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 13px 15px; box-shadow: var(--shadow); }
+.tile .lbl { font-size: 10px; letter-spacing: .13em; text-transform: uppercase; color: var(--ink-3); font-variation-settings: "wdth" 88, "wght" 600; }
+.tile .big { font-size: 26px; font-variation-settings: "wdth" 105, "wght" 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .small { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.meter { height: 6px; border-radius: 3px; background: var(--panel-2); border: 1px solid var(--line); margin-top: 8px; position: relative; overflow: hidden; }
+.meter i { position: absolute; top: 0; bottom: 0; display: block; }
+.meter .mid { position: absolute; top: -1px; bottom: -1px; left: 50%; width: 1px; background: var(--line-strong); }
+
+/* ── move table ─────────────────────────────────────────── */
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-size: 10px; letter-spacing: .11em; text-transform: uppercase; color: var(--ink-3); font-variation-settings: "wdth" 88, "wght" 600; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 6px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; font-variant-numeric: tabular-nums; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--panel-2); }
+tbody tr.played td { box-shadow: inset 2px 0 0 var(--accent); }
+td.san { font-family: "JetBrains Mono", ui-monospace, monospace; font-weight: 600; white-space: nowrap; }
+td.num { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 12px; }
+.bar { position: relative; height: 9px; min-width: 60px; background: var(--panel-2); border-radius: 4px; }
+.bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--seq); border-radius: 0 4px 4px 0; }
+.chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; border: 1px solid var(--line-strong); }
+
+/* ── charts ─────────────────────────────────────────────── */
+.chartbox { padding: 14px 16px 8px; }
+svg.chart { width: 100%; height: auto; display: block; overflow: visible; }
+.axis text { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 9px; fill: var(--ink-3); }
+.grid line { stroke: var(--line); stroke-width: 1; }
+.zero { stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+.vline { stroke: var(--pos); stroke-width: 2; fill: none; stroke-linejoin: round; }
+.tip { position: fixed; z-index: 40; pointer-events: none; background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px; padding: 7px 10px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11.5px; color: var(--ink); box-shadow: var(--shadow); opacity: 0; transition: opacity .1s; max-width: 260px; }
+.tip.on { opacity: 1; }
+
+/* ── attention explorer ─────────────────────────────────── */
+.attn-section { margin-top: 22px; }
+.attn-grid { display: grid; grid-template-columns: minmax(300px, 480px) 1fr; gap: 20px; align-items: start; }
+@media (max-width: 980px) { .attn-grid { grid-template-columns: 1fr; } }
+.controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.controls label { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-variation-settings: "wdth" 88, "wght" 600; }
+input[type=range] { accent-color: var(--accent); width: 190px; }
+select, button.ghost { font-family: inherit; font-size: 12.5px; color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; }
+canvas { display: block; image-rendering: pixelated; width: 100%; height: auto; border-radius: 6px; }
+.heads { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 10px; padding: 14px 16px; }
+.headcell { border: 1px solid var(--line); border-radius: 7px; padding: 5px; cursor: pointer; background: var(--panel-2); }
+.headcell[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.headcell figcaption { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 10px; color: var(--ink-3); text-align: center; margin-top: 4px; }
+.biasrow { display: flex; gap: 3px; padding: 0 16px 14px; }
+.biasrow div { flex: 1; text-align: center; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 9.5px; color: var(--ink-3); }
+.biasrow .cell { height: 26px; border-radius: 4px; border: 1px solid var(--line); margin-bottom: 3px; }
+
+details.reading { margin-top: 22px; }
+details.reading summary { cursor: pointer; font-size: 11px; letter-spacing: .13em; text-transform: uppercase; color: var(--ink-2); font-variation-settings: "wdth" 88, "wght" 600; padding: 12px 0; }
+.reading .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
+.reading p { margin: 0 0 8px; color: var(--ink-2); font-size: 13.5px; max-width: 62ch; }
+.reading code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+.reading h3 { font-size: 13px; margin: 0 0 6px; font-variation-settings: "wdth" 100, "wght" 700; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1><span class="sub" id="eyebrow">Model introspection</span><span id="title">Glass Box</span></h1>
+    <div class="meta-grid" id="meta"></div>
+  </header>
+
+  <div class="strip" id="strip"></div>
+
+  <div class="main">
+    <section class="panel board-shell">
+      <div class="board-frame">
+        <div class="board" id="board"></div>
+        <svg id="arrows" viewBox="0 0 800 800" aria-hidden="true"></svg>
+      </div>
+      <div class="modes" id="modes"></div>
+      <div class="scalebar" id="scalebar"></div>
+      <div class="hint" id="overlay-hint"></div>
+      <div class="fen" id="fen"></div>
+    </section>
+
+    <section style="display:grid; gap:16px;">
+      <div class="tiles" id="tiles"></div>
+
+      <div class="panel">
+        <div class="head"><span>Legal moves — policy vs. value</span><span class="note" id="moves-note"></span></div>
+        <div class="tablewrap"><table id="moves"></table></div>
+      </div>
+
+      <div class="panel chartbox">
+        <div class="head" style="margin:-14px -16px 10px; padding:12px 16px;"><span>Where the answer forms</span><span class="note" id="depth-note"></span></div>
+        <svg class="chart" id="depthchart" viewBox="0 0 720 260" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel attn-section" id="attn-panel">
+    <div class="controls">
+      <span style="font-size:11px;letter-spacing:.13em;text-transform:uppercase;font-variation-settings:'wdth' 88,'wght' 600;color:var(--ink-2)">Attention</span>
+      <label for="layer">Layer</label>
+      <input type="range" id="layer" min="0" max="15" value="15">
+      <span class="note" id="layer-val" style="font-family:'JetBrains Mono',monospace;font-size:12px"></span>
+      <label for="head">Head</label>
+      <select id="head"></select>
+      <label for="attnmode">Read</label>
+      <select id="attnmode">
+        <option value="row">row — where a token looks</option>
+        <option value="col">column — who looks at a token</option>
+      </select>
+      <span class="note" id="attn-status" style="color:var(--ink-3);font-family:'JetBrains Mono',monospace;font-size:11px"></span>
+    </div>
+    <div class="attn-grid">
+      <div style="padding:16px">
+        <canvas id="heatmap" width="67" height="67"></canvas>
+        <div class="scalebar"><span>0</span><span class="ramp" id="attn-ramp"></span><span id="attn-max">max</span></div>
+        <div class="hint">Rows are queries (the token doing the looking), columns are keys. The last three rows/columns are the castling, en-passant and side-to-move tokens. Click a cell to select that square on the board.</div>
+      </div>
+      <div>
+        <div class="head" style="border-top:0"><span>All heads, layer <span id="hl-layer"></span></span><span class="note">click to select</span></div>
+        <div class="heads" id="heads"></div>
+        <div class="head"><span>Relation bias — head <span id="hb-head"></span></span><span class="note">learned, position-independent</span></div>
+        <div class="biasrow" id="biasrow"></div>
+      </div>
+    </div>
+  </section>
+
+  <details class="reading">
+    <summary>How to read this / how it was made</summary>
+    <div class="cols">
+      <div>
+        <h3>Policy vs. value disagreement</h3>
+        <p>Every legal move carries its policy probability and the <em>child value</em> — the value head's verdict on the position after that move, from the mover's side. A move the policy loves but the value dislikes (or vice versa) is where search and network fight each other.</p>
+      </div>
+      <div>
+        <h3>Where the answer forms</h3>
+        <p>The value and policy are decoded from <em>every</em> layer's residual stream through the final norm and the real heads (a logit lens). If the top move is already locked in by layer 6 and nothing moves after, the last ten layers are not doing policy work.</p>
+      </div>
+      <div>
+        <h3>Occlusion saliency</h3>
+        <p>Each non-king piece is deleted in turn and the position re-evaluated. The square shows the swing in value, or in the probability of the move the model wanted. Big swings mark the pieces the verdict actually rests on.</p>
+      </div>
+      <div>
+        <h3>Attention and rollout</h3>
+        <p>Attention is recomputed from each layer's captured input using the model's own projections and its chess-relation bias, then checked against the real forward pass. Rollout multiplies the head-averaged, residual-corrected maps through the stack and reads the game-state token rows.</p>
+      </div>
+    </div>
+    <p style="margin-top:10px"><code id="repro"></code></p>
+  </details>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script id="dump" type="application/json">__PAYLOAD__</script>
+<script>
+"use strict";
+const DUMP = JSON.parse(document.getElementById("dump").textContent);
+const META = DUMP.meta;
+const POS = DUMP.positions;
+const L = META.n_layers, H = META.n_heads, T = 67;
+const GLYPH = { p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚" };
+const FILES = "abcdefgh";
+const STATE_NAMES = ["castling", "en-passant", "side-to-move"];
+
+const state = {
+  pos: 0,
+  mode: "policy",
+  layer: L - 1,
+  head: -1,          // -1 = mean over heads
+  attnMode: "row",
+  square: null,      // selected token index 0..66
+  hoverMove: null,
+};
+const attnCache = new Map();   // pos index -> {q: Uint8Array, scale: Float32Array}
+
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const sqName = (i) => (i < 64 ? FILES[i % 8] + (Math.floor(i / 8) + 1) : STATE_NAMES[i - 64]);
+const fmt = (x, d = 3) => (x >= 0 ? "+" : "−") + Math.abs(x).toFixed(d);
+const pct = (x) => (100 * x).toFixed(1) + "%";
+
+/* ── colour ramps ──────────────────────────────────────────
+   sequential (attention, one hue, light→dark) and diverging
+   (value / saliency, two poles with a neutral middle).       */
+function mix(a, b, t) { return a.map((v, i) => Math.round(v + (b[i] - v) * t)); }
+function rgb(c, alpha) { return `rgba(${c[0]},${c[1]},${c[2]},${alpha == null ? 1 : alpha})`; }
+function hex2rgb(h) { h = h.replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); }
+function seqColor(t) {                     // 0..1
+  const lo = hex2rgb(css("--panel-2")), hi = hex2rgb(css("--seq"));
+  return mix(lo, hi, Math.max(0, Math.min(1, Math.pow(t, 0.45))));
+}
+function divColor(t) {                     // -1..1
+  const mid = hex2rgb(css("--neutral"));
+  const pole = hex2rgb(t >= 0 ? css("--pos") : css("--neg"));
+  return mix(mid, pole, Math.min(1, Math.abs(t)));
+}
+
+/* ── attention decoding ────────────────────────────────── */
+async function inflate(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  if (typeof DecompressionStream === "undefined") throw new Error("no DecompressionStream");
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+async function getAttn(i) {
+  if (attnCache.has(i)) return attnCache.get(i);
+  const a = POS[i].attention;
+  if (!a) return null;
+  const q = await inflate(a.data);
+  const rec = { q, scale: Float32Array.from(a.scale) };
+  attnCache.set(i, rec);
+  return rec;
+}
+// attention[layer][head][from][to], de-quantised with the per-row scale.
+// The stored byte is sqrt-companded, so square it on the way back out.
+function attnAt(rec, l, h, i, j) {
+  const row = (l * H + h) * T + i;
+  const u = rec.q[row * T + j] / 255;
+  return u * u * rec.scale[row];
+}
+function headMeanAt(rec, l, i, j) {
+  let s = 0;
+  for (let h = 0; h < H; h++) s += attnAt(rec, l, h, i, j);
+  return s / H;
+}
+
+/* ── board ─────────────────────────────────────────────── */
+const boardEl = document.getElementById("board");
+const cells = [];
+for (let row = 0; row < 8; row++) {
+  for (let col = 0; col < 8; col++) {
+    const sq = (7 - row) * 8 + col;
+    const d = document.createElement("div");
+    d.className = "sq " + ((row + col) % 2 === 0 ? "light" : "dark");
+    d.dataset.sq = sq;
+    d.innerHTML =
+      '<span class="heat"></span>' +
+      (col === 0 ? `<span class="rank-lbl">${8 - row}</span>` : "") +
+      (row === 7 ? `<span class="file-lbl">${FILES[col]}</span>` : "") +
+      '<span class="glyph"></span><span class="val"></span>';
+    d.addEventListener("click", () => {
+      state.square = state.square === sq ? null : sq;
+      render();
+    });
+    boardEl.appendChild(d);
+    cells[sq] = d;
+  }
+}
+
+const MODES = [
+  { id: "policy", label: "Policy", hint: "Arrow width and opacity follow the move probability. The dashed arrow is the move actually played in the game." },
+  { id: "attention", label: "Attention", hint: "Attention for the selected layer/head. Click a square to pin a query token; with nothing selected the board shows attention received from the three game-state tokens." },
+  { id: "rollout", label: "Rollout", hint: "Attention rollout through the whole stack, read from the game-state tokens the value head consumes." },
+  { id: "value", label: "Value saliency", hint: "Delete this piece, and the value moves by this much. Teal = the model likes the position more without it." },
+  { id: "policysal", label: "Move saliency", hint: "Delete this piece, and the probability of the model's chosen move changes by this much." },
+];
+const modesEl = document.getElementById("modes");
+MODES.forEach((m) => {
+  const b = document.createElement("button");
+  b.className = "mode"; b.textContent = m.label; b.dataset.mode = m.id;
+  b.addEventListener("click", () => { state.mode = m.id; render(); });
+  modesEl.appendChild(b);
+});
+
+/* ── overlays ──────────────────────────────────────────── */
+function overlayValues(p, rec) {
+  // Returns {v: Float64Array(64), kind: "seq"|"div", max, label}
+  const out = new Float64Array(64);
+  if (state.mode === "rollout" && p.attention) {
+    for (let i = 0; i < 64; i++) out[i] = p.attention.rollout[i];
+    return { v: out, kind: "seq", max: Math.max(...out), label: "rollout weight" };
+  }
+  if (state.mode === "value" && p.saliency) {
+    for (let i = 0; i < 64; i++) out[i] = p.saliency.value_delta[i];
+    return { v: out, kind: "div", max: Math.max(...out.map(Math.abs)), label: "Δ value" };
+  }
+  if (state.mode === "policysal" && p.saliency) {
+    for (let i = 0; i < 64; i++) out[i] = p.saliency.policy_delta[i];
+    return { v: out, kind: "div", max: Math.max(...out.map(Math.abs)), label: "Δ p(" + p.saliency.top_move + ")" };
+  }
+  if (state.mode === "attention" && rec) {
+    const l = state.layer;
+    const get = (i, j) => (state.head < 0 ? headMeanAt(rec, l, i, j) : attnAt(rec, l, state.head, i, j));
+    if (state.square !== null) {
+      for (let i = 0; i < 64; i++) out[i] = state.attnMode === "row" ? get(state.square, i) : get(i, state.square);
+    } else {
+      for (let i = 0; i < 64; i++) { let s = 0; for (let t = 64; t < 67; t++) s += get(t, i); out[i] = s / 3; }
+    }
+    return { v: out, kind: "seq", max: Math.max(...out), label: "attention" };
+  }
+  return null;
+}
+
+function paintBoard(p, rec) {
+  const ov = overlayValues(p, rec);
+  const lastFrom = p.last_move ? sqIndex(p.last_move.slice(0, 2)) : null;
+  const lastTo = p.last_move ? sqIndex(p.last_move.slice(2, 4)) : null;
+
+  for (let sq = 0; sq < 64; sq++) {
+    const cell = cells[sq];
+    const glyph = cell.querySelector(".glyph");
+    const piece = p.pieces[sq];
+    if (piece) {
+      glyph.textContent = GLYPH[piece.toLowerCase()];
+      glyph.className = "glyph " + (piece === piece.toUpperCase() ? "w" : "b");
+    } else { glyph.textContent = ""; glyph.className = "glyph"; }
+
+    const heat = cell.querySelector(".heat");
+    const val = cell.querySelector(".val");
+    if (ov && ov.max > 0) {
+      const x = ov.v[sq];
+      if (ov.kind === "seq") {
+        heat.style.background = rgb(seqColor(x / ov.max), Math.min(0.88, 0.12 + 0.88 * (x / ov.max)));
+      } else {
+        const t = x / ov.max;
+        heat.style.background = Math.abs(t) < 0.02 ? "transparent" : rgb(divColor(t), Math.min(0.85, Math.abs(t) * 0.9));
+      }
+      val.textContent = ov.kind === "div"
+        ? (Math.abs(x) >= ov.max * 0.25 ? (x >= 0 ? "+" : "−") + Math.abs(x).toFixed(2).slice(1) : "")
+        : (x >= ov.max * 0.3 ? (100 * x).toFixed(0) + "%" : "");
+    } else { heat.style.background = "transparent"; val.textContent = ""; }
+
+    cell.classList.toggle("sel", state.square === sq);
+    cell.classList.toggle("lastmove", sq === lastFrom || sq === lastTo);
+  }
+
+  const bar = document.getElementById("scalebar");
+  if (ov && ov.max > 0) {
+    const stops = ov.kind === "seq"
+      ? [0, .25, .5, .75, 1].map((t) => rgb(seqColor(t))).join(",")
+      : [-1, -.5, 0, .5, 1].map((t) => rgb(divColor(t))).join(",");
+    bar.innerHTML = `<span>${ov.kind === "div" ? fmt(-ov.max, 2) : "0"}</span>
+      <span class="ramp" style="background:linear-gradient(90deg,${stops})"></span>
+      <span>${ov.kind === "div" ? fmt(ov.max, 2) : (100 * ov.max).toFixed(1) + "%"}</span>
+      <span style="margin-left:6px">${ov.label}</span>`;
+  } else bar.innerHTML = "";
+}
+
+function sqIndex(name) { return (parseInt(name[1], 10) - 1) * 8 + FILES.indexOf(name[0]); }
+function sqCenter(sq) { const c = sq % 8, r = Math.floor(sq / 8); return [c * 100 + 50, (7 - r) * 100 + 50]; }
+
+function paintArrows(p) {
+  const svg = document.getElementById("arrows");
+  svg.innerHTML = "";
+  if (state.mode !== "policy" && state.hoverMove === null) return;
+  const moves = state.hoverMove !== null
+    ? [p.policy.moves[state.hoverMove]]
+    : p.policy.moves.slice(0, 6);
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  svg.appendChild(defs);
+  moves.forEach((m, i) => {
+    const [x1, y1] = sqCenter(m.from), [x2, y2] = sqCenter(m.to);
+    const opacity = state.hoverMove !== null ? 0.95 : Math.max(0.18, Math.min(0.92, 0.25 + m.prob));
+    const w = 6 + 20 * Math.sqrt(m.prob);
+    const color = i === 0 || state.hoverMove !== null ? css("--accent") : css("--seq");
+    const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy);
+    const ux = dx / len, uy = dy / len;
+    const hx = x2 - ux * 26, hy = y2 - uy * 26;   // stop short for the head
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", `M ${x1 + ux * 16} ${y1 + uy * 16} L ${hx} ${hy}`);
+    line.setAttribute("stroke", color);
+    line.setAttribute("stroke-width", w);
+    line.setAttribute("stroke-linecap", "round");
+    line.setAttribute("opacity", opacity);
+    line.setAttribute("fill", "none");
+    svg.appendChild(line);
+    const head = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const px = -uy, py = ux, s = w * 1.5;
+    head.setAttribute("d", `M ${x2 - ux * 4} ${y2 - uy * 4} L ${hx + px * s} ${hy + py * s} L ${hx - px * s} ${hy - py * s} Z`);
+    head.setAttribute("fill", color);
+    head.setAttribute("opacity", opacity);
+    svg.appendChild(head);
+  });
+  const topUci = p.policy.moves[0] && p.policy.moves[0].uci;
+  if (p.played_uci && p.played_uci !== topUci && state.hoverMove === null) {
+    const [x1, y1] = sqCenter(sqIndex(p.played_uci.slice(0, 2)));
+    const [x2, y2] = sqCenter(sqIndex(p.played_uci.slice(2, 4)));
+    const dash = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    dash.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
+    dash.setAttribute("stroke", css("--ink"));
+    dash.setAttribute("stroke-width", "3");
+    dash.setAttribute("stroke-dasharray", "10 8");
+    dash.setAttribute("opacity", ".65");
+    dash.setAttribute("fill", "none");
+    svg.appendChild(dash);
+  }
+}
+
+/* ── tiles ─────────────────────────────────────────────── */
+// The move the value head would pick if it, not the policy, chose. When this
+// disagrees with the policy's move, search will pull away from the prior —
+// and that gap is usually where the interesting bugs live.
+function valuePick(p) {
+  const scored = p.policy.moves.filter((m) => m.child_value != null);
+  if (scored.length < 2) return null;
+  let best = scored[0];
+  for (const m of scored) if (m.child_value > best.child_value) best = m;
+  const same = best.uci === p.policy.moves[0].uci;
+  return {
+    lbl: "Value head's pick",
+    big: best.san,
+    small: same ? "agrees with the policy" : `policy rank #${best.rank + 1} · ${pct(best.prob)} · ${fmt(best.child_value, 3)}`,
+    meter: { from: 0, to: best.prob, color: same ? css("--pos") : css("--neg") },
+  };
+}
+
+function paintTiles(p) {
+  const top = p.policy.moves[0];
+  const ent = p.policy.entropy, maxEnt = p.policy.max_entropy || 1;
+  const played = p.played_san;
+  const rankOfPlayed = played ? p.policy.moves.findIndex((m) => m.san === played) : -1;
+  const vPct = (p.value + 1) / 2;
+  const cmp = p.compare;
+  const tiles = [
+    { lbl: "Model's move", big: top ? top.san : "—", small: top ? pct(top.prob) + " of the legal mass" + (cmp ? " · other: " + cmp.top1 : "") : "",
+      meter: { from: 0, to: top ? top.prob : 0, color: css("--seq") } },
+    { lbl: "Value (side to move)", big: top ? fmt(p.value, 3) : fmt(p.value, 3),
+      small: (p.turn === "w" ? "White" : "Black") + " to move" + (cmp ? " · other: " + fmt(cmp.value, 3) : ""),
+      meter: { from: Math.min(0.5, vPct), to: Math.max(0.5, vPct), color: p.value >= 0 ? css("--pos") : css("--neg"), mid: true } },
+    { lbl: "Policy entropy", big: ent.toFixed(2) + " b", small: "of " + maxEnt.toFixed(2) + " b over " + p.legal_count + " moves",
+      meter: { from: 0, to: ent / maxEnt, color: css("--accent") } },
+    valuePick(p),
+    played ? { lbl: "Move played", big: played, small: rankOfPlayed >= 0 ? "model rank #" + (rankOfPlayed + 1) + " · " + pct(p.policy.moves[rankOfPlayed].prob) : "not in the legal list",
+      meter: { from: 0, to: rankOfPlayed >= 0 ? p.policy.moves[rankOfPlayed].prob : 0, color: css("--accent") } } : null,
+  ].filter(Boolean);
+
+  document.getElementById("tiles").innerHTML = tiles.map((t) => `
+    <div class="tile">
+      <div class="lbl">${t.lbl}</div>
+      <div class="big">${t.big}</div>
+      <div class="small">${t.small}</div>
+      <div class="meter">${t.meter.mid ? '<span class="mid"></span>' : ""}
+        <i style="left:${100 * t.meter.from}%;width:${100 * (t.meter.to - t.meter.from)}%;background:${t.meter.color}"></i>
+      </div>
+    </div>`).join("");
+}
+
+/* ── move table ────────────────────────────────────────── */
+function paintMoves(p) {
+  const hasCmp = p.policy.moves.some((m) => m.compare_prob != null);
+  const rows = p.policy.moves.slice(0, 18);
+  const head = `<thead><tr><th>#</th><th>Move</th><th style="width:34%">Policy</th><th>p</th>
+    <th>Child value</th><th>Value gain</th>${hasCmp ? "<th>Other model</th>" : ""}<th></th></tr></thead>`;
+  const body = rows.map((m, i) => {
+    const cv = m.child_value;
+    const tension = cv == null ? null : cv - p.policy.moves[0].child_value;
+    return `<tr data-i="${i}" class="${p.played_san && m.san === p.played_san ? "played" : ""}">
+      <td class="num" style="color:var(--ink-3)">${i + 1}</td>
+      <td class="san">${m.san}</td>
+      <td><div class="bar"><i style="width:${Math.max(1.5, 100 * m.prob)}%"></i></div></td>
+      <td class="num">${(100 * m.prob).toFixed(1)}</td>
+      <td class="num"><span class="chip" style="color:${cv == null ? "var(--ink-3)" : cv >= 0 ? "var(--pos)" : "var(--neg)"}">${cv == null ? "—" : fmt(cv, 3)}</span></td>
+      <td class="num" style="color:${tension > 0.05 ? "var(--pos)" : "var(--ink-3)"}">${tension == null ? "" : (tension > 0 ? "+" : "") + tension.toFixed(3)}</td>
+      ${hasCmp ? `<td class="num" style="color:var(--ink-3)">${m.compare_prob == null ? "—" : (100 * m.compare_prob).toFixed(1)}</td>` : ""}
+      <td class="num" style="color:var(--ink-3)">${sqName(m.from)}→${sqName(m.to)}</td>
+    </tr>`;
+  }).join("");
+  const t = document.getElementById("moves");
+  t.innerHTML = head + "<tbody>" + body + "</tbody>";
+  t.querySelectorAll("tbody tr").forEach((tr) => {
+    tr.addEventListener("mouseenter", () => { state.hoverMove = +tr.dataset.i; paintArrows(p); });
+    tr.addEventListener("mouseleave", () => { state.hoverMove = null; paintArrows(p); });
+    tr.addEventListener("click", () => { state.square = +p.policy.moves[+tr.dataset.i].from; render(); });
+  });
+  document.getElementById("moves-note").textContent =
+    `${p.policy.n_moves} legal · ${pct(p.policy.legal_mass)} of the raw 64×73 softmax is legal` +
+    (rows.length < p.policy.n_moves ? ` · top ${rows.length} shown` : "");
+}
+
+/* ── depth chart ───────────────────────────────────────── */
+function paintDepth(p) {
+  const d = p.depth;
+  if (!d) return;
+  const W = 720, Ht = 260, m = { l: 44, r: 16, t: 16, b: 54 };
+  const iw = W - m.l - m.r, ih = Ht - m.t - m.b;
+  const vals = d.value_by_layer;
+  const lim = Math.max(0.15, ...vals.map((v) => Math.abs(v)), Math.abs(p.value)) * 1.15;
+  const x = (i) => m.l + (iw * i) / Math.max(1, vals.length - 1);
+  const y = (v) => m.t + ih * (1 - (v + lim) / (2 * lim));
+
+  let g = `<g class="grid">`;
+  [-lim, -lim / 2, 0, lim / 2, lim].forEach((v) => { g += `<line x1="${m.l}" y1="${y(v).toFixed(1)}" x2="${W - m.r}" y2="${y(v).toFixed(1)}"/>`; });
+  g += `</g><line class="zero" x1="${m.l}" y1="${y(0)}" x2="${W - m.r}" y2="${y(0)}"/>`;
+  g += `<g class="axis">` + [-lim, 0, lim].map((v) => `<text x="${m.l - 8}" y="${y(v) + 3}" text-anchor="end">${v.toFixed(2)}</text>`).join("") + `</g>`;
+
+  const path = vals.map((v, i) => `${i ? "L" : "M"} ${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(" ");
+  const area = `${path} L ${x(vals.length - 1).toFixed(1)} ${y(0)} L ${m.l} ${y(0)} Z`;
+  g += `<path d="${area}" fill="${css("--pos")}" opacity=".12"/>`;
+  g += `<path class="vline" d="${path}" stroke="${css("--pos")}"/>`;
+  g += `<circle cx="${x(vals.length - 1)}" cy="${y(vals[vals.length - 1])}" r="4.5" fill="${css("--pos")}"/>`;
+  g += `<text x="${x(vals.length - 1) - 8}" y="${y(vals[vals.length - 1]) - 10}" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="${css("--ink")}">${fmt(p.value, 3)}</text>`;
+
+  // Agreement strip: does the logit lens at this layer already pick the final move?
+  const sy = m.t + ih + 16;
+  d.top_by_layer.forEach((t, i) => {
+    const w = Math.max(6, iw / vals.length - 3);
+    g += `<rect x="${(x(i) - w / 2).toFixed(1)}" y="${sy}" width="${w.toFixed(1)}" height="10" rx="3"
+      fill="${t.agrees ? css("--accent") : css("--line-strong")}" opacity="${t.agrees ? 0.9 : 0.6}"/>`;
+    g += `<rect class="hitbox" data-i="${i}" x="${(x(i) - w / 2 - 2).toFixed(1)}" y="${m.t}" width="${(w + 4).toFixed(1)}" height="${ih + 30}" fill="transparent"/>`;
+  });
+  g += `<g class="axis">` + vals.map((_, i) =>
+    (i % 2 === 0 || i === vals.length - 1) ? `<text x="${x(i)}" y="${sy + 26}" text-anchor="middle">${i + 1}</text>` : "").join("") + `</g>`;
+  g += `<text class="axis" x="${m.l}" y="${Ht - 4}" font-family="JetBrains Mono, monospace" font-size="9" fill="${css("--ink-3")}">layer → · value read from each layer (line), lens already picks the final move (gold)</text>`;
+
+  const svg = document.getElementById("depthchart");
+  svg.innerHTML = g;
+  svg.querySelectorAll(".hitbox").forEach((r) => {
+    r.addEventListener("mousemove", (e) => {
+      const i = +r.dataset.i, t = d.top_by_layer[i];
+      showTip(e, `layer ${i + 1}<br>value ${fmt(vals[i], 3)}<br>lens top: ${t.san} ${pct(t.prob)}<br>final move here: ${pct(t.final_move_prob)}<br>write norm ${d.residual_write_norm[i].toFixed(1)}`);
+    });
+    r.addEventListener("mouseleave", hideTip);
+  });
+
+  const firstAgree = d.top_by_layer.findIndex((t, i) => d.top_by_layer.slice(i).every((u) => u.agrees));
+  document.getElementById("depth-note").textContent =
+    firstAgree >= 0 ? `final move locked in from layer ${firstAgree + 1} of ${L}` : "the final move is never stable across layers";
+}
+
+const tipEl = document.getElementById("tip");
+function showTip(e, html) {
+  tipEl.innerHTML = html; tipEl.classList.add("on");
+  const r = tipEl.getBoundingClientRect();
+  tipEl.style.left = Math.min(window.innerWidth - r.width - 10, e.clientX + 14) + "px";
+  tipEl.style.top = Math.max(8, e.clientY - r.height - 12) + "px";
+}
+function hideTip() { tipEl.classList.remove("on"); }
+
+/* ── attention explorer ────────────────────────────────── */
+function paintHeatmap(rec) {
+  const cv = document.getElementById("heatmap");
+  const ctx = cv.getContext("2d");
+  if (!rec) { ctx.clearRect(0, 0, T, T); return; }
+  const img = ctx.createImageData(T, T);
+  const get = (i, j) => (state.head < 0 ? headMeanAt(rec, state.layer, i, j) : attnAt(rec, state.layer, state.head, i, j));
+  let max = 0;
+  const buf = new Float64Array(T * T);
+  for (let i = 0; i < T; i++) for (let j = 0; j < T; j++) { const v = get(i, j); buf[i * T + j] = v; if (v > max) max = v; }
+  for (let i = 0; i < T; i++) for (let j = 0; j < T; j++) {
+    const c = seqColor(buf[i * T + j] / (max || 1));
+    const o = (i * T + j) * 4;
+    img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  document.getElementById("attn-max").textContent = max.toFixed(3);
+  document.getElementById("attn-ramp").style.background =
+    `linear-gradient(90deg,${[0, .25, .5, .75, 1].map((t) => rgb(seqColor(t))).join(",")})`;
+}
+
+function paintHeads(rec) {
+  const wrap = document.getElementById("heads");
+  wrap.innerHTML = "";
+  document.getElementById("hl-layer").textContent = state.layer + 1;
+  if (!rec) return;
+  const opts = [{ h: -1, name: "mean" }].concat(Array.from({ length: H }, (_, h) => ({ h, name: "h" + h })));
+  opts.forEach(({ h, name }) => {
+    const fig = document.createElement("figure");
+    fig.className = "headcell"; fig.style.margin = "0";
+    fig.setAttribute("aria-pressed", state.head === h);
+    const cv = document.createElement("canvas");
+    cv.width = T; cv.height = T;
+    const ctx = cv.getContext("2d");
+    const img = ctx.createImageData(T, T);
+    let max = 0; const buf = new Float64Array(T * T);
+    for (let i = 0; i < T; i++) for (let j = 0; j < T; j++) {
+      const v = h < 0 ? headMeanAt(rec, state.layer, i, j) : attnAt(rec, state.layer, h, i, j);
+      buf[i * T + j] = v; if (v > max) max = v;
+    }
+    for (let i = 0; i < T * T; i++) {
+      const c = seqColor(buf[i] / (max || 1)), o = i * 4;
+      img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    fig.appendChild(cv);
+    const cap = document.createElement("figcaption");
+    cap.textContent = name;
+    fig.appendChild(cap);
+    fig.addEventListener("click", () => { state.head = h; render(); });
+    wrap.appendChild(fig);
+  });
+}
+
+function paintBias() {
+  const row = document.getElementById("biasrow");
+  const names = META.relation_names || [];
+  const bias = META.relation_bias;
+  document.getElementById("hb-head").textContent = state.head < 0 ? "mean" : state.head;
+  if (!bias) { row.innerHTML = ""; return; }
+  const vals = state.head < 0
+    ? names.map((_, k) => bias[state.layer].reduce((s, h) => s + h[k], 0) / H)
+    : bias[state.layer][state.head];
+  const max = Math.max(...vals.map(Math.abs), 1e-6);
+  row.innerHTML = vals.map((v, k) => `
+    <div title="${names[k]}: ${fmt(v, 3)}">
+      <div class="cell" style="background:${rgb(divColor(v / max), Math.min(0.9, 0.15 + Math.abs(v / max)))}"></div>
+      ${names[k]}<br><span style="color:var(--ink-2)">${v.toFixed(2)}</span>
+    </div>`).join("");
+}
+
+/* ── position strip, header ────────────────────────────── */
+function paintStrip() {
+  const strip = document.getElementById("strip");
+  if (POS.length < 2) { strip.style.display = "none"; return; }
+  strip.innerHTML = POS.map((p, i) => {
+    const label = p.ply != null ? `${Math.floor(p.ply / 2) + 1}${p.ply % 2 === 0 ? "." : "…"} ${p.played_san || "—"}` : `#${i + 1}`;
+    return `<button class="ply" data-i="${i}" aria-current="${i === state.pos}">${label}</button>`;
+  }).join("");
+  strip.querySelectorAll(".ply").forEach((b) =>
+    b.addEventListener("click", () => { state.pos = +b.dataset.i; state.square = null; render(); }));
+}
+
+function paintHeader() {
+  document.getElementById("title").textContent = META.title || "Glass Box";
+  const bits = [
+    ["model", (META.model_dir || "").split("/").pop() + (META.ema ? " (EMA)" : "")],
+    ["shape", `${META.n_layers}L · ${META.n_heads}H · d${META.config ? META.config.embed_dim : "?"}`],
+    META.compare_dir ? ["vs", META.compare_dir.split("/").pop()] : null,
+    ["attn check", "Δ " + Number(META.attention_check).toExponential(1)],
+    ["generated", META.generated],
+  ].filter(Boolean);
+  document.getElementById("meta").innerHTML = bits.map(([k, v]) => `<span>${k} <b>${v}</b></span>`).join("");
+  document.getElementById("repro").textContent =
+    `python scripts/introspect_model.py --model-dir ${META.model_dir} --fen "<fen>" --out out/think.html`;
+}
+
+/* ── render ────────────────────────────────────────────── */
+let renderToken = 0;
+async function render() {
+  const p = POS[state.pos];
+  const my = ++renderToken;
+  paintStrip();
+  paintTiles(p);
+  paintMoves(p);
+  paintDepth(p);
+  paintBias();
+  document.getElementById("fen").textContent = p.fen;
+  document.getElementById("layer-val").textContent = `${state.layer + 1}/${L}`;
+  document.getElementById("overlay-hint").textContent =
+    (MODES.find((m) => m.id === state.mode) || {}).hint +
+    (state.square !== null ? `  ·  selected: ${sqName(state.square)}` : "");
+  modesEl.querySelectorAll(".mode").forEach((b) => b.setAttribute("aria-pressed", b.dataset.mode === state.mode));
+  document.getElementById("head").value = String(state.head);
+  document.getElementById("attnmode").value = state.attnMode;
+
+  let rec = null;
+  if (p.attention) {
+    const status = document.getElementById("attn-status");
+    if (!attnCache.has(state.pos)) status.textContent = "decoding…";
+    try { rec = await getAttn(state.pos); status.textContent = ""; }
+    catch (e) { status.textContent = "attention unavailable: " + e.message; }
+  } else {
+    document.getElementById("attn-panel").style.display = "none";
+  }
+  if (my !== renderToken) return;
+  paintBoard(p, rec);
+  paintArrows(p);
+  paintHeatmap(rec);
+  paintHeads(rec);
+}
+
+/* ── controls ──────────────────────────────────────────── */
+const layerEl = document.getElementById("layer");
+layerEl.max = String(L - 1); layerEl.value = String(state.layer);
+layerEl.addEventListener("input", () => { state.layer = +layerEl.value; render(); });
+
+const headEl = document.getElementById("head");
+headEl.innerHTML = `<option value="-1">mean of ${H}</option>` +
+  Array.from({ length: H }, (_, h) => `<option value="${h}">head ${h}</option>`).join("");
+headEl.addEventListener("change", () => { state.head = +headEl.value; render(); });
+
+document.getElementById("attnmode").addEventListener("change", (e) => { state.attnMode = e.target.value; render(); });
+
+document.getElementById("heatmap").addEventListener("click", async (e) => {
+  const r = e.target.getBoundingClientRect();
+  const j = Math.floor(((e.clientX - r.left) / r.width) * T);
+  const i = Math.floor(((e.clientY - r.top) / r.height) * T);
+  state.square = state.attnMode === "row" ? i : j;
+  if (state.square > 63) state.square = null;
+  state.mode = "attention";
+  render();
+});
+document.getElementById("heatmap").addEventListener("mousemove", async (e) => {
+  const rec = attnCache.get(state.pos);
+  if (!rec) return;
+  const r = e.target.getBoundingClientRect();
+  const j = Math.floor(((e.clientX - r.left) / r.width) * T);
+  const i = Math.floor(((e.clientY - r.top) / r.height) * T);
+  if (i < 0 || j < 0 || i >= T || j >= T) return hideTip();
+  const v = state.head < 0 ? headMeanAt(rec, state.layer, i, j) : attnAt(rec, state.layer, state.head, i, j);
+  showTip(e, `${sqName(i)} → ${sqName(j)}<br>${v.toFixed(4)}`);
+});
+document.getElementById("heatmap").addEventListener("mouseleave", hideTip);
+
+window.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+  const k = e.key;
+  if (k === "ArrowRight" && state.pos < POS.length - 1) { state.pos++; state.square = null; render(); }
+  else if (k === "ArrowLeft" && state.pos > 0) { state.pos--; state.square = null; render(); }
+  else if (k === "ArrowUp" && state.layer < L - 1) { state.layer++; layerEl.value = state.layer; render(); }
+  else if (k === "ArrowDown" && state.layer > 0) { state.layer--; layerEl.value = state.layer; render(); }
+  else if (k === "]" && state.head < H - 1) { state.head++; render(); }
+  else if (k === "[" && state.head >= 0) { state.head--; render(); }
+  else return;
+  e.preventDefault();
+});
+
+paintHeader();
+render();
+</script>

@@ -236,3 +236,36 @@ hf_space/space_build/
 
 # Maia weights (downloaded by maia2 on first use)
 maia2_models/
+
+# Local agent / editor state
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.vscode/
+
+# Generated knowledge graph (rebuild with `graphify update .`)
+graphify-out/
+rust/graphify-out/
+
+# Rust CUDA build tree (the generic `target/` rule above does not cover it)
+rust/target-cuda/
+
+# Experiment run directories: ablations, value-head sweeps, RL runs.
+# The shipped checkpoints (data/models/pos2move_v2*/, V2_model/) stay tracked.
+data/models/pos2move_v2.1-*/
+data/models/v2.1-*/
+
+# ONNX exports (regenerate with scripts/export_onnx.py)
+data/models/**/model.onnx
+data/models/**/model_ema.onnx
+data/models/**/model_ema.int8.onnx
+
+# Generated eval / self-play / reward / opening-book data
+data/eval/
+data/selfplay/
+data/rewards/
+data/openings/
+data/lichess_puzzles.csv.zst
+
+# Paper (LaTeX source, figures, and build output) is kept out of the repo
+paper/

@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import selfplay_core
 from engine_match import OPENINGS
 
-from train_value_head import load_model
+from grpo_puzzles import load_model
 
 _BUCKETS = (32, 64, 128, 256, 512, 1024)
 
