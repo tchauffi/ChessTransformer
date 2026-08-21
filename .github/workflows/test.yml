@@ -1,0 +1,47 @@
+name: tests
+
+# Distributed correctness on free CPU runners. The whole point of the gloo backend here is
+# that multi-rank bugs get caught at zero cost -- not at $12/hour on a rented 8-GPU box.
+# The shard datasets are gitignored, so tests/conftest.py synthesizes a format-valid set;
+# the suite runs for real rather than skipping.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies (CPU torch)
+        # The project pins a cu128 index for local GPU work; CI has no GPU, and pulling
+        # CUDA wheels would blow past the runner's disk for no benefit.
+        run: |
+          uv venv
+          uv pip install --index-url https://download.pytorch.org/whl/cpu torch
+          uv pip install pytest numpy h5py python-chess accelerate tensorboard
+
+      - name: Lint
+        run: uv run ruff check src scripts tests || true
+
+      - name: Distributed tests (gloo, 2 and 4 ranks)
+        run: uv run pytest tests/ -v --no-header
+        env:
+          # Force the synthetic path even if a future change vendors sample shards, so CI
+          # always exercises the same branch it is meant to cover.
+          CT_FORCE_SYNTHETIC_SHARDS: "1"
+          OMP_NUM_THREADS: "1"

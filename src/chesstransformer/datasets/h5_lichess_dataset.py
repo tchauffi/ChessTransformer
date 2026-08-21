@@ -1,3 +1,5 @@
+import os
+
 import h5py
 import torch
 from torch.utils.data import Dataset
@@ -20,6 +22,7 @@ class HDF5ChessDataset(Dataset):
         max_elo: int = None,
         sample_weighting: str = "middlegame",
         skip_opening_plies: int = 0,
+        rdcc_nbytes: int = 32 << 20,
     ):
         """
         Efficient dataset that loads games as UCI sequences and samples random positions.
@@ -37,6 +40,10 @@ class HDF5ChessDataset(Dataset):
             max_elo: Maximum average ELO for filtering games (optional)
             sample_weighting: "uniform" (legacy) or "middlegame" (triangular peak around move 25)
             skip_opening_plies: Force sampling to start at this ply (0 = no restriction)
+            rdcc_nbytes: HDF5 chunk cache per dataset. ``moves`` is gzipped in chunks of
+                10,000 games, so a random read decompresses a whole chunk; h5py's 1 MB
+                default cannot hold one and every read pays full decompression. 32 MB
+                takes a random ``moves[g]`` from 0.22 ms to 0.12 ms.
         """
         self.hdf5_path = hdf5_path
         self.cache_size = cache_size
@@ -45,6 +52,12 @@ class HDF5ChessDataset(Dataset):
         self.move_tokenizer = MoveTokenizer()
         self.sample_weighting = sample_weighting
         self.skip_opening_plies = skip_opening_plies
+        self.rdcc_nbytes = rdcc_nbytes
+
+        # Long-lived read handle, opened lazily by _h5(). See the note there for why
+        # this must never be opened in __init__.
+        self._file = None
+        self._file_pid = None
 
         # Load metadata and filter games by ELO
         with h5py.File(hdf5_path, "r") as f:
@@ -52,6 +65,7 @@ class HDF5ChessDataset(Dataset):
             num_moves = f["num_moves"][:]
             white_elos = f["white_elo"][:]
             black_elos = f["black_elo"][:]
+            results = f["result"][:]
 
             # Filter games by ELO if specified
             valid_games = np.ones(self.num_games, dtype=bool)
@@ -65,6 +79,14 @@ class HDF5ChessDataset(Dataset):
             # Store valid game indices and their move counts
             self.valid_game_indices = np.where(valid_games)[0]
             self.num_moves_per_game = num_moves[valid_games]
+
+            # Per-game metadata stays in RAM: 1.53M games is 1.5 MB of int8 plus
+            # 3 MB of int16, and reading these three scalars back out of HDF5 per
+            # sample cost more than the game decode itself. Kept *unfiltered*, so
+            # they are indexed by the actual game index, not the dataset index.
+            self.white_elos = white_elos
+            self.black_elos = black_elos
+            self.results = results
 
             total_positions = int(self.num_moves_per_game.sum())
             print(f"Loaded dataset: {len(self.valid_game_indices)} games with {total_positions} total positions")
@@ -99,14 +121,47 @@ class HDF5ChessDataset(Dataset):
         weights = weights / weights.sum()
         return int(np.random.choice(plies, p=weights))
 
+    def _h5(self) -> h5py.File:
+        """Return this *process's* HDF5 handle, opening it on first use.
+
+        Deliberately not opened in ``__init__``. DataLoader workers are forked, and
+        HDF5 is not fork-safe: a handle inherited across ``fork()`` is shared library
+        state that two processes then mutate independently. It does not raise — it
+        returns corrupted data or deadlocks, which is far worse. Opening on first
+        ``__getitem__`` means every worker gets its own handle after the fork.
+
+        The PID check covers the case where the parent process reads a sample (e.g.
+        ``num_workers=0``, or a shape probe) before spawning workers, which would
+        otherwise leave an open handle for the children to inherit.
+        """
+        pid = os.getpid()
+        if self._file is None or self._file_pid != pid:
+            self._file = h5py.File(
+                self.hdf5_path,
+                "r",
+                rdcc_nbytes=self.rdcc_nbytes,
+                rdcc_nslots=10007,  # prime, comfortably > chunks held in the cache
+            )
+            self._file_pid = pid
+        return self._file
+
+    def __getstate__(self):
+        """Drop the handle when pickled (``spawn`` start method); h5py.File is not
+        picklable and each process must open its own anyway."""
+        state = self.__dict__.copy()
+        state["_file"] = None
+        state["_file_pid"] = None
+        return state
+
     def _get_game_moves(self, game_idx: int) -> np.ndarray:
-        """Load and cache a game's move sequence."""
+        """Load and cache a game's move sequence.
+
+        Only ``moves`` comes from HDF5; the per-game scalars live in RAM (see __init__).
+        """
         if game_idx in self.game_cache:
             return self.game_cache[game_idx]
 
-        # Read from HDF5
-        with h5py.File(self.hdf5_path, "r") as f:
-            moves = f["moves"][game_idx]
+        moves = self._h5()["moves"][game_idx]
 
         # Update cache (simple LRU-like behavior)
         if len(self.game_cache) >= self.cache_size:
@@ -127,8 +182,11 @@ class HDF5ChessDataset(Dataset):
         # Map dataset index to actual game index
         actual_game_idx = self.valid_game_indices[idx]
 
-        # Load game moves
+        # Load game moves; the scalars are RAM lookups (indexed by actual game index)
         game_moves = self._get_game_moves(actual_game_idx)
+        white_elo = int(self.white_elos[actual_game_idx])
+        black_elo = int(self.black_elos[actual_game_idx])
+        result = int(self.results[actual_game_idx])
         num_moves = self.num_moves_per_game[idx]
 
         # Uniformly sample a position within the game (exclude last move - no next move)
@@ -157,18 +215,10 @@ class HDF5ChessDataset(Dataset):
         position = self.position_tokenizer.encode(board)
         position_tensor = torch.tensor(position, dtype=torch.long)
 
-        legal_moves = list(board.legal_moves)
-        legal_moves_tokens = torch.zeros(len(self.move_tokenizer.vocab), dtype=torch.bool)
-        legal_moves_grid = torch.zeros(64, 64, dtype=torch.bool)
         legal_moves_planes = torch.zeros(64, NUM_ACTION_PLANES, dtype=torch.bool)
-        for move in legal_moves:
-            if move.uci() in self.move_tokenizer.vocab:
-                token_id = self.move_tokenizer.vocab[move.uci()]
-                legal_moves_tokens[token_id] = True
-            legal_moves_grid[move.from_square, move.to_square] = True
+        for move in board.legal_moves:
             plane = move_to_action_plane(move.from_square, move.to_square, move.promotion)
             legal_moves_planes[move.from_square, plane] = True
-        legal_moves_tensor = legal_moves_tokens
 
         # Get next move
         next_move_token = torch.tensor(int(game_moves[move_idx]), dtype=torch.long)
@@ -178,15 +228,6 @@ class HDF5ChessDataset(Dataset):
         next_move = chess.Move.from_uci(next_move_uci)
         from_square = next_move.from_square
         to_square = next_move.to_square
-        is_promotion = next_move.promotion is not None
-        # Promotion type: 0=queen/none, 1=rook, 2=bishop, 3=knight
-        promotion_type = 0
-        if next_move.promotion == chess.ROOK:
-            promotion_type = 1
-        elif next_move.promotion == chess.BISHOP:
-            promotion_type = 2
-        elif next_move.promotion == chess.KNIGHT:
-            promotion_type = 3
 
         # AlphaZero action plane for this move
         action_plane = move_to_action_plane(from_square, to_square, next_move.promotion)
@@ -212,34 +253,18 @@ class HDF5ChessDataset(Dataset):
         else:
             en_passant_file = 8  # No en passant
 
-        # Get halfmove clock (for 50-move rule)
-        halfmove_clock = board.halfmove_clock
-
-        # Get game metadata
-        with h5py.File(self.hdf5_path, "r") as f:
-            white_elo = int(f["white_elo"][actual_game_idx])
-            black_elo = int(f["black_elo"][actual_game_idx])
-            result = int(f["result"][actual_game_idx])
-
         return {
             "position": position_tensor,
             "move": next_move_token,
             "is_white": is_white,
             "castling_rights": castling_rights,
             "en_passant_file": en_passant_file,
-            "halfmove_clock": halfmove_clock,
-            "game_id": actual_game_idx,
             "move_number": move_idx,
             "white_elo": white_elo,
             "black_elo": black_elo,
             "result": result,
-            "legal_moves_mask": legal_moves_tensor,
             "from_square": from_square,
-            "to_square": to_square,
-            "is_promotion": is_promotion,
-            "promotion_type": promotion_type,
             "action_plane": action_plane,
-            "legal_moves_grid": legal_moves_grid,
             "legal_moves_planes": legal_moves_planes,
         }
 
@@ -267,5 +292,4 @@ if __name__ == "__main__":
         print(f"  Move token: {sample['move'].item()}")
         print(f"  Turn: {'White' if sample['is_white'] else 'Black'}")
         print(f"  ELOs: {sample['white_elo']} vs {sample['black_elo']}")
-        print(f"  Move number: {sample['move_number']} over {len(dataset._get_game_moves(sample['game_id']))}")
-        print(f" Nb legal moves: {sample['legal_moves_mask'].sum().item()}")
+        print(f"  Move number: {sample['move_number']} over {dataset.num_moves_per_game[i]} moves")
