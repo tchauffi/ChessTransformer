@@ -267,8 +267,5 @@ data/rewards/
 data/openings/
 data/lichess_puzzles.csv.zst
 
-# LaTeX build artifacts (paper/main.log is covered by *.log above)
-paper/*.aux
-paper/*.fdb_latexmk
-paper/*.fls
-paper/*.out
+# Paper (LaTeX source, figures, and build output) is kept out of the repo
+paper/
