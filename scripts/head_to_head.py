@@ -132,6 +132,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bot", default="rust/target/release/ct-bot")
+    p.add_argument("--bot-a", default=None,
+                   help="ct-bot binary for side A (default --bot). Point A and B at two builds "
+                        "to gate a search change with the model held fixed.")
+    p.add_argument("--bot-b", default=None, help="ct-bot binary for side B (default --bot)")
     p.add_argument("--model-a", default=BASE, help="ONNX model for side A")
     p.add_argument("--model-b", default=BASE, help="ONNX model for side B")
     p.add_argument("--nodes-a", type=int, default=3600, help="MCTS node budget, side A")
@@ -164,6 +168,9 @@ def parse_args() -> argparse.Namespace:
                        help=f"first-play-urgency penalty for side {side.upper()} (default 0.2)")
         p.add_argument(f"--prior-temp-{side}", type=float, default=None,
                        help=f"policy-prior softmax temperature for side {side.upper()} (default 1.0)")
+        p.add_argument(f"--syzygy-{side}", default=None,
+                       help=f"Syzygy tablebase dir(s) for side {side.upper()}, ':'-separated "
+                            "(default: none)")
     p.add_argument("--sim-batch", type=int, default=None,
                    help="leaves per NN wave (ct-bot default 16). Larger batches feed the GPU "
                         "better but change search behaviour -- more collisions per wave -- so "
@@ -183,25 +190,28 @@ def main() -> None:
     if args.sim_batch is not None:
         common += ["--sim-batch", str(args.sim_batch)]
 
-    def search_flags(cpuct, fpu, prior_temp):
+    def search_flags(cpuct, fpu, prior_temp, syzygy):
         """Per-side PUCT knobs, so a tuned config can be matched against an untuned one."""
         out = []
-        for flag, val in (("--c-puct", cpuct), ("--fpu", fpu), ("--prior-temp", prior_temp)):
+        for flag, val in (("--c-puct", cpuct), ("--fpu", fpu), ("--prior-temp", prior_temp),
+                          ("--syzygy-path", syzygy)):
             if val is not None:
                 out += [flag, str(val)]
         return out
 
-    A = (la, [args.bot, "uci", "--model", args.model_a, *common,
-              *search_flags(args.cpuct_a, args.fpu_a, args.prior_temp_a)], args.nodes_a)
-    B = (lb, [args.bot, "uci", "--model", args.model_b, *common,
-              *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b)], args.nodes_b)
+    A = (la, [args.bot_a or args.bot, "uci", "--model", args.model_a, *common,
+              *search_flags(args.cpuct_a, args.fpu_a, args.prior_temp_a, args.syzygy_a)],
+         args.nodes_a)
+    B = (lb, [args.bot_b or args.bot, "uci", "--model", args.model_b, *common,
+              *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b, args.syzygy_b)],
+         args.nodes_b)
     book = OPENINGS[: args.openings]
 
     jobs = [(op, a_white) for op in book for a_white in (True, False)]
     workers = max(1, min(args.workers, len(jobs)))
 
-    print(f"{la}: {args.model_a} @ {args.nodes_a} nodes")
-    print(f"{lb}: {args.model_b} @ {args.nodes_b} nodes")
+    print(f"{la}: {args.bot_a or args.bot} {args.model_a} @ {args.nodes_a} nodes")
+    print(f"{lb}: {args.bot_b or args.bot} {args.model_b} @ {args.nodes_b} nodes")
     print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)\n", flush=True)
 
     lock = threading.Lock()
