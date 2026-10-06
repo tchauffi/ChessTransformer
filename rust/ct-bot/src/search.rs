@@ -1,22 +1,26 @@
 //! Single-game batched MCTS over one position — semantics mirror
 //! `Pos2MoveV2MctsBot` / `selfplay-core::Engine`: PUCT + FPU, virtual-loss
 //! leaf waves with one batched NN forward per wave, zobrist TT for priors +
-//! value, threefold/50-move awareness over game history + search path, and
+//! value, threefold/50-move awareness over game history + search path
+//! (plus Lc0's two-fold rule for cycles inside the search), and
 //! tree reuse across moves (re-root when the new position extends the
 //! previous root by 1..=4 expanded plies).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chess_core::encoding::{
-    action_plane, encode_position, halfmove, move_coords, terminal_value, zobrist, NUM_PLANES,
+    action_plane, encode_position, halfmove, move_coords, search_terminal_value, zobrist,
+    NUM_PLANES,
 };
 use chess_core::tree::{backup_vl, puct_select, softmax_priors, Node};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use shakmaty::{Chess, Move, Position};
+use shakmaty_syzygy::{AmbiguousWdl, Tablebase, Wdl};
 
 use crate::nn::{EvalRequest, Evaluator};
 
@@ -30,6 +34,12 @@ pub struct SearchParams {
     pub move_temp: f64,
     pub move_temp_plies: u32,
     pub tt_cap: usize,
+    /// Syzygy tables. In-tree, positions reached by a capture or pawn move
+    /// that the tables cover are scored exactly (WDL) instead of by the value
+    /// head. At a covered root, a won position plays the DTZ-optimal move
+    /// outright and a drawn/lost one restricts the search to result-preserving
+    /// moves (root probing needs the DTZ tables too).
+    pub syzygy: Option<Arc<Tablebase<Chess>>>,
 }
 
 impl Default for SearchParams {
@@ -42,6 +52,7 @@ impl Default for SearchParams {
             move_temp: 0.0,
             move_temp_plies: 0,
             tt_cap: 2_000_000,
+            syzygy: None,
         }
     }
 }
@@ -53,7 +64,19 @@ pub struct SearchResult {
     pub sims: u32,
     pub nn_evals: u32,
     pub tt_hits: u32,
+    /// Tablebase-scored leaves (or 1 when the root move came from the tables).
+    pub tb_hits: u32,
     pub elapsed: Duration,
+}
+
+/// What the tablebases say about the root.
+enum RootTb {
+    /// Not covered (or no tables, or a probe failed): search normally.
+    Off,
+    /// Won: play the DTZ-optimal move without searching.
+    Play(Move),
+    /// Drawn or lost: search only among the moves that keep the best result.
+    Restrict(Vec<Move>),
 }
 
 enum LeafEval {
@@ -174,15 +197,35 @@ impl<E: Evaluator> Search<E> {
         let t0 = Instant::now();
         let mut nn_evals = 0u32;
         let mut tt_hits = 0u32;
+        let mut tb_hits = 0u32;
         let mut sims_done = 0u32;
+
+        let restrict = match self.root_tablebase() {
+            RootTb::Play(best) => {
+                return Ok(SearchResult {
+                    best,
+                    value: 1.0,
+                    sims: 0,
+                    nn_evals: 0,
+                    tt_hits: 0,
+                    tb_hits: 1,
+                    elapsed: t0.elapsed(),
+                });
+            }
+            RootTb::Restrict(keep) => {
+                self.tree = vec![Node::default()]; // a reused root has every move
+                Some(keep)
+            }
+            RootTb::Off => None,
+        };
 
         if !self.tree[0].expanded {
             let key = *self.history.last().unwrap();
             let moves: Vec<Move> = self.pos.legal_moves().to_vec();
             assert!(!moves.is_empty(), "go() on a terminal position");
-            if let Some((priors, _)) = self.tt.get(&key).cloned() {
+            let priors = if let Some((priors, _)) = self.tt.get(&key).cloned() {
                 tt_hits += 1;
-                self.tree[0].expand(moves, priors);
+                priors
             } else {
                 let (tokens, player, castling, ep) = encode_position(&self.pos);
                 let out = self
@@ -192,8 +235,13 @@ impl<E: Evaluator> Search<E> {
                 nn_evals += 1;
                 let priors = priors_for(&moves, &out.logits, self.params.prior_temp);
                 self.insert_tt(key, priors.clone(), out.value);
-                self.tree[0].expand(moves, priors);
-            }
+                priors
+            };
+            let (moves, priors) = match &restrict {
+                Some(keep) => restrict_moves(moves, priors, keep),
+                None => (moves, priors),
+            };
+            self.tree[0].expand(moves, priors);
         }
 
         while sims_done < sims {
@@ -207,9 +255,16 @@ impl<E: Evaluator> Search<E> {
                 let key = zobrist(&pos);
                 let mut all_keys = self.history.clone();
                 all_keys.extend_from_slice(&path_keys);
-                if let Some(t) = terminal_value(&pos, &all_keys, key) {
+                let root_idx = self.history.len() - 1;
+                if let Some(t) = search_terminal_value(&pos, &all_keys, key, root_idx) {
                     backup_vl(&mut self.tree, &path, t);
                     sims_done += 1;
+                    continue;
+                }
+                if let Some(t) = self.leaf_tablebase(&pos) {
+                    backup_vl(&mut self.tree, &path, t);
+                    sims_done += 1;
+                    tb_hits += 1;
                     continue;
                 }
                 let moves: Vec<Move> = pos.legal_moves().to_vec();
@@ -310,8 +365,67 @@ impl<E: Evaluator> Search<E> {
             sims: sims_done,
             nn_evals,
             tt_hits,
+            tb_hits,
             elapsed: t0.elapsed(),
         })
+    }
+
+    /// Exact WDL for a leaf the tables cover, from its side-to-move POV. Only
+    /// probed straight after a capture or pawn move (halfmove clock 0), where
+    /// WDL is exact under the 50-move rule; cursed wins and blessed losses
+    /// score as the draws they are.
+    fn leaf_tablebase(&self, pos: &Chess) -> Option<f32> {
+        let tb = self.params.syzygy.as_ref()?;
+        if pos.halfmoves() != 0 || pos.board().occupied().count() > tb.max_pieces() {
+            return None;
+        }
+        Some(match tb.probe_wdl_after_zeroing(pos).ok()? {
+            Wdl::Win => 1.0,
+            Wdl::Loss => -1.0,
+            Wdl::CursedWin | Wdl::Draw | Wdl::BlessedLoss => 0.0,
+        })
+    }
+
+    fn root_tablebase(&self) -> RootTb {
+        let Some(tb) = &self.params.syzygy else {
+            return RootTb::Off;
+        };
+        if self.pos.board().occupied().count() > tb.max_pieces() {
+            return RootTb::Off;
+        }
+        // Each move's result for us under the 50-move rule from the current
+        // clock: +1 win, 0 draw, -1 loss. Ambiguous (DTZ-rounded) verdicts are
+        // read pessimistically for us.
+        let moves = self.pos.legal_moves();
+        let mut verdicts = Vec::with_capacity(moves.len());
+        for m in &moves {
+            let mut after = self.pos.clone();
+            after.play_unchecked(m);
+            let v = match tb.probe_wdl(&after) {
+                Ok(AmbiguousWdl::Loss) => 1,
+                Ok(AmbiguousWdl::Win | AmbiguousWdl::MaybeWin) => -1,
+                Ok(_) => 0,
+                Err(_) => return RootTb::Off,
+            };
+            verdicts.push(v);
+        }
+        let Some(&best) = verdicts.iter().max() else {
+            return RootTb::Off;
+        };
+        if best == 1 {
+            return match tb.best_move(&self.pos) {
+                Ok(Some((m, _))) => RootTb::Play(m),
+                _ => RootTb::Off,
+            };
+        }
+        RootTb::Restrict(
+            moves
+                .iter()
+                .zip(&verdicts)
+                .filter(|&(_, &v)| v == best)
+                .map(|(m, _)| m.clone())
+                .collect(),
+        )
     }
 
     /// Virtual-loss descent to an unexpanded node; returns (leaf node index,
@@ -347,6 +461,40 @@ impl<E: Evaluator> Search<E> {
         }
     }
 
+    /// Root children as (move, visits, Q from the root side-to-move POV, prior),
+    /// most-visited first. Diagnostic only.
+    pub fn root_stats(&self) -> Vec<(Move, u32, f64, f32)> {
+        let root = &self.tree[0];
+        let mut out: Vec<_> = (0..root.moves.len())
+            .map(|i| {
+                let q = if root.n[i] > 0 { -root.w[i] / root.n[i] as f64 } else { f64::NAN };
+                (root.moves[i].clone(), root.n[i], q, root.priors[i])
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
+    }
+
+    /// Most-visited line from the root as (move, visits, Q from the mover's
+    /// POV). Diagnostic only.
+    pub fn pv(&self, max_len: usize) -> Vec<(Move, u32, f64)> {
+        let mut out = Vec::new();
+        let mut node = 0usize;
+        while out.len() < max_len && self.tree[node].expanded {
+            let nd = &self.tree[node];
+            let Some(i) = (0..nd.moves.len()).max_by_key(|&i| nd.n[i]) else { break };
+            if nd.n[i] == 0 {
+                break;
+            }
+            out.push((nd.moves[i].clone(), nd.n[i], -nd.w[i] / nd.n[i] as f64));
+            if nd.children[i] < 0 {
+                break;
+            }
+            node = nd.children[i] as usize;
+        }
+        out
+    }
+
     /// Raw value-head estimate for a position (side-to-move POV), no search.
     pub fn raw_value(&mut self, pos: &Chess) -> Result<f32> {
         let (tokens, player, castling, ep) = encode_position(pos);
@@ -375,6 +523,18 @@ fn priors_for(moves: &[Move], logits: &[f32], prior_temp: f32) -> Vec<f32> {
         .collect();
     softmax_priors(&mut scores, prior_temp);
     scores
+}
+
+/// Keep only `keep` (with their priors, renormalized) from a root expansion.
+fn restrict_moves(moves: Vec<Move>, priors: Vec<f32>, keep: &[Move]) -> (Vec<Move>, Vec<f32>) {
+    let (moves, mut priors): (Vec<Move>, Vec<f32>) =
+        moves.into_iter().zip(priors).filter(|(m, _)| keep.contains(m)).unzip();
+    let total: f32 = priors.iter().sum();
+    let k = priors.len() as f32;
+    for p in priors.iter_mut() {
+        *p = if total > 0.0 { *p / total } else { 1.0 / k };
+    }
+    (moves, priors)
 }
 
 /// Copy the subtree under `root` into a fresh arena with the root at index 0.
@@ -486,6 +646,158 @@ mod tests {
         // and the root value must be drawish, not a fantasy win.
         assert!(r.value.abs() < 0.5, "root value should be drawish, got {}", r.value);
         assert_eq!(r.sims, 128);
+    }
+
+    /// Value = material balance from the side to move's POV; policy = uniform
+    /// plus a bonus for checking moves. A crude stand-in for a real net, but
+    /// one that can tell winning from losing and looks at forcing moves first.
+    struct CheckingMaterialEval;
+
+    fn request_to_pos(r: &EvalRequest) -> Chess {
+        const CH: &[u8; 13] = b".PNBRQKpnbrqk";
+        let mut fen = String::new();
+        for rank in (0..8).rev() {
+            let mut empty = 0;
+            for file in 0..8 {
+                match r.tokens[rank * 8 + file] {
+                    0 => empty += 1,
+                    t => {
+                        if empty > 0 {
+                            fen.push_str(&empty.to_string());
+                            empty = 0;
+                        }
+                        fen.push(CH[t as usize] as char);
+                    }
+                }
+            }
+            if empty > 0 {
+                fen.push_str(&empty.to_string());
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
+        }
+        fen.push_str(if r.player == 1 { " w - - 0 1" } else { " b - - 0 1" });
+        pos(&fen)
+    }
+
+    impl Evaluator for CheckingMaterialEval {
+        fn eval_batch(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>> {
+            const VAL: [f32; 7] = [0.0, 1.0, 3.0, 3.0, 5.0, 9.0, 0.0];
+            Ok(batch
+                .iter()
+                .map(|r| {
+                    let white: f32 = r
+                        .tokens
+                        .iter()
+                        .map(|&t| match t {
+                            1..=6 => VAL[t as usize],
+                            7..=12 => -VAL[t as usize - 6],
+                            _ => 0.0,
+                        })
+                        .sum();
+                    let stm = if r.player == 1 { white } else { -white };
+                    let p = request_to_pos(r);
+                    let mut logits = vec![0.0; 64 * NUM_PLANES];
+                    for m in p.legal_moves() {
+                        let mut after = p.clone();
+                        after.play_unchecked(&m);
+                        if after.is_check() {
+                            let (f, t, pr) = move_coords(&m);
+                            logits[f * NUM_PLANES + action_plane(f, t, pr)] = 3.0;
+                        }
+                    }
+                    EvalOutput { logits, value: (stm / 3.0).tanh() }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn finds_perpetual_via_twofold() {
+        // Black is a queen and rook down; per Stockfish (d26) every move loses
+        // (-6.5 or worse) except Qf2+ Kh1 Qf1+ Kh2 Qf2+, a perpetual. With the
+        // two-fold rule that cycle scores as a draw 5 plies in; threefold-only
+        // needs 9, which this budget does not reach.
+        let p = pos("6k1/5ppp/R7/Q7/3q4/6PP/7K/8 b - - 0 1");
+        let mut s = Search::new(CheckingMaterialEval, SearchParams::default());
+        s.set_position(p, &[]);
+        let r = s.go(3000, None, &AtomicBool::new(false)).unwrap();
+        let best = r.best.to_uci(CastlingMode::Standard).to_string();
+        assert_eq!(best, "d4f2", "should take the perpetual (value {})", r.value);
+        assert!(r.value > -0.2, "perpetual should score near 0, got {}", r.value);
+    }
+
+    #[test]
+    fn twofold_only_counts_repeats_inside_the_search() {
+        use chess_core::encoding::search_terminal_value;
+        let p = Chess::default(); // non-terminal; only the key sequence matters
+        let (a, b, c, d) = (1u64, 2, 3, 4);
+        // Cycle entirely after the root (root at index 0): draw.
+        assert_eq!(search_terminal_value(&p, &[a, b, c, d, a], a, 0), Some(0.0));
+        // The earlier occurrence predates the root: only one repeat, play on.
+        assert_eq!(search_terminal_value(&p, &[a, b, c, d, a], a, 1), None);
+        // ... unless it is the third occurrence overall.
+        assert_eq!(search_terminal_value(&p, &[a, b, a, c, d, a], a, 3), Some(0.0));
+        // No repeat at all.
+        assert_eq!(search_terminal_value(&p, &[a, b, c, d], d, 0), None);
+    }
+
+    /// Tables from $SYZYGY_PATH (3-4-piece is enough for these tests).
+    fn syzygy() -> Arc<Tablebase<Chess>> {
+        let path = std::env::var("SYZYGY_PATH").expect("set SYZYGY_PATH to run tablebase tests");
+        crate::load_syzygy(&path).unwrap().expect("no tables found")
+    }
+
+    fn tb_params() -> SearchParams {
+        SearchParams { syzygy: Some(syzygy()), ..SearchParams::default() }
+    }
+
+    /// The opponent's WDL after `m` is played from `p`.
+    fn wdl_after(tb: &Tablebase<Chess>, p: &Chess, m: &Move) -> AmbiguousWdl {
+        let mut after = p.clone();
+        after.play_unchecked(m);
+        tb.probe_wdl(&after).unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
+    fn tablebase_win_at_root_plays_without_search() {
+        let p = pos("8/2K5/8/8/4k3/8/8/6R1 w - - 0 1"); // KRvK, DTZ 25
+        let mut s = Search::new(UniformEval, tb_params());
+        s.set_position(p.clone(), &[]);
+        let r = s.go(800, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!((r.sims, r.tb_hits), (0, 1), "should not search a won TB root");
+        assert_eq!(wdl_after(&syzygy(), &p, &r.best), AmbiguousWdl::Loss);
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
+    fn tablebase_draw_at_root_keeps_the_draw() {
+        // Drawn KRvKR where 11 of 19 moves lose, all of them quiet: in-tree
+        // probes (zeroing moves only) cannot see these, root filtering must.
+        let p = pos("8/7r/8/8/3K4/8/3k4/4R3 w - - 0 1");
+        let tb = syzygy();
+        let mut s = Search::new(UniformEval, tb_params());
+        s.set_position(p.clone(), &[]);
+        let r = s.go(400, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(s.root_stats().len(), 8, "root should hold only the 8 drawing moves");
+        assert!(
+            !matches!(wdl_after(&tb, &p, &r.best), AmbiguousWdl::Win | AmbiguousWdl::MaybeWin),
+            "played a losing move"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
+    fn tablebase_scores_captures_into_covered_endgames() {
+        // 5 pieces at the root (beyond 3-4-piece tables): searched normally,
+        // but Kxd2/Qxd2 land in KQvKR and must be scored from the tables.
+        let p = pos("8/8/8/3k4/8/2r5/3p4/3QK3 w - - 0 1");
+        let mut s = Search::new(UniformEval, tb_params());
+        s.set_position(p, &[]);
+        let r = s.go(400, None, &AtomicBool::new(false)).unwrap();
+        assert!(r.sims == 400 && r.tb_hits > 0, "sims {} tb hits {}", r.sims, r.tb_hits);
     }
 
     #[test]

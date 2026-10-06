@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 chess-core = { path = "../chess-core" }
 shakmaty = { workspace = true }
+shakmaty-syzygy = "0.25.3"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

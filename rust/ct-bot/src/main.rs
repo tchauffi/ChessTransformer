@@ -13,9 +13,12 @@ mod timeman;
 mod uci;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use shakmaty::Chess;
+use shakmaty_syzygy::Tablebase;
 
 const DEFAULT_MODEL: &str = "data/models/pos2move_v2.1/model.int8.onnx";
 
@@ -45,6 +48,22 @@ impl ModelArgs {
     }
 }
 
+/// Load Syzygy tables from a ':'-separated list of directories (the UCI
+/// `SyzygyPath` convention). Empty means none.
+pub fn load_syzygy(paths: &str) -> Result<Option<Arc<Tablebase<Chess>>>> {
+    let dirs: Vec<&str> = paths.split(':').filter(|d| !d.trim().is_empty()).collect();
+    if dirs.is_empty() {
+        return Ok(None);
+    }
+    let mut tb = Tablebase::new();
+    let mut n = 0;
+    for dir in &dirs {
+        n += tb.add_directory(dir).with_context(|| format!("syzygy path {dir}"))?;
+    }
+    log::info!("syzygy: {n} table files from {paths} (up to {} pieces)", tb.max_pieces());
+    Ok(Some(Arc::new(tb)))
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// UCI engine mode
@@ -58,6 +77,10 @@ enum Cmd {
     /// Evaluate one FEN; print value + per-move priors as JSON (parity probe)
     #[command(hide = true)]
     Eval(EvalArgs),
+    /// Search one FEN from scratch at several budgets; print the top root
+    /// moves (visits, Q, prior) per budget (search-behavior probe)
+    #[command(hide = true)]
+    Probe(ProbeArgs),
 }
 
 #[derive(Args)]
@@ -79,6 +102,9 @@ struct UciArgs {
     /// Seed for the clock-mode sims/sec estimate (refined after every move)
     #[arg(long, default_value_t = 400.0)]
     initial_sims_per_sec: f64,
+    /// Syzygy tablebase directories, ':'-separated (UCI option SyzygyPath)
+    #[arg(long, default_value = "")]
+    syzygy_path: String,
 }
 
 #[derive(Args, Clone)]
@@ -113,6 +139,9 @@ struct LichessArgs {
     /// Lichess server (override for testing)
     #[arg(long, default_value = "https://lichess.org")]
     base_url: String,
+    /// Syzygy tablebase directories, ':'-separated
+    #[arg(long, default_value = "")]
+    syzygy_path: String,
 }
 
 #[derive(Args)]
@@ -142,6 +171,9 @@ struct ServeArgs {
     /// Reported in /api/health for the frontend display
     #[arg(long, default_value_t = 2100)]
     approx_elo: u32,
+    /// Syzygy tablebase directories, ':'-separated
+    #[arg(long, default_value = "", env = "SYZYGY_PATH")]
+    syzygy_path: String,
 }
 
 #[derive(Args)]
@@ -150,6 +182,76 @@ struct EvalArgs {
     model: ModelArgs,
     #[arg(long)]
     fen: String,
+}
+
+#[derive(Args)]
+struct ProbeArgs {
+    #[command(flatten)]
+    model: ModelArgs,
+    #[arg(long, default_value = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")]
+    fen: String,
+    #[arg(long, num_args = 1.., default_values_t = [800u32, 3200, 12800])]
+    sims: Vec<u32>,
+    #[arg(long, default_value_t = 16)]
+    sim_batch: usize,
+    #[arg(long, default_value_t = 1.0)]
+    c_puct: f64,
+    #[arg(long, default_value_t = 0.2)]
+    fpu: f64,
+    #[arg(long, default_value_t = 1.0)]
+    prior_temp: f32,
+    /// Root moves to print per budget
+    #[arg(long, default_value_t = 6)]
+    top: usize,
+    /// Syzygy tablebase directories, ':'-separated
+    #[arg(long, default_value = "")]
+    syzygy_path: String,
+}
+
+fn cmd_probe(args: &ProbeArgs) -> Result<()> {
+    use shakmaty::{fen::Fen, CastlingMode, Chess};
+    use std::sync::atomic::AtomicBool;
+
+    let fen: Fen = args.fen.parse()?;
+    let pos: Chess = fen.into_position(CastlingMode::Standard)?;
+    let params = search::SearchParams {
+        c_puct: args.c_puct,
+        fpu: args.fpu,
+        prior_temp: args.prior_temp,
+        sim_batch: args.sim_batch,
+        syzygy: load_syzygy(&args.syzygy_path)?,
+        ..search::SearchParams::default()
+    };
+    let mut s = search::Search::new(args.model.evaluator()?, params);
+    for &sims in &args.sims {
+        s.new_game();
+        s.set_position(pos.clone(), &[]);
+        let r = s.go(sims, None, &AtomicBool::new(false))?;
+        println!(
+            "sims {:>6}  best {}  value {:+.3}  tb hits {}  ({:.1}s)",
+            r.sims,
+            r.best.to_uci(CastlingMode::Standard),
+            r.value,
+            r.tb_hits,
+            r.elapsed.as_secs_f64()
+        );
+        let pv: Vec<String> = s
+            .pv(16)
+            .iter()
+            .map(|(m, n, q)| format!("{}({n},{q:+.2})", m.to_uci(CastlingMode::Standard)))
+            .collect();
+        println!("    pv {}", pv.join(" "));
+        for (m, n, q, p) in s.root_stats().into_iter().take(args.top) {
+            println!(
+                "    {:<6} n {:>6}  q {:+.3}  prior {:.3}",
+                m.to_uci(CastlingMode::Standard).to_string(),
+                n,
+                q,
+                p
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_eval(args: &EvalArgs) -> Result<()> {
@@ -198,6 +300,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
         Cmd::Eval(args) => cmd_eval(args),
+        Cmd::Probe(args) => cmd_probe(args),
         Cmd::Bench(args) => bench::run(args),
         Cmd::Uci(args) => uci::run(args),
         Cmd::Lichess(args) => lichess::run(args),

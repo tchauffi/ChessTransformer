@@ -25,6 +25,7 @@ fn value_to_cp(v: f32) -> i32 {
 
 struct Options {
     model: std::path::PathBuf,
+    syzygy_path: String,
     threads: usize,
     device_cuda: bool,
     sims: u32,
@@ -49,6 +50,7 @@ impl Uci {
                 fpu: self.opts.params.fpu,
                 prior_temp: self.opts.params.prior_temp,
                 sim_batch: self.opts.params.sim_batch,
+                syzygy: self.opts.params.syzygy.clone(),
                 ..SearchParams::default()
             };
             let mut search = Search::new(eval, params);
@@ -74,6 +76,7 @@ impl Uci {
         println!("option name CPuct type string default {}", self.opts.params.c_puct);
         println!("option name FPU type string default {}", self.opts.params.fpu);
         println!("option name PriorTemp type string default {}", self.opts.params.prior_temp);
+        println!("option name SyzygyPath type string default {}", self.opts.syzygy_path);
         println!("uciok");
     }
 
@@ -133,6 +136,16 @@ impl Uci {
                     }
                 }
             }
+            "syzygypath" => match crate::load_syzygy(value) {
+                Ok(tb) => {
+                    self.opts.syzygy_path = value.to_string();
+                    self.opts.params.syzygy = tb.clone();
+                    if let Some(s) = &mut self.search {
+                        s.params.syzygy = tb;
+                    }
+                }
+                Err(e) => println!("info string SyzygyPath: {e:#}"),
+            },
             _ => log::warn!("unknown option: {name}"),
         }
     }
@@ -232,6 +245,9 @@ impl Uci {
         self.tm.update(result.sims, result.elapsed);
 
         let ms = result.elapsed.as_millis().max(1);
+        if result.tb_hits > 0 {
+            println!("info string tbhits {}", result.tb_hits);
+        }
         println!(
             "info depth 1 nodes {} nps {} time {} score cp {} pv {}",
             result.sims,
@@ -278,6 +294,7 @@ pub fn run(args: &UciArgs) -> Result<()> {
     let mut uci = Uci {
         opts: Options {
             model: args.model.model.clone(),
+            syzygy_path: args.syzygy_path.clone(),
             threads: args.model.threads,
             device_cuda: args.model.device == "cuda",
             sims: args.sims,
@@ -286,6 +303,7 @@ pub fn run(args: &UciArgs) -> Result<()> {
                 c_puct: args.c_puct,
                 fpu: args.fpu,
                 prior_temp: args.prior_temp,
+                syzygy: crate::load_syzygy(&args.syzygy_path)?,
                 ..SearchParams::default()
             },
         },

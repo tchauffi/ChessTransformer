@@ -105,6 +105,7 @@ fn s<'a>(v: &'a Value, path: &[&str]) -> &'a str {
 struct Bot {
     client: Client,
     args: LichessArgs,
+    syzygy: Option<Arc<shakmaty_syzygy::Tablebase<Chess>>>,
     our_id: String,
     active: Arc<Mutex<HashSet<String>>>,
 }
@@ -125,8 +126,10 @@ async fn run_async(args: LichessArgs) -> Result<()> {
     }
     log::info!("connected as {our_id} ({title})");
 
+    let syzygy = crate::load_syzygy(&args.syzygy_path)?;
     let bot = Arc::new(Bot {
         client,
+        syzygy,
         args,
         our_id,
         active: Arc::new(Mutex::new(HashSet::new())),
@@ -237,6 +240,7 @@ impl Bot {
             sim_batch: self.args.sim_batch,
             move_temp: self.args.move_temp,
             move_temp_plies: self.args.move_temp_plies,
+            syzygy: self.syzygy.clone(),
             ..SearchParams::default()
         };
         let mut search = Some(Search::new(eval, params));
@@ -349,10 +353,11 @@ impl Bot {
 
                 let uci = result.best.to_uci(CastlingMode::Standard).to_string();
                 log::info!(
-                    "game {game_id}: {uci} value={:+.3} sims={} ({} nn evals, {:.2}s, ~{:.0} sims/s)",
+                    "game {game_id}: {uci} value={:+.3} sims={} ({} nn evals, {} tb hits, {:.2}s, ~{:.0} sims/s)",
                     result.value,
                     result.sims,
                     result.nn_evals,
+                    result.tb_hits,
                     result.elapsed.as_secs_f64(),
                     tm.sims_per_sec(),
                 );

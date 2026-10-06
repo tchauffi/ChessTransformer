@@ -200,7 +200,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     )?;
     let search = Search::new(
         eval,
-        SearchParams { sim_batch: args.sim_batch, ..SearchParams::default() },
+        SearchParams {
+            sim_batch: args.sim_batch,
+            syzygy: crate::load_syzygy(&args.syzygy_path)?,
+            ..SearchParams::default()
+        },
     );
     let app = Arc::new(App {
         session: Mutex::new(Session {
