@@ -105,14 +105,23 @@ OPENINGS = [
 ]
 
 
+def game_over(board: chess.Board) -> bool:
+    """Automatic endings, plus the draws either side may claim because they have
+    already happened (a third occurrence, the 50-move counter at 100) -- the same
+    rule as engine_match.py. Not ``claim_draw=True``: that also ends the game when
+    the side to move merely *could* claim with its next move, which a winning side
+    never would (see elo_gauntlet.py), so it scored won games as draws."""
+    return board.is_game_over() or board.is_repetition(3) or board.halfmove_clock >= 100
+
+
 def play(white, white_nodes, black, black_nodes, opening: str, max_plies: int) -> str:
     board = chess.Board()
     for uci in opening.split():
         board.push(chess.Move.from_uci(uci))
-    while not board.is_game_over(claim_draw=True) and board.ply() < max_plies:
+    while not game_over(board) and board.ply() < max_plies:
         eng, nodes = (white, white_nodes) if board.turn == chess.WHITE else (black, black_nodes)
         board.push(eng.play(board, chess.engine.Limit(nodes=nodes)).move)
-    return board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "1/2-1/2"
+    return board.result() if board.is_game_over() else "1/2-1/2"
 
 
 def elo(score: float) -> float:
