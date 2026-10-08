@@ -21,13 +21,25 @@ similar strength -- raise --openings before reading anything into a small gap.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import chess
 import chess.engine
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from chesstransformer.evaluation.sprt import (  # noqa: E402
+    format_report,
+    pair_up,
+    sprt_decision,
+    sprt_llr,
+    summarize,
+)
 
 BASE = "data/models/pos2move_v2.1/model.int8.onnx"  # base (non-EMA) int8
 
@@ -114,14 +126,29 @@ def game_over(board: chess.Board) -> bool:
     return board.is_game_over() or board.is_repetition(3) or board.halfmove_clock >= 100
 
 
-def play(white, white_nodes, black, black_nodes, opening: str, max_plies: int) -> str:
+def start_board(opening: str) -> chess.Board:
+    """A built-in line is UCI moves from the start position; a --book entry is a FEN."""
+    if "/" in opening:
+        return chess.Board(opening)
     board = chess.Board()
     for uci in opening.split():
         board.push(chess.Move.from_uci(uci))
-    while not game_over(board) and board.ply() < max_plies:
+    return board
+
+
+def play(white, white_nodes, black, black_nodes, opening: str, max_plies: int):
+    """Returns (result, plies on the move stack, fewest men on the board at any point).
+
+    ``max_plies`` counts the move stack, so for the built-in lines it is the game's
+    ply count (as before) and for a FEN start it is the plies played from that FEN."""
+    board = start_board(opening)
+    min_men = len(board.piece_map())
+    while not game_over(board) and len(board.move_stack) < max_plies:
         eng, nodes = (white, white_nodes) if board.turn == chess.WHITE else (black, black_nodes)
         board.push(eng.play(board, chess.engine.Limit(nodes=nodes)).move)
-    return board.result() if board.is_game_over() else "1/2-1/2"
+        min_men = min(min_men, len(board.piece_map()))
+    result = board.result() if board.is_game_over() else "1/2-1/2"
+    return result, len(board.move_stack), min_men
 
 
 def elo(score: float) -> float:
@@ -143,8 +170,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-a", default=None, help="display name for side A")
     p.add_argument("--label-b", default=None, help="display name for side B")
     p.add_argument("--openings", type=int, default=8,
-                   help=f"opening lines to use, from the front of the book (max {len(OPENINGS)}). "
-                        "Each is played twice, colours swapped.")
+                   help=f"opening lines to use, from the front of the book (built-in max "
+                        f"{len(OPENINGS)}). Each is played twice, colours swapped.")
+    p.add_argument("--book", type=Path, default=None,
+                   help="JSON book from scripts/build_opening_book.py; games start from each "
+                        "entry's FEN. Default: the built-in lines above.")
+    p.add_argument("--games-out", type=Path, default=None,
+                   help="append one JSON line per game (start, colours, result, plies, "
+                        "fewest men reached)")
+    p.add_argument("--sprt", action="store_true",
+                   help="stop as soon as the paired SPRT decides H0 vs H1; games already in "
+                        "flight finish, half-played pairs are dropped from the score")
+    p.add_argument("--elo0", type=float, default=0.0, help="SPRT null hypothesis")
+    p.add_argument("--elo1", type=float, default=15.0,
+                   help="SPRT alternative: the smallest gain worth promoting")
+    p.add_argument("--alpha", type=float, default=0.05)
+    p.add_argument("--beta", type=float, default=0.05)
+    p.add_argument("--min-pairs", type=int, default=20,
+                   help="never stop before this many completed pairs")
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--workers", type=int, default=1,
                    help="game-pairs to play concurrently, each with its own engine pair. "
@@ -176,8 +219,12 @@ def parse_args() -> argparse.Namespace:
                         "better but change search behaviour -- more collisions per wave -- so "
                         "leave unset when the match is meant to mirror production search.")
     args = p.parse_args()
-    if not 1 <= args.openings <= len(OPENINGS):
-        p.error(f"--openings must be in 1..{len(OPENINGS)}")
+    if args.book is not None:
+        args.lines = [o["fen"] for o in json.loads(args.book.read_text())["openings"]]
+    else:
+        args.lines = OPENINGS
+    if not 1 <= args.openings <= len(args.lines):
+        p.error(f"--openings must be in 1..{len(args.lines)}")
     args.label_a = args.label_a or f"A@{args.nodes_a}"
     args.label_b = args.label_b or f"B@{args.nodes_b}"
     return args
@@ -205,9 +252,9 @@ def main() -> None:
     B = (lb, [args.bot_b or args.bot, "uci", "--model", args.model_b, *common,
               *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b, args.syzygy_b)],
          args.nodes_b)
-    book = OPENINGS[: args.openings]
+    book = args.lines[: args.openings]
 
-    jobs = [(op, a_white) for op in book for a_white in (True, False)]
+    jobs = [(i, op, a_white) for i, op in enumerate(book) for a_white in (True, False)]
     workers = max(1, min(args.workers, len(jobs)))
 
     print(f"{la}: {args.bot_a or args.bot} {args.model_a} @ {args.nodes_a} nodes")
@@ -215,7 +262,11 @@ def main() -> None:
     print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)\n", flush=True)
 
     lock = threading.Lock()
+    stop = threading.Event()
+    decided = {}  # SPRT state at the moment it stopped the match
     done = [0]
+    results: dict[tuple[int, bool], float] = {}
+    games_out = args.games_out.open("a") if args.games_out else None
 
     def run_shard(shard):
         """Play a slice of the job list with a private pair of engine processes."""
@@ -223,19 +274,37 @@ def main() -> None:
         eb = chess.engine.SimpleEngine.popen_uci(B[1])
         out = []
         try:
-            for op, a_white in shard:
+            for idx, op, a_white in shard:
+                if stop.is_set():
+                    break
                 if a_white:
                     white, wn, black, bn = ea, A[2], eb, B[2]
                 else:
                     white, wn, black, bn = eb, B[2], ea, A[2]
-                r = play(white, wn, black, bn, op, args.max_plies)
+                r, plies, min_men = play(white, wn, black, bn, op, args.max_plies)
                 s = 0.5 if r == "1/2-1/2" else (1.0 if (r == "1-0") == a_white else 0.0)
                 tag = "=" if s == 0.5 else ("+" if s == 1.0 else "-")
                 out.append(s)
                 with lock:
+                    results[(idx, a_white)] = s
                     done[0] += 1
                     print(f"[{done[0]:3}/{len(jobs)}] {la if a_white else lb:10}=W  "
                           f"{op[:11]:11} -> {r:7} ({la} {tag})", flush=True)
+                    if games_out:
+                        games_out.write(json.dumps({
+                            "idx": idx, "start": op, "a_white": a_white, "result": r,
+                            "score_a": s, "plies": plies, "min_men": min_men}) + "\n")
+                        games_out.flush()
+                    if args.sprt and not stop.is_set():
+                        pairs = pair_up(results)
+                        llr = sprt_llr(pairs, args.elo0, args.elo1)
+                        verdict = sprt_decision(llr, args.alpha, args.beta,
+                                                min_pairs_met=len(pairs) >= args.min_pairs)
+                        if verdict:
+                            print(f"  SPRT decided {verdict} after {len(pairs)} pairs "
+                                  f"(LLR {llr:+.2f}); finishing games in flight", flush=True)
+                            decided.update(llr=llr, pairs=len(pairs))
+                            stop.set()
         finally:
             ea.quit()
             eb.quit()
@@ -244,6 +313,22 @@ def main() -> None:
     shards = [jobs[i::workers] for i in range(workers)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         scores = [s for shard in pool.map(run_shard, shards) for s in shard]
+    if games_out:
+        games_out.close()
+
+    # Pair-scored (pentanomial) report: each opening's two games form one sample,
+    # so the opening's own bias cancels instead of widening the interval.
+    pairs = pair_up(results)
+    # A sequential test reports the decision it stopped on. Games still in flight at that
+    # moment are kept in the Elo estimate but must not re-open the verdict.
+    llr = None
+    if args.sprt:
+        llr = decided.get("llr", sprt_llr(pairs, args.elo0, args.elo1))
+    print("\n" + format_report(summarize(pairs, scores), la, lb, llr, args.elo0, args.elo1,
+                               args.alpha, args.beta))
+    if decided:
+        print(f"  (SPRT verdict taken at {decided['pairs']} pairs; the estimate above also "
+              f"counts the {len(pairs) - decided['pairs']} pair(s) that finished after it)")
 
     n = len(scores)
     wa = sum(1 for s in scores if s == 1.0)
