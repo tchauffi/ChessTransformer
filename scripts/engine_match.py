@@ -17,6 +17,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from chesstransformer.bots.pos2move_v2_bot import Pos2MoveV2Bot
 from chesstransformer.bots.pos2move_v2_mcts_bot import Pos2MoveV2MctsBot
+from chesstransformer.evaluation.sprt import (
+    format_report,
+    sprt_decision,
+    sprt_llr,
+    summarize,
+)
 
 # Common openings a few moves in, to diversify otherwise-deterministic play.
 OPENINGS: list[str] = [
@@ -119,6 +126,14 @@ OPENINGS: list[str] = [
 ]
 
 
+def load_book(path: Path | None) -> list[str]:
+    """Opening FENs, from a generated book or the built-in suite."""
+    if path is None:
+        return list(OPENINGS)
+    payload = json.loads(path.read_text())
+    return [o["fen"] for o in payload["openings"]]
+
+
 def play(white: Pos2MoveV2Bot, black: Pos2MoveV2Bot, start_fen: str, max_moves: int):
     board = chess.Board(start_fen)
     nodes = 0
@@ -199,6 +214,19 @@ def main():
     p.add_argument("--a-model-dir", default=None, help="Override model dir for engine A")
     p.add_argument("--b-model-dir", default=None, help="Override model dir for engine B")
     p.add_argument("--openings", type=int, default=len(OPENINGS), help="How many openings to use")
+    p.add_argument("--book", type=Path, default=None,
+                   help="JSON book from scripts/build_opening_book.py. The built-in "
+                        "suite only supports 184 games, which cannot resolve anything "
+                        "under roughly +80 Elo.")
+    p.add_argument("--sprt", action="store_true",
+                   help="stop as soon as the match decides H0 vs H1")
+    p.add_argument("--elo0", type=float, default=0.0, help="SPRT null hypothesis")
+    p.add_argument("--elo1", type=float, default=15.0,
+                   help="SPRT alternative: the smallest gain worth promoting")
+    p.add_argument("--alpha", type=float, default=0.05)
+    p.add_argument("--beta", type=float, default=0.05)
+    p.add_argument("--min-pairs", type=int, default=20,
+                   help="never stop before this many completed pairs")
     p.add_argument("--no-compile", action="store_true")
     args = p.parse_args()
 
@@ -217,14 +245,19 @@ def main():
     bot_b = build_bot(args, args.b_ema, args.b_quiescence, b_depth, args.b_mcts, args.b_sims, b_model,
                       args.b_cpuct, args.b_prior_temp, args.b_fpu, not args.b_no_reuse)
 
-    openings = OPENINGS[: args.openings]
+    book = load_book(args.book)
+    openings = book[: args.openings]
     a_score = 0.0
     a_w = a_d = a_l = 0
     a_nodes = a_time = 0.0
     a_n_moves = 0
     games = 0
+    pairs: list[float] = []
+    game_scores: list[float] = []
+    verdict = None
 
     for fen in openings:
+        pair_total = 0.0
         # Game 1: A=White, B=Black ; Game 2: A=Black, B=White
         for a_is_white in (True, False):
             white, black = (bot_a, bot_b) if a_is_white else (bot_b, bot_a)
@@ -240,10 +273,23 @@ def main():
             a_w += sc == 1.0
             a_d += sc == 0.5
             a_l += sc == 0.0
+            pair_total += sc
+            game_scores.append(sc)
             # Track A's own move cost (half the moves are A's, roughly).
             a_n_moves += n_moves
             a_nodes += nodes
             a_time += mtime
+
+        # Only complete pairs are scored, so the opening's difficulty cancels.
+        pairs.append(pair_total)
+        if args.sprt:
+            llr = sprt_llr(pairs, args.elo0, args.elo1)
+            verdict = sprt_decision(llr, args.alpha, args.beta,
+                                    min_pairs_met=len(pairs) >= args.min_pairs)
+            if verdict:
+                print(f"  SPRT decided {verdict} after {len(pairs)} pairs "
+                      f"({games} games), stopping", flush=True)
+                break
 
     print("\n" + "=" * 56)
     print(f"MATCH RESULT (engine A perspective), {games} games")
@@ -252,6 +298,10 @@ def main():
     print(f"  total move time: {a_time:.1f}s over {a_n_moves} half-moves "
           f"({a_time / max(a_n_moves,1) * 1000:.0f} ms/move, {a_nodes / max(a_time,1e-9):.0f} nodes/s)")
     print("=" * 56)
+    stats = summarize(pairs, game_scores)
+    llr = sprt_llr(pairs, args.elo0, args.elo1) if args.sprt else None
+    print(format_report(stats, "A", "B", llr, args.elo0, args.elo1,
+                        args.alpha, args.beta))
 
 
 if __name__ == "__main__":
