@@ -122,18 +122,31 @@ def resolve_precision(requested: str) -> str:
     return requested
 
 
-def unpack_batch(batch, device):
+def unpack_batch(batch, device, value_labels: str = "human", elo_offset: bool = False):
     """Normalise a batch from either data path into the tensors the loss expects.
 
     The shard loader ships the legal mask as a ``(B, 64)`` uint16 index list — 64 KB per
     batch of 512 against 2.4 MB for the dense ``(64, 73)`` bool mask — so the mask is
     rebuilt here, on device, after the H2D copy. Doing it in the dataset would put the
     2.4 MB straight back on the wire and undo the entire point of the shard format.
+
+    ``value_labels="tablebase"`` swaps the human game result for the Syzygy-adjudicated
+    one (``result_tb``, shard format v2). ``elo_offset`` returns the rating gap the model
+    adds to its value logits -- zeroed on samples whose label is their own tablebase
+    result, since perfect play does not depend on who is playing. ``elo_gap`` is ``None``
+    otherwise, which is also what inference passes.
     """
     if "legal_idx" in batch:
         legal_planes = scatter_legal_planes(batch["legal_idx"].to(device, non_blocking=True))
     else:
         legal_planes = batch["legal_moves_planes"].to(device, non_blocking=True)
+    result_key = "result_tb" if value_labels == "tablebase" else "result"
+    elo_gap = None
+    if elo_offset:
+        elo_gap = batch["elo_gap"].to(device, non_blocking=True).float()
+        if value_labels == "tablebase":
+            exact = batch["value_exact"].to(device, non_blocking=True).bool()
+            elo_gap = elo_gap.masked_fill(exact, 0.0)
     return {
         "board": batch["position"].to(device, non_blocking=True).long(),
         "player": batch["is_white"].to(device, non_blocking=True).long(),
@@ -144,12 +157,13 @@ def unpack_batch(batch, device):
         "legal_planes": legal_planes,
         # Narrow on the wire (int8/int16 out of the shard), widened here so both data
         # paths hand compute_loss exactly the same dtypes.
-        "result": batch["result"].to(device, non_blocking=True).long(),
+        "result": batch[result_key].to(device, non_blocking=True).long(),
         # Must stay bool: compute_loss combines it with `result` as a *mask*
         # (`z[(white_win & is_white) | ...]`). An int tensor there would silently become
         # fancy indexing and scatter the value targets onto the wrong rows.
         "is_white": batch["is_white"].to(device, non_blocking=True).bool(),
         "move_number": batch["move_number"].to(device, non_blocking=True).long(),
+        "elo_gap": elo_gap,
     }
 
 
@@ -464,6 +478,17 @@ def main():
                              "3 game-state tokens. 'attn' = learned-query pool over all 67 "
                              "tokens, giving the value head the same access to the board that "
                              "the policy head already has.")
+    parser.add_argument("--value-labels", type=str, default="human",
+                        choices=["human", "tablebase"],
+                        help="Value target. 'human' = the game's result. 'tablebase' = that "
+                             "result adjudicated by Syzygy at the game's first <=5-man position, "
+                             "and each <=5-man sample's own exact result. Needs v2 shards "
+                             "built with build_shards.py --syzygy.")
+    parser.add_argument("--elo-offset", action="store_true",
+                        help="Explain the players' rating gap with a learned logit offset "
+                             "(training only), so the value head stops attributing the stronger "
+                             "player's results to the position. Needs --value-head wdl and v2 "
+                             "shards. Inference reads the head as a game between equals.")
     parser.add_argument("--state-relation", action="store_true",
                         help="Give state-token<->square attention its own relation bias bucket "
                              "(9 categories) instead of sharing bucket 7 with 'far apart'.")
@@ -517,6 +542,11 @@ def main():
                              "single-GPU speedup was measured with), after under DDP so "
                              "Dynamo's DDPOptimizer engages. See the note at the call site.")
     args = parser.parse_args()
+    if args.elo_offset and args.value_head != "wdl":
+        parser.error("--elo-offset shifts win/loss logits, so it needs --value-head wdl")
+    if (args.elo_offset or args.value_labels != "human") and args.shards is None:
+        parser.error("--elo-offset and --value-labels tablebase read shard format v2 fields; "
+                     "pass --shards")
 
     # Epochs are gone as a unit of training length. They were never comparable between the
     # two data paths — the HDF5 dataset is indexed by *game* (738 optimizer steps/epoch) and
@@ -658,6 +688,26 @@ def main():
         vocab_size = dataset.position_tokenizer.vocab_size
 
     rank0_print(f"Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
+    if use_shards:
+        # Refuse rather than fall back: training "with tablebase labels" on shards that do
+        # not carry them would be a silent no-op that still gets gated and written up.
+        shard_meta = FlatShardDataset(args.shards, "train").meta
+        have = set(shard_meta["record_dtype"]["names"])
+        need = set()
+        if args.value_labels == "tablebase":
+            need |= {"result_tb", "value_exact"}
+            if not shard_meta.get("syzygy"):
+                raise SystemExit(f"{args.shards} was built without --syzygy: its result_tb is "
+                                 "a copy of result, so --value-labels tablebase would change "
+                                 "nothing. Rebuild with build_shards.py --syzygy.")
+        if args.elo_offset:
+            need.add("elo_gap")
+        if need - have:
+            raise SystemExit(f"{args.shards} lacks {sorted(need - have)} (format v1); "
+                             "rebuild it with scripts/build_shards.py")
+        if args.value_labels == "tablebase":
+            rank0_print(f"Value labels: tablebase ({shard_meta.get('num_tb_relabelled', 0):,} "
+                        f"relabelled, {shard_meta.get('num_tb_exact', 0):,} exact samples)")
 
     # ── Model ────────────────────────────────────────────────────────────
     model_config = {
@@ -671,6 +721,7 @@ def main():
         "value_head_type": args.value_head,
         "value_pool": args.value_pool,
         "state_relation": args.state_relation,
+        "value_elo_offset": args.elo_offset,
     }
     if accelerator.is_main_process:
         with (log_path / "model_config.json").open("w") as f:
@@ -885,8 +936,9 @@ def main():
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation", leave=False,
                               disable=not accelerator.is_main_process):
-                b = unpack_batch(batch, device)
-                move_logits, value = model(b["board"], b["player"], b["castling"], b["en_passant"])
+                b = unpack_batch(batch, device, args.value_labels, args.elo_offset)
+                move_logits, value = model(b["board"], b["player"], b["castling"], b["en_passant"],
+                                           elo_gap=b["elo_gap"])
                 loss, metrics = compute_loss(
                     move_logits, value,
                     b["from_sq"], b["action_plane"],
@@ -919,6 +971,8 @@ def main():
             "val/value_sign_acc": sums["value_sign"] / n,
             "val/accuracy": sums["correct"] / n,
             "val/legal_accuracy": sums["legal_correct"] / n,
+            **({"val/elo_beta": float(unwrapped.elo_beta)}
+               if unwrapped.elo_beta is not None else {}),
         }
 
     def record_validation(vals, data_pass, extra_log=None, label=""):
@@ -1028,14 +1082,15 @@ def main():
         start_pass_shuffle(train_loader, data_pass)
         for batch in train_loader:
             with accelerator.accumulate(model):
-                b = unpack_batch(batch, device)
+                b = unpack_batch(batch, device, args.value_labels, args.elo_offset)
                 board, player = b["board"], b["player"]
                 castling, en_passant = b["castling"], b["en_passant"]
                 from_sq, action_plane = b["from_sq"], b["action_plane"]
                 legal_planes, result = b["legal_planes"], b["result"]
                 is_white, move_number = b["is_white"], b["move_number"]
 
-                move_logits, value = model(board, player, castling, en_passant)
+                move_logits, value = model(board, player, castling, en_passant,
+                                           elo_gap=b["elo_gap"])
                 loss, metrics = compute_loss(
                     move_logits, value,
                     from_sq, action_plane,
@@ -1161,14 +1216,15 @@ def main():
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing", leave=False,
                           disable=not accelerator.is_main_process):
-            b = unpack_batch(batch, device)
+            b = unpack_batch(batch, device, args.value_labels, args.elo_offset)
             board, player = b["board"], b["player"]
             castling, en_passant = b["castling"], b["en_passant"]
             from_sq, action_plane = b["from_sq"], b["action_plane"]
             legal_planes, result = b["legal_planes"], b["result"]
             is_white, move_number = b["is_white"], b["move_number"]
 
-            move_logits, value = model(board, player, castling, en_passant)
+            move_logits, value = model(board, player, castling, en_passant,
+                                       elo_gap=b["elo_gap"])
             loss, metrics = compute_loss(
                 move_logits, value,
                 from_sq, action_plane,

@@ -265,6 +265,7 @@ data/eval/
 data/selfplay/
 data/rewards/
 data/openings/
+data/syzygy/
 data/lichess_puzzles.csv.zst
 
 # Paper (LaTeX source, figures, and build output) is kept out of the repo

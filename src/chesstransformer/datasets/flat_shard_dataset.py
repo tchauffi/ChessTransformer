@@ -35,10 +35,10 @@ import torch
 from torch.utils.data import BatchSampler, DataLoader, RandomSampler, SequentialSampler
 
 from chesstransformer.datasets.shard_format import (
-    FORMAT_VERSION,
     NUM_ACTION_PLANES,
     NUM_SQUARES,
     PAD_ACTION,
+    SUPPORTED_FORMAT_VERSIONS,
     dtype_from_meta,
 )
 
@@ -46,6 +46,11 @@ from chesstransformer.datasets.shard_format import (
 #: wire (uint8/int16) and widened on device — an int64 ``position`` would be 8x the copy
 #: for an embedding lookup that accepts int32 anyway.
 _SCALAR_FIELDS = ("from_square", "action_plane", "castling_rights", "en_passant_file", "is_white")
+
+#: Value-target fields added in format v2 (see ``shard_format``). Passed through when the
+#: directory has them; a v1 directory simply does not, and the trainer refuses the flags
+#: that need them.
+_OPTIONAL_FIELDS = ("elo_gap", "result_tb", "value_exact")
 
 
 class FlatShardDataset(torch.utils.data.Dataset):
@@ -58,10 +63,11 @@ class FlatShardDataset(torch.utils.data.Dataset):
         with (self.shard_dir / "meta.json").open() as fh:
             self.meta = json.load(fh)
 
-        if self.meta["format_version"] != FORMAT_VERSION:
+        if self.meta["format_version"] not in SUPPORTED_FORMAT_VERSIONS:
             raise ValueError(
                 f"{self.shard_dir} was built with format_version "
-                f"{self.meta['format_version']}, this code reads {FORMAT_VERSION}. Rebuild."
+                f"{self.meta['format_version']}, this code reads "
+                f"{SUPPORTED_FORMAT_VERSIONS}. Rebuild."
             )
 
         if split not in self.meta["splits"]:
@@ -69,6 +75,7 @@ class FlatShardDataset(torch.utils.data.Dataset):
 
         self.dtype = dtype_from_meta(self.meta["record_dtype"])
         self.pad_action = int(self.meta["pad_action"])
+        self.optional_fields = tuple(f for f in _OPTIONAL_FIELDS if f in self.dtype.names)
 
         wanted = set(self.meta["splits"][split])
         self.shard_meta = [m for m in self.meta["shards"] if m["shard_id"] in wanted]
@@ -146,7 +153,7 @@ class FlatShardDataset(torch.utils.data.Dataset):
                 np.ascontiguousarray(batch["move_number"]).astype(np.int16)
             ),
         }
-        for name in _SCALAR_FIELDS:
+        for name in _SCALAR_FIELDS + self.optional_fields:
             out[name] = torch.from_numpy(np.ascontiguousarray(batch[name]))
         return out
 

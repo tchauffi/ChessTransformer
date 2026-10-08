@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -230,6 +232,7 @@ class Pos2MoveV2(nn.Module):
         value_head_type: str = "scalar",
         value_pool: str = "state",
         state_relation: bool = False,
+        value_elo_offset: bool = False,
     ):
         super().__init__()
         if value_head_type not in ("scalar", "wdl"):
@@ -241,8 +244,24 @@ class Pos2MoveV2(nn.Module):
                 "value_bounded / value_clamp are scalar-head options; a WDL head is already "
                 "bounded because its value is p(win) - p(loss)."
             )
+        if value_elo_offset and value_head_type != "wdl":
+            raise ValueError("value_elo_offset shifts win/loss logits, so it needs a WDL head")
         self.value_head_type = value_head_type
         self.value_pool_kind = value_pool
+
+        # Rating-gap offset for the value *target* (training only). The outcome of a
+        # human game depends on who was stronger as well as on the position, and the
+        # network has no rating input, so without this it explains the stronger
+        # player's results through whatever position features correlate with them --
+        # e.g. "1.a4 wins", because strong players choose rim openings against weaker
+        # ones (docs/search-scaling-and-value-bias.md). With it, training fits
+        #   log p(win)/p(loss) = f(position) + 2 * elo_beta * gap / 400
+        # so f only has to carry what the board says. Inference passes no gap, which
+        # reads the head as a game between equals. elo_beta starts at ln(10)/2, the
+        # Elo model's own slope, and is learned (rating noise attenuates it).
+        self.elo_beta = (
+            nn.Parameter(torch.tensor(math.log(10.0) / 2.0)) if value_elo_offset else None
+        )
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.position_embedding = nn.Embedding(67, embed_dim)  # 64 squares + 3 extra tokens
@@ -382,13 +401,18 @@ class Pos2MoveV2(nn.Module):
         move_logits = self.move_head(x[:, :64, :])  # (B, 64, NUM_ACTION_PLANES)
         return move_logits, value_features
 
-    def forward(self, board_tokens, player_token, castling_token, en_passant_token):
+    def forward(self, board_tokens, player_token, castling_token, en_passant_token,
+                elo_gap=None):
         """``(move_logits, value)`` with ``value`` the **raw** head output.
 
         (B, 1) for a scalar head -- byte-identical to v2.1 -- and (B, 3) logits
         for a WDL head, which is what cross-entropy needs. Anything that wants
         the single number MCTS backs up calls :meth:`value_scalar` on the result;
         for a scalar head that is the identity, so existing callers are unaffected.
+
+        ``elo_gap`` (B,) is the side to move's rating minus its opponent's, and is
+        for training only: with ``value_elo_offset`` it shifts the win/loss logits
+        by the rating gap (see ``elo_beta``). Leave it ``None`` at inference.
 
         Deliberately the only forward path: DDP registers its gradient-sync hooks
         on ``forward``, and ``torch.compile`` only traces what goes through
@@ -397,7 +421,11 @@ class Pos2MoveV2(nn.Module):
         move_logits, value_features = self._trunk(
             board_tokens, player_token, castling_token, en_passant_token
         )
-        return move_logits, self.value_head(value_features)
+        value = self.value_head(value_features)
+        if elo_gap is not None and self.elo_beta is not None:
+            k = self.elo_beta * (elo_gap.float() / 400.0)  # (B,)
+            value = value + torch.stack([k, torch.zeros_like(k), -k], dim=-1).to(value.dtype)
+        return move_logits, value
 
     def value_scalar(self, value_out):
         """Reduce a raw value output to the scalar in [-1, 1] that search uses.
