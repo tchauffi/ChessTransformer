@@ -29,6 +29,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2
 
 
+class ScalarValueWrapper(torch.nn.Module):
+    """Force the exported graph's second output to the scalar value search uses.
+
+    ``Pos2MoveV2.forward`` returns the *raw* value head, which is (B, 3) logits
+    for a WDL head. The ONNX consumer (rust/ct-bot's ``nn.rs``) reads
+    ``value[[i, 0]]`` and would take the raw win-logit as Q. For a scalar head
+    ``value_scalar`` is the identity, so this wrapper is a no-op there.
+    """
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, board_tokens, player_token, castling_token, en_passant_token):
+        move_logits, value = self.inner(
+            board_tokens, player_token, castling_token, en_passant_token
+        )
+        return move_logits, self.inner.value_scalar(value)
+
+
 def export_onnx(
     model_dir: str | Path, output_path: str | Path | None = None, use_ema: bool = False
 ) -> Path:
@@ -67,6 +87,11 @@ def export_onnx(
         print(f"EMA weights loaded ({len(ema_state)} tensors; {len(missing)} buffers kept).")
 
     model.eval()
+
+    # The exported graph must always emit a scalar "value" -- rust/ct-bot's nn.rs
+    # reads value[[i, 0]] and would otherwise silently take a raw WDL logit as Q.
+    # For a scalar head value_scalar is the identity, so this changes nothing.
+    model = ScalarValueWrapper(model).eval()
 
     # Dummy inputs. Batch=2, not 1: torch.export specializes size-1 dims to
     # constants, which bakes batch=1 reshapes into the graph.

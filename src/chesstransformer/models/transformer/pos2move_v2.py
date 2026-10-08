@@ -8,10 +8,12 @@ EXTRA_TOKENS = 3  # castling, en_passant, player
 CONTEXT_SIZE = BOARD_SQUARES + EXTRA_TOKENS  # 67
 
 
-def build_chess_relation_index(context_size: int = CONTEXT_SIZE) -> torch.Tensor:
+def build_chess_relation_index(
+    context_size: int = CONTEXT_SIZE, state_category: bool = False
+) -> torch.Tensor:
     """Precompute (T, T) relation index between every pair of tokens.
 
-    Categories (8 total):
+    Categories (8 by default):
       0: same square / same token
       1: same file
       2: same rank
@@ -20,18 +22,23 @@ def build_chess_relation_index(context_size: int = CONTEXT_SIZE) -> torch.Tensor
       5: king-adjacent (Chebyshev <= 1)
       6: nearby (Manhattan <= 3)
       7: far
-      Game-state tokens (>= 64) get category 0 toward themselves and
-      a dedicated "global" category 7 toward all board squares.
+
+    Any pair involving a game-state token (>= 64) is "global". With
+    ``state_category=False`` — the v2.1 behaviour — global reuses bucket **7**,
+    so the state tokens' only channel to the board shares one learned bias per
+    head with the least informative board relation. Since the value head reads
+    those tokens, that bias is load-bearing for every MCTS leaf score.
+    ``state_category=True`` gives global its own bucket 8 (9 categories).
     """
     rel = torch.zeros(context_size, context_size, dtype=torch.long)
+    global_bucket = 8 if state_category else 7
     for i in range(context_size):
         for j in range(context_size):
             if i == j:
                 rel[i, j] = 0
                 continue
             if i >= BOARD_SQUARES or j >= BOARD_SQUARES:
-                # Any pair involving a game-state token: "global" bucket
-                rel[i, j] = 7
+                rel[i, j] = global_bucket
                 continue
             fi, ri = i % 8, i // 8
             fj, rj = j % 8, j // 8
@@ -54,6 +61,7 @@ def build_chess_relation_index(context_size: int = CONTEXT_SIZE) -> torch.Tensor
 
 
 _RELATION_INDEX: torch.Tensor = build_chess_relation_index()
+_RELATION_INDEX_STATE: torch.Tensor = build_chess_relation_index(state_category=True)
 
 
 class ReluSquared(nn.Module):
@@ -62,7 +70,8 @@ class ReluSquared(nn.Module):
 
 class ChessGroupedQueryAttention(nn.Module):
     def __init__(
-        self, d_in, d_out, num_heads, num_kv_groups, context_size, dropout=0.0, qkv_bias=False
+        self, d_in, d_out, num_heads, num_kv_groups, context_size, dropout=0.0, qkv_bias=False,
+        state_relation=False,
     ):
         super().__init__()
 
@@ -85,11 +94,14 @@ class ChessGroupedQueryAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
 
-        # Chess-geometry relative bias: 8 relation categories per head
-        # Massively fewer params than fully-learned (H, T, T) bias.
-        self.num_relations = 8
+        # Chess-geometry relative bias: one learned scalar per (head, relation).
+        # Massively fewer params than a fully-learned (H, T, T) bias.
+        self.num_relations = 9 if state_relation else 8
         self.bias_table = nn.Parameter(torch.zeros(num_heads, self.num_relations))
-        self.register_buffer("rel_idx", _RELATION_INDEX, persistent=False)
+        self.register_buffer(
+            "rel_idx", _RELATION_INDEX_STATE if state_relation else _RELATION_INDEX,
+            persistent=False,
+        )
 
 
     def forward(self, x):
@@ -145,7 +157,8 @@ class MLP(nn.Module):
         return x
     
 class ChessTransformerLayer(nn.Module):
-    def __init__(self, dim, nb_heads, qkv_bias, context_size, dropout=0.1, layer_drop=0.0):
+    def __init__(self, dim, nb_heads, qkv_bias, context_size, dropout=0.1, layer_drop=0.0,
+                 state_relation=False):
         super().__init__()
         self.attn = ChessGroupedQueryAttention(
             d_in=dim,
@@ -155,6 +168,7 @@ class ChessTransformerLayer(nn.Module):
             context_size=context_size,
             dropout=dropout,
             qkv_bias=qkv_bias,
+            state_relation=state_relation,
         )
         self.mlp = MLP(dim, dim * 4, dim, dropout=dropout)
         self.norm1 = nn.RMSNorm(dim)
@@ -175,6 +189,32 @@ class ChessTransformerLayer(nn.Module):
             x = x + self.mlp(self.norm2(x))
         return x
     
+class ValueAttentionPool(nn.Module):
+    """Pool the whole sequence into one vector with a single learned query.
+
+    The v2.1 value head reads ``x[:, -3:, :].mean(dim=1)`` -- the mean of the
+    castling / en-passant / player tokens -- so all 64 squares reach it only by
+    having been attended *into* those three slots, while the policy head reads
+    every square directly. This pools over all 67 tokens instead.
+
+    ``q`` is initialised near zero, which makes the softmax uniform, so the
+    module starts as a mean-pool over the full sequence and learns where to look
+    from there.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.q = nn.Parameter(torch.zeros(dim))
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.scale = dim ** -0.5
+
+    def forward(self, x):  # (B, T, D) -> (B, D)
+        attn = (self.k_proj(x) @ self.q) * self.scale  # (B, T)
+        w = attn.softmax(dim=-1).unsqueeze(-1)  # (B, T, 1)
+        return (w * self.v_proj(x)).sum(dim=1)
+
+
 class Pos2MoveV2(nn.Module):
     def __init__(
         self,
@@ -187,8 +227,22 @@ class Pos2MoveV2(nn.Module):
         layer_drop: float = 0.0,
         value_bounded: bool = False,
         value_clamp: bool = False,
+        value_head_type: str = "scalar",
+        value_pool: str = "state",
+        state_relation: bool = False,
     ):
         super().__init__()
+        if value_head_type not in ("scalar", "wdl"):
+            raise ValueError(f"value_head_type must be 'scalar' or 'wdl', got {value_head_type!r}")
+        if value_pool not in ("state", "attn"):
+            raise ValueError(f"value_pool must be 'state' or 'attn', got {value_pool!r}")
+        if value_head_type == "wdl" and (value_bounded or value_clamp):
+            raise ValueError(
+                "value_bounded / value_clamp are scalar-head options; a WDL head is already "
+                "bounded because its value is p(win) - p(loss)."
+            )
+        self.value_head_type = value_head_type
+        self.value_pool_kind = value_pool
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.position_embedding = nn.Embedding(67, embed_dim)  # 64 squares + 3 extra tokens
@@ -213,6 +267,7 @@ class Pos2MoveV2(nn.Module):
                     context_size=67,  # Max sequence length (64 squares + 3 extra tokens)
                     dropout=dropout,
                     layer_drop=drop_rates[i],
+                    state_relation=state_relation,
                 )
                 for i in range(nb_transformer_layers)
             ]
@@ -227,17 +282,30 @@ class Pos2MoveV2(nn.Module):
             nn.Linear(policy_hidden, NUM_ACTION_PLANES),
         )
 
-        # Deeper value head: D → D//4 → GELU → 1
-        # value_bounded appends a tanh so the output cannot leave the target's
-        # [-1, 1] range. Kept off by default: the shipped v2.1 weights were
-        # trained without it, and squashing them post-hoc changes their scale.
-        # The Tanh lands at index 3, so the Linear state-dict keys (0.*, 2.*)
-        # are identical either way and checkpoints stay interchangeable.
+        # How the value head reads the trunk. "state" is v2.1's three-token mean;
+        # "attn" pools all 67 tokens (see ValueAttentionPool).
+        self.value_pool = ValueAttentionPool(embed_dim) if value_pool == "attn" else None
+
+        # Deeper value head: D → D//4 → GELU → out
+        #
+        # value_head_type "wdl" emits 3 logits (win / draw / loss, side-to-move
+        # POV) trained with cross-entropy instead of one scalar trained with MSE.
+        # MSE against a {-1, 0, +1} outcome converges to a shrunken conditional
+        # mean -- v2.1's head has output std 0.42 against a target std of 0.95 --
+        # and MCTS maximises over those leaf values. A softmax cannot shrink that
+        # way, is bounded by construction, and makes the draw an explicit outcome
+        # rather than the midpoint of two others.
+        #
+        # value_bounded appends a tanh so a *scalar* output cannot leave the
+        # target's [-1, 1] range. Kept off by default: the shipped v2.1 weights
+        # were trained without it, and squashing them post-hoc changes their
+        # scale. The Tanh lands at index 3, so the Linear state-dict keys
+        # (0.*, 2.*) are identical either way and checkpoints stay interchangeable.
         value_hidden = embed_dim // 4
         value_layers = [
             nn.Linear(embed_dim, value_hidden),
             nn.GELU(),
-            nn.Linear(value_hidden, 1),
+            nn.Linear(value_hidden, 3 if value_head_type == "wdl" else 1),
         ]
         if value_bounded:
             value_layers.append(nn.Tanh())
@@ -280,9 +348,13 @@ class Pos2MoveV2(nn.Module):
                 layer.attn.proj.weight.mul_(scale)
                 layer.mlp.fc2.weight.mul_(scale)
 
-    def forward(self, board_tokens, player_token, castling_token, en_passant_token):
-        batch_size = board_tokens.size(0)
+    def _trunk(self, board_tokens, player_token, castling_token, en_passant_token):
+        """Shared forward up to the heads.
 
+        Returns ``(move_logits, value_features)``. Split out so training can read
+        raw WDL logits and inference can read a scalar without either paying for
+        a second pass through the trunk.
+        """
         token_emb = self.token_embedding(board_tokens)  # (B, 64, D)
         pos_emb = self.position_embedding(self.pos_index)  # (67, D)
         castling_emb = self.castling_embedding(castling_token).unsqueeze(1)  # (B, 1, D)
@@ -302,10 +374,37 @@ class Pos2MoveV2(nn.Module):
 
         x = self.final_norm(x)
 
-        state_token = x[:, -3:, :].mean(dim=1)  # Average the last 3 game-state tokens: (B, D)
+        if self.value_pool is not None:
+            value_features = self.value_pool(x)  # (B, D) over all 67 tokens
+        else:
+            value_features = x[:, -3:, :].mean(dim=1)  # v2.1: mean of the 3 state tokens
 
-        board_tokens_out = x[:, :64, :]  # (B, 64, D)
-        move_logits = self.move_head(board_tokens_out)  # (B, 64, NUM_ACTION_PLANES)
-        value_pred = self.value_head(state_token)  # (B, 1)
+        move_logits = self.move_head(x[:, :64, :])  # (B, 64, NUM_ACTION_PLANES)
+        return move_logits, value_features
 
-        return move_logits, value_pred
+    def forward(self, board_tokens, player_token, castling_token, en_passant_token):
+        """``(move_logits, value)`` with ``value`` the **raw** head output.
+
+        (B, 1) for a scalar head -- byte-identical to v2.1 -- and (B, 3) logits
+        for a WDL head, which is what cross-entropy needs. Anything that wants
+        the single number MCTS backs up calls :meth:`value_scalar` on the result;
+        for a scalar head that is the identity, so existing callers are unaffected.
+
+        Deliberately the only forward path: DDP registers its gradient-sync hooks
+        on ``forward``, and ``torch.compile`` only traces what goes through
+        ``__call__``, so a separate training entry point would quietly lose both.
+        """
+        move_logits, value_features = self._trunk(
+            board_tokens, player_token, castling_token, en_passant_token
+        )
+        return move_logits, self.value_head(value_features)
+
+    def value_scalar(self, value_out):
+        """Reduce a raw value output to the scalar in [-1, 1] that search uses.
+
+        Identity for a scalar head; Q = p(win) - p(loss) for a WDL head.
+        """
+        if value_out.size(-1) == 3:
+            p = value_out.softmax(dim=-1)
+            return (p[..., 0] - p[..., 2]).unsqueeze(-1)
+        return value_out

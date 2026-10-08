@@ -153,6 +153,10 @@ def main():
             torch.from_numpy(bt), torch.from_numpy(pl),
             torch.from_numpy(ca), torch.from_numpy(ep),
         )
+        # The export emits the scalar search backs up (export_onnx.ScalarValueWrapper);
+        # compare against that, not a WDL head's raw (B, 3) logits, which numpy would
+        # silently broadcast against the (B, 1) ONNX value.
+        t_value = model.value_scalar(t_value)
     t_logits = t_logits.numpy()
     t_value = t_value.numpy()
 

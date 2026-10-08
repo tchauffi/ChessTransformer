@@ -145,9 +145,9 @@ def unpack_batch(batch, device):
         # Narrow on the wire (int8/int16 out of the shard), widened here so both data
         # paths hand compute_loss exactly the same dtypes.
         "result": batch["result"].to(device, non_blocking=True).long(),
-        # Must stay bool: compute_loss uses it as a *mask* (`target_value[white_win &
-        # is_white]`). An int tensor there would silently become fancy indexing and
-        # scatter the value targets onto the wrong rows.
+        # Must stay bool: compute_loss combines it with `result` as a *mask*
+        # (`z[(white_win & is_white) | ...]`). An int tensor there would silently become
+        # fancy indexing and scatter the value targets onto the wrong rows.
         "is_white": batch["is_white"].to(device, non_blocking=True).bool(),
         "move_number": batch["move_number"].to(device, non_blocking=True).long(),
     }
@@ -195,7 +195,14 @@ def compute_loss(
     value_rampup_halfmoves=40,
     label_smoothing: float = 0.0,
 ):
-    """Total loss = (label-smoothed) policy CE + value MSE.
+    """Total loss = (label-smoothed) policy CE + value loss.
+
+    ``value`` comes from ``Pos2MoveV2.forward_train``, so its last dim selects
+    the objective: **1** is the scalar head (MSE against z in {-1, 0, +1}), **3**
+    is the WDL head (cross-entropy over win/draw/loss from the side-to-move POV).
+
+    ``value_rampup_halfmoves`` down-weights early plies, whose outcome label is
+    mostly noise; pass ``0`` to disable it and weight every position equally.
 
     Returns
     -------
@@ -203,7 +210,10 @@ def compute_loss(
     metrics    : dict of detached scalar tensors for logging
         - ce          : standard cross-entropy on the full action space
         - legal_ce    : cross-entropy after masking to legal moves only
-        - value_loss  : weighted MSE on the value head
+        - value_loss  : the weighted value objective actually backprop'd
+        - value_mse   : MSE of the scalar value against z, comparable across
+                        head types (for WDL it scores p(win) - p(loss))
+        - value_sign  : sign accuracy on decisive positions
         - acc         : top-1 accuracy on the full action space
         - legal_acc   : top-1 accuracy after masking to legal moves only
     """
@@ -227,19 +237,36 @@ def compute_loss(
     else:
         policy_loss = F.cross_entropy(flat_logits, flat_target)
 
-    # ── Value loss: per-sample MSE, ramped up by move number ────────────
-    target_value = torch.zeros_like(value)
+    # ── Value loss ──────────────────────────────────────────────────────
+    # z in {-1, 0, +1} from the side-to-move POV, as a (B,) vector. Keeping every
+    # per-sample quantity 1-D here is load-bearing: the previous version built
+    # target_value with the head's (B, 1) shape and multiplied it by a (B,)
+    # ramp, which broadcasts to (B, B) -- so .mean() silently collapsed to
+    # mean(loss) * mean(progress) and the per-sample ramp never actually applied.
     white_win = result == 1
     black_win = result == 2
-    target_value[white_win & is_white] = 1.0
-    target_value[white_win & ~is_white] = -1.0
-    target_value[black_win & is_white] = -1.0
-    target_value[black_win & ~is_white] = 1.0
+    z = torch.zeros(B, dtype=torch.float32, device=value.device)
+    z[(white_win & is_white) | (black_win & ~is_white)] = 1.0
+    z[(white_win & ~is_white) | (black_win & is_white)] = -1.0
 
-    progress = (move_number.float() / value_rampup_halfmoves).clamp(max=1.0)
-    per_sample_value_loss = (value.float() - target_value) ** 2
-    value_loss = (progress * per_sample_value_loss).mean()
+    if value_rampup_halfmoves > 0:
+        weight = (move_number.float() / value_rampup_halfmoves).clamp(max=1.0)  # (B,)
+    else:
+        weight = torch.ones_like(z)
 
+    if value.size(-1) == 3:
+        # WDL: class 0 = win, 1 = draw, 2 = loss, side-to-move POV.
+        target_cls = torch.ones(B, dtype=torch.long, device=value.device)
+        target_cls[z > 0] = 0
+        target_cls[z < 0] = 2
+        per_sample = F.cross_entropy(value.float(), target_cls, reduction="none")  # (B,)
+        p = value.float().softmax(dim=-1)
+        scalar_value = p[:, 0] - p[:, 2]  # (B,) — the Q that MCTS backs up
+    else:
+        scalar_value = value.float().squeeze(-1)  # (B,)
+        per_sample = (scalar_value - z) ** 2
+
+    value_loss = (weight * per_sample).mean()
     total_loss = policy_loss + value_loss_weight * value_loss
 
     # ── Metrics (no grad) ───────────────────────────────────────────────
@@ -255,10 +282,18 @@ def compute_loss(
         legal_preds = masked_logits.argmax(dim=-1)
         legal_acc = (legal_preds == flat_target).float().mean()
 
+        # Head-agnostic value quality, so a WDL run stays comparable to a scalar one.
+        value_mse = ((scalar_value - z) ** 2).mean()
+        decisive = z != 0
+        value_sign = ((torch.sign(scalar_value) == z)[decisive].float().mean()
+                      if decisive.any() else torch.zeros((), device=value.device))
+
     metrics = {
         "ce": ce_metric,
         "legal_ce": legal_ce_metric,
         "value_loss": value_loss.detach(),
+        "value_mse": value_mse,
+        "value_sign": value_sign,
         "acc": acc,
         "legal_acc": legal_acc,
     }
@@ -409,8 +444,29 @@ def main():
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     # Loss weights
-    parser.add_argument("--value-loss-weight", type=float, default=5.0)
+    parser.add_argument("--value-loss-weight", type=float, default=5.0,
+                        help="Multiplier on the value loss. Tuned for MSE (~0.5); a WDL "
+                             "cross-entropy is ~0.6-0.9 nats, so re-sweep around 1.0 when "
+                             "changing --value-head.")
+    parser.add_argument("--value-rampup-halfmoves", type=int, default=40,
+                        help="Linearly ramp the per-sample value loss from 0 at ply 0 to full "
+                             "weight at this ply, damping early plies whose outcome label is "
+                             "mostly noise. 0 disables the ramp (equal weight everywhere).")
     parser.add_argument("--label-smoothing", type=float, default=0.1)
+    # Value head shape. Defaults reproduce v2.1 exactly.
+    parser.add_argument("--value-head", type=str, default="scalar", choices=["scalar", "wdl"],
+                        help="'scalar' = one output trained with MSE against z in {-1,0,+1}. "
+                             "'wdl' = 3 logits (win/draw/loss) trained with cross-entropy; "
+                             "bounded by construction and immune to MSE's shrinkage toward "
+                             "the conditional mean.")
+    parser.add_argument("--value-pool", type=str, default="state", choices=["state", "attn"],
+                        help="How the value head reads the trunk. 'state' = v2.1's mean of the "
+                             "3 game-state tokens. 'attn' = learned-query pool over all 67 "
+                             "tokens, giving the value head the same access to the board that "
+                             "the policy head already has.")
+    parser.add_argument("--state-relation", action="store_true",
+                        help="Give state-token<->square attention its own relation bias bucket "
+                             "(9 categories) instead of sharing bucket 7 with 'far apart'.")
     # Model
     parser.add_argument("--preset", type=str, default="base", choices=list(PRESETS),
                         help="Model size. See PRESETS for per-GPU DDP memory. Individual "
@@ -612,6 +668,9 @@ def main():
         "dropout": args.dropout,
         "kvq_bias": False,
         "layer_drop": args.layer_drop,
+        "value_head_type": args.value_head,
+        "value_pool": args.value_pool,
+        "state_relation": args.state_relation,
     }
     if accelerator.is_main_process:
         with (log_path / "model_config.json").open("w") as f:
@@ -681,7 +740,7 @@ def main():
     for name, param in model.named_parameters():
         if "embedding" in name:
             adamw_emb_params.append(param)
-        elif "move_head" in name or "value_head" in name:
+        elif "move_head" in name or "value_head" in name or "value_pool" in name:
             adamw_head_params.append(param)
         elif param.ndim == 2:
             muon_params.append(param)
@@ -821,7 +880,8 @@ def main():
         # No cross-rank reduction here on purpose: val_loader is replicated, not sharded,
         # so every rank walks the identical set and arrives at the identical number. That
         # is what keeps best-model selection consistent across ranks without a gather.
-        sums = dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, correct=0, legal_correct=0, total=0)
+        sums = dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, value_mse=0.0, value_sign=0.0,
+                    correct=0, legal_correct=0, total=0)
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation", leave=False,
                               disable=not accelerator.is_main_process):
@@ -832,12 +892,15 @@ def main():
                     b["from_sq"], b["action_plane"],
                     b["legal_planes"], b["result"], b["is_white"], b["move_number"],
                     args.value_loss_weight,
+                    value_rampup_halfmoves=args.value_rampup_halfmoves,
                 )
                 B = move_logits.size(0)
                 sums["loss"] += loss.item() * B
                 sums["ce"] += metrics["ce"].item() * B
                 sums["legal_ce"] += metrics["legal_ce"].item() * B
                 sums["value"] += metrics["value_loss"].item() * B
+                sums["value_mse"] += metrics["value_mse"].item() * B
+                sums["value_sign"] += metrics["value_sign"].item() * B
                 sums["correct"] += int(metrics["acc"].item() * B)
                 sums["legal_correct"] += int(metrics["legal_acc"].item() * B)
                 sums["total"] += B
@@ -852,6 +915,8 @@ def main():
             "val/ce": sums["ce"] / n,
             "val/legal_ce": sums["legal_ce"] / n,
             "val/value_loss": sums["value"] / n,
+            "val/value_mse": sums["value_mse"] / n,
+            "val/value_sign_acc": sums["value_sign"] / n,
             "val/accuracy": sums["correct"] / n,
             "val/legal_accuracy": sums["legal_correct"] / n,
         }
@@ -869,7 +934,9 @@ def main():
         ema_tag = " (EMA)" if use_ema else ""
         rank0_print(f"{label}val_loss={vals['val/loss']:.4f}{ema_tag} "
               f"| val_acc={vals['val/accuracy']:.4f} "
-              f"| val_legal_acc={vals['val/legal_accuracy']:.4f}")
+              f"| val_legal_acc={vals['val/legal_accuracy']:.4f} "
+              f"| val_v_mse={vals['val/value_mse']:.4f} "
+              f"| val_v_sign={vals['val/value_sign_acc']:.4f}")
 
         if vals["val/loss"] < best_val_loss:
             best_val_loss = vals["val/loss"]
@@ -904,9 +971,11 @@ def main():
 
     def new_window():
         """Train metrics accumulated since the last validation, sample-weighted."""
-        return dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, acc=0.0, legal_acc=0.0, n=0)
+        return dict(loss=0.0, ce=0.0, legal_ce=0.0, value=0.0, value_mse=0.0, value_sign=0.0,
+                    acc=0.0, legal_acc=0.0, n=0)
 
-    WINDOW_KEYS = ("loss", "ce", "legal_ce", "value", "acc", "legal_acc")
+    WINDOW_KEYS = ("loss", "ce", "legal_ce", "value", "value_mse", "value_sign",
+                   "acc", "legal_acc")
 
     def flush_window(w):
         """Average the window across ranks, not just within one.
@@ -972,6 +1041,7 @@ def main():
                     from_sq, action_plane,
                     legal_planes, result, is_white, move_number,
                     args.value_loss_weight,
+                    value_rampup_halfmoves=args.value_rampup_halfmoves,
                     label_smoothing=args.label_smoothing,
                 )
 
@@ -1010,6 +1080,8 @@ def main():
             window["ce"] += metrics["ce"].item() * bs
             window["legal_ce"] += metrics["legal_ce"].item() * bs
             window["value"] += metrics["value_loss"].item() * bs
+            window["value_mse"] += metrics["value_mse"].item() * bs
+            window["value_sign"] += metrics["value_sign"].item() * bs
             window["acc"] += metrics["acc"].item() * bs
             window["legal_acc"] += metrics["legal_acc"].item() * bs
             window["n"] += bs
@@ -1102,6 +1174,7 @@ def main():
                 from_sq, action_plane,
                 legal_planes, result, is_white, move_number,
                 args.value_loss_weight,
+                value_rampup_halfmoves=args.value_rampup_halfmoves,
             )
 
             B = move_logits.size(0)
