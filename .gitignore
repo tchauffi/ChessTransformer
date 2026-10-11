@@ -249,6 +249,8 @@ rust/graphify-out/
 
 # Rust CUDA build tree (the generic `target/` rule above does not cover it)
 rust/target-cuda/
+# Dev build tree: builds go here so they never relink the deployed bot's target/release/ct-bot
+rust/target-dev/
 
 # Experiment run directories: ablations, value-head sweeps, RL runs.
 # The shipped checkpoints (data/models/pos2move_v2*/, V2_model/) stay tracked.
@@ -263,6 +265,7 @@ data/models/**/model_ema.int8.onnx
 # Generated eval / self-play / reward / opening-book data
 data/eval/
 data/selfplay/
+data/rl/
 data/rewards/
 data/openings/
 data/syzygy/
