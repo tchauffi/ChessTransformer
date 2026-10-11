@@ -61,6 +61,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Dataset
@@ -306,8 +307,17 @@ def main():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-embedding", type=float, default=4e-5)
     p.add_argument("--weight-decay", type=float, default=0.05)
+    p.add_argument("--new-lr-mult", type=float, default=1.0,
+                   help="lr multiplier for smolgen / full-table attention-bias parameters")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                   help="torch.compile the training forwards: 2.2x the steps/s of eager on gen01 and "
+                        "9.4 vs >15.4 GiB on the smolgen model, which eager cannot fit at batch 512")
     p.add_argument("--human-elo-gap", action=argparse.BooleanOptionalAction, default=True,
                    help="feed the human shards' rating gap to the value head's Elo offset")
+    p.add_argument("--train-dropout", action=argparse.BooleanOptionalAction, default=True,
+                   help="keep the base config's dropout and layer drop while training. With "
+                        "them on, the KL to the (eval-mode) reference is mostly dropout noise: "
+                        "0.050 for identical weights on gen01")
     p.add_argument("--warmup-steps", type=int, default=200)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--value-weight", type=float, default=1.0)
@@ -361,9 +371,21 @@ def main():
 
     # ── Model + frozen reference ─────────────────────────────────────────
     model = load_model(Path(args.base), device)
+    if not args.train_dropout:
+        for mod in model.modules():
+            if isinstance(mod, nn.Dropout):
+                mod.p = 0.0
+            if hasattr(mod, "layer_drop"):
+                mod.layer_drop = 0.0
+            if hasattr(mod, "dropout") and isinstance(mod.dropout, float):
+                mod.dropout = 0.0  # attention-probability dropout inside SDPA
     ref = copy.deepcopy(model).eval()
     for q in ref.parameters():
         q.requires_grad_(False)
+    # Training forwards go through the compiled wrappers; `model` keeps the parameters, so
+    # EMA, evaluation and the saved state dict are unchanged (no `_orig_mod.` prefixes).
+    fwd = torch.compile(model) if args.compile else model
+    ref_fwd = torch.compile(ref) if args.compile else ref
     print(f"Model parameters: {sum(t.numel() for t in model.parameters()):,}")
 
     # ── Baseline: frozen base net on the val split ───────────────────────
@@ -372,19 +394,32 @@ def main():
           f"value_mse={base_val['value']:.4f} | sign_acc={base_val['sign_acc']:.4f}")
 
     # ── Optimizer + warmup→linear-decay schedule ─────────────────────────
-    emb, decay_p, nodecay_p = [], [], []
+    # Attention-bias parameters added by scripts/convert_attn_bias.py start from zero (smolgen)
+    # or from the bucket values (bias_full), so --new-lr-mult lets them move within one
+    # generation. The full table is kept out of weight decay: decay would pull it toward
+    # zero, away from the bucket values it was filled with.
+    emb, decay_p, nodecay_p, new_decay, new_nodecay = [], [], [], [], []
     for n_, t in model.named_parameters():
-        if "embedding" in n_:
+        if "smolgen" in n_ or "bias_full" in n_:
+            (new_decay if t.ndim >= 2 and "bias_full" not in n_ else new_nodecay).append(t)
+        elif "embedding" in n_:
             emb.append(t)
         elif t.ndim >= 2:
             decay_p.append(t)
         else:
             nodecay_p.append(t)
-    opt = torch.optim.AdamW([
+    groups = [
         {"params": emb, "lr": args.lr_embedding, "weight_decay": args.weight_decay},
         {"params": decay_p, "lr": args.lr, "weight_decay": args.weight_decay},
         {"params": nodecay_p, "lr": args.lr, "weight_decay": 0.0},
-    ])
+    ]
+    if new_decay or new_nodecay:
+        new_lr = args.lr * args.new_lr_mult
+        groups += [{"params": new_decay, "lr": new_lr, "weight_decay": args.weight_decay},
+                   {"params": new_nodecay, "lr": new_lr, "weight_decay": 0.0}]
+        print(f"Attention-bias parameters: {sum(t.numel() for t in new_decay + new_nodecay):,} "
+              f"at lr {new_lr:g}")
+    opt = torch.optim.AdamW(groups)
     total_steps = max(1, len(train_loader) * args.epochs)
     if args.max_steps > 0:
         total_steps = min(total_steps, args.max_steps)
@@ -413,13 +448,13 @@ def main():
             halfmove, z, root_v, policy = halfmove.to(device), z.to(device), root_v.to(device), policy.to(device)
             full = full.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
-                logits, value = model(board, player, castling, ep)
+                logits, value = fwd(board, player, castling, ep)
                 with torch.no_grad():
-                    ref_logits, _ = ref(board, player, castling, ep)
+                    ref_logits, _ = ref_fwd(board, player, castling, ep)
                 loss, m = compute_loss(logits, value, policy, full, z, root_v, halfmove, ref_logits,
                                        args.value_weight, args.kl_coef, args.soft_mix, args.ramp_halfmoves)
                 if human_iter is not None:
-                    h = human_loss(model, next(human_iter), device, args.value_weight,
+                    h = human_loss(fwd, next(human_iter), device, args.value_weight,
                                    elo_gap=args.human_elo_gap)
                     loss = (1.0 - args.human_frac) * loss + args.human_frac * h
                     m["human"] = h.detach()
@@ -481,7 +516,8 @@ def main():
     meta = {"base": str(args.base), "data": [str(d) for d in args.data], "epochs": epoch,
             "steps": step, "select": args.select,
             "kl_coef": args.kl_coef, "value_weight": args.value_weight, "soft_mix": args.soft_mix,
-            "human_elo_gap": args.human_elo_gap,
+            "new_lr_mult": args.new_lr_mult, "human_elo_gap": args.human_elo_gap,
+            "train_dropout": args.train_dropout, "compile": args.compile,
             "human_shards": args.human_shards, "human_frac": args.human_frac if args.human_shards else 0.0,
             "baseline_val": base_val, "last_val": val, "best_val_loss": best_val}
     (out / "expert_iter_meta.json").write_text(json.dumps(meta, indent=2))
