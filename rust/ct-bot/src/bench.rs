@@ -37,7 +37,7 @@ fn requests(positions: &[Chess]) -> Vec<EvalRequest> {
         .iter()
         .map(|p| {
             let (tokens, player, castling, ep) = chess_core::encoding::encode_position(p);
-            EvalRequest { tokens, player, castling, ep }
+            EvalRequest { tokens, player, castling, ep, legal: Vec::new() }
         })
         .collect()
 }

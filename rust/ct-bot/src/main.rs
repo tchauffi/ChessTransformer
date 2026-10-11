@@ -265,7 +265,7 @@ fn cmd_eval(args: &EvalArgs) -> Result<()> {
 
     let mut eval = args.model.evaluator()?;
     let out = eval
-        .eval_batch(&[nn::EvalRequest { tokens, player, castling, ep }])?
+        .eval_batch(&[nn::EvalRequest { tokens, player, castling, ep, legal: Vec::new() }])?
         .remove(0);
 
     let moves = pos.legal_moves();

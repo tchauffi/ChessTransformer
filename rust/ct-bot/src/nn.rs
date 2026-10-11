@@ -11,24 +11,8 @@ use anyhow::{Context, Result};
 use ndarray::{Array1, Array2, Array3};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 
-pub struct EvalRequest {
-    pub tokens: [u8; 64],
-    pub player: u8,
-    pub castling: u8,
-    pub ep: u8,
-}
-
-pub struct EvalOutput {
-    /// Flat [64*73] logits for one position (from_sq * 73 + plane).
-    pub logits: Vec<f32>,
-    pub value: f32,
-}
-
-/// Batched position evaluation. Implemented by `OnnxEvaluator` (and by test
-/// doubles in the search unit tests).
-pub trait Evaluator {
-    fn eval_batch(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>>;
-}
+// The interface the search is written against lives in chess-core with it.
+pub use chess_core::eval::{EvalOutput, EvalRequest, Evaluator};
 
 pub struct OnnxEvaluator {
     session: Session,
