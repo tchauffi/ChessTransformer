@@ -218,14 +218,25 @@ def compute_loss(logits, value, policy_tgt, full, z, root_v, halfmove, ref_logit
     return total, metrics
 
 
-def human_loss(model, hb, device, value_weight):
+def human_loss(model, hb, device, value_weight, elo_gap=True):
     """Supervised loss on one batch of human shards: the played move and the
-    (tablebase-adjudicated, when the shards carry it) game result."""
+    (tablebase-adjudicated, when the shards carry it) game result.
+
+    With ``elo_gap`` the rating gap goes through the value head's Elo offset, as in
+    pretraining (pos2move_v2_trainer.prepare_batch). Without it a human result is read
+    as a game between equals, so the head is taught to explain the stronger player's
+    wins through the position -- the bias the offset exists to remove."""
     board = hb["position"].to(device, non_blocking=True).long()
     is_white = hb["is_white"].to(device, non_blocking=True).bool()
+    gap = None
+    if elo_gap and getattr(model, "elo_beta", None) is not None and "elo_gap" in hb:
+        gap = hb["elo_gap"].to(device, non_blocking=True).float()
+        if "result_tb" in hb and "value_exact" in hb:  # a tablebase result is exact
+            gap = gap.masked_fill(hb["value_exact"].to(device).bool(), 0.0)
     logits, value = model(board, is_white.long(),
                           hb["castling_rights"].to(device, non_blocking=True).long(),
-                          hb["en_passant_file"].to(device, non_blocking=True).long())
+                          hb["en_passant_file"].to(device, non_blocking=True).long(),
+                          elo_gap=gap)
     B = board.size(0)
     target = (hb["from_square"].to(device).long() * NUM_ACTION_PLANES
               + hb["action_plane"].to(device).long())
@@ -295,6 +306,8 @@ def main():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-embedding", type=float, default=4e-5)
     p.add_argument("--weight-decay", type=float, default=0.05)
+    p.add_argument("--human-elo-gap", action=argparse.BooleanOptionalAction, default=True,
+                   help="feed the human shards' rating gap to the value head's Elo offset")
     p.add_argument("--warmup-steps", type=int, default=200)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--value-weight", type=float, default=1.0)
@@ -406,7 +419,8 @@ def main():
                 loss, m = compute_loss(logits, value, policy, full, z, root_v, halfmove, ref_logits,
                                        args.value_weight, args.kl_coef, args.soft_mix, args.ramp_halfmoves)
                 if human_iter is not None:
-                    h = human_loss(model, next(human_iter), device, args.value_weight)
+                    h = human_loss(model, next(human_iter), device, args.value_weight,
+                                   elo_gap=args.human_elo_gap)
                     loss = (1.0 - args.human_frac) * loss + args.human_frac * h
                     m["human"] = h.detach()
             opt.zero_grad(set_to_none=True)
@@ -467,6 +481,7 @@ def main():
     meta = {"base": str(args.base), "data": [str(d) for d in args.data], "epochs": epoch,
             "steps": step, "select": args.select,
             "kl_coef": args.kl_coef, "value_weight": args.value_weight, "soft_mix": args.soft_mix,
+            "human_elo_gap": args.human_elo_gap,
             "human_shards": args.human_shards, "human_frac": args.human_frac if args.human_shards else 0.0,
             "baseline_val": base_val, "last_val": val, "best_val_loss": best_val}
     (out / "expert_iter_meta.json").write_text(json.dumps(meta, indent=2))

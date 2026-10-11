@@ -97,3 +97,39 @@ def test_defaults_are_all_full_and_noise_only_on_full_searches():
     assert {_first_root_visits({**fast, "dirichlet_alpha": 0.3}, s) for s in range(4)} == \
         {_first_root_visits(fast, 0)}
 
+
+def _tiny_wdl_model():
+    from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2
+    torch.manual_seed(0)
+    return Pos2MoveV2(embed_dim=32, nb_transformer_layers=2, num_heads=4, dropout=0.0,
+                      value_head_type="wdl", value_elo_offset=True)
+
+
+def _human_batch(b=16, exact=False):
+    g = torch.Generator().manual_seed(0)
+    return {
+        "position": torch.randint(0, 13, (b, 64), generator=g),
+        "is_white": torch.randint(0, 2, (b,), generator=g),
+        "castling_rights": torch.randint(0, 16, (b,), generator=g),
+        "en_passant_file": torch.full((b,), 8),
+        "from_square": torch.randint(0, 64, (b,), generator=g),
+        "action_plane": torch.randint(0, 73, (b,), generator=g),
+        "result": torch.randint(0, 3, (b,), generator=g),
+        "result_tb": torch.randint(0, 3, (b,), generator=g),
+        "value_exact": torch.full((b,), exact),
+        "elo_gap": torch.full((b,), 300),
+    }
+
+
+def test_human_replay_feeds_the_rating_gap():
+    # Pretraining reads human results through the Elo offset; the RL replay must too,
+    # or it re-teaches the value head that the stronger side's positions are winning.
+    from train_expert_iter import human_loss
+    m = _tiny_wdl_model().eval()
+    with torch.no_grad():
+        with_gap = human_loss(m, _human_batch(), "cpu", 1.0, elo_gap=True)
+        no_gap = human_loss(m, _human_batch(), "cpu", 1.0, elo_gap=False)
+        exact = human_loss(m, _human_batch(exact=True), "cpu", 1.0, elo_gap=True)
+        exact_no_gap = human_loss(m, _human_batch(exact=True), "cpu", 1.0, elo_gap=False)
+    assert not torch.isclose(with_gap, no_gap)
+    assert torch.isclose(exact, exact_no_gap)  # tablebase results ignore who was stronger
