@@ -6,7 +6,12 @@ visit_ptr, indices = from_square * 73 + action_plane) — the value and policy
 targets needed for expert-iteration training.
 
 The Rust engine runs N games concurrently and batches leaf evaluations across
-all of them; Python only runs the batched NN forward. Build the core with:
+all of them; Python only runs the batched NN forward. Games are searched with
+the deployed bot's own search (``SelfPlayEngine`` on ``chess_core::search``:
+16-leaf waves, deferred TT hits, the tree reused from move to move), so the
+teacher is the search the network is judged and deployed with;
+``--legacy-engine`` selects the older self-play search (``Engine``). Build the
+core with:
 
     uvx maturin build --release -m rust/selfplay-core/Cargo.toml -o dist
     uv pip install --force-reinstall dist/selfplay_core-*.whl
@@ -43,9 +48,13 @@ _BUCKETS = (32, 64, 128, 256, 512, 1024)
 class Forward:
     """Batched bf16 forward with bucketed static shapes (compile-friendly)."""
 
-    def __init__(self, model_dir: str, device: str, use_ema: bool, compile_model: bool):
+    def __init__(self, model_dir: str, device: str, use_ema: bool, compile_model: bool,
+                 buckets: tuple[int, ...] = _BUCKETS):
         self.device = device
+        self.buckets = buckets
         self.model = load_model(Path(model_dir), device).bfloat16().eval()
+        # Search backs up a scalar; a WDL head is reduced to p(win) - p(loss).
+        self.value_scalar = self.model.value_scalar
         if use_ema:
             ema = torch.load(Path(model_dir) / "ema_state.pt", map_location="cpu", weights_only=True)
             ema = {k.replace("_orig_mod.", ""): v for k, v in ema.items()}
@@ -55,13 +64,15 @@ class Forward:
         if compile_model and device == "cuda":
             self.model = torch.compile(self.model, mode="reduce-overhead")
         self.bufs = {}
-        for b in _BUCKETS:  # warm up every bucket so CUDA-graph capture is up front
+        self.slots = {}  # async staging buffers, one set per in-flight batch
+        for b in buckets:  # warm up every bucket so CUDA-graph capture is up front
             self._buffers(b)
             bt, pl, ca, ep = self.bufs[b]
             for _ in range(3):
                 self.model(bt, pl, ca, ep)
         if device == "cuda":
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()  # the eager warm-up runs' blocks, not the graphs' pool
 
     def _buffers(self, bucket: int):
         if bucket not in self.bufs:
@@ -77,8 +88,8 @@ class Forward:
     def __call__(self, boards: np.ndarray, player: np.ndarray, castling: np.ndarray,
                  ep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n = len(player)
-        bucket = next((b for b in _BUCKETS if n <= b), _BUCKETS[-1])
-        if n > _BUCKETS[-1]:  # split oversized batches
+        bucket = next((b for b in self.buckets if n <= b), self.buckets[-1])
+        if n > self.buckets[-1]:  # split oversized batches
             l1, v1 = self(boards[:bucket], player[:bucket], castling[:bucket], ep[:bucket])
             l2, v2 = self(boards[bucket:], player[bucket:], castling[bucket:], ep[bucket:])
             return np.concatenate([l1, l2]), np.concatenate([v1, v2])
@@ -91,14 +102,105 @@ class Forward:
         logits, value = self.model(bt, pl, ca, e)
         return (
             logits[:n].float().cpu().numpy(),
-            value[:n].squeeze(-1).float().cpu().numpy(),
+            self.value_scalar(value[:n].float()).squeeze(-1).cpu().numpy(),
         )
+
+    # ── Asynchronous path: legal-move logits only, CPU/GPU overlap ────────────
+    #
+    # launch() queues a batch and returns at once: inputs go to the GPU through
+    # pinned buffers, the legal moves' logits are gathered on the GPU (a few
+    # dozen floats per position instead of 4672) and come back through pinned
+    # buffers behind an event. wait() blocks on that event only. With one slot
+    # per engine, the CPU searches one engine's games while the GPU evaluates
+    # the other's. Every `verify_every`-th batch is recomputed synchronously
+    # and compared, so a stream-ordering mistake fails loudly instead of
+    # feeding wrong evaluations to the search.
+
+    verify_every = 50
+    launched = 0
+
+    def _slot(self, slot: int, n: int, width: int) -> dict:
+        st = self.slots.get(slot)
+        if st is None or st["cap"] < n or st["wcap"] < width:
+            cap = max(n, st["cap"] if st else 0, 64)
+            wcap = max(width, st["wcap"] if st else 0, 64)
+            pin = self.device == "cuda"
+
+            def host(size, dtype):
+                return torch.zeros(size, dtype=dtype, pin_memory=pin)
+
+            def dev(size, dtype):
+                return torch.zeros(size, dtype=dtype, device=self.device)
+
+            st = {"cap": cap, "wcap": wcap,
+                  "event": torch.cuda.Event() if self.device == "cuda" else None,
+                  "h_in": [host((cap, 64), torch.uint8)] + [host(cap, torch.uint8) for _ in range(3)],
+                  "d_in": [dev((cap, 64), torch.uint8)] + [dev(cap, torch.uint8) for _ in range(3)],
+                  "h_legal": host(cap * wcap, torch.int16), "d_legal": dev(cap * wcap, torch.int16),
+                  "h_logits": host(cap * wcap, torch.float32), "h_values": host(cap, torch.float32)}
+            self.slots[slot] = st
+        return st
+
+    @torch.no_grad()
+    def launch(self, slot: int, boards: np.ndarray, player: np.ndarray, castling: np.ndarray,
+               ep: np.ndarray, legal: np.ndarray):
+        """Queue a forward; `wait(handle)` returns (legal logits (n, width), values (n,)).
+        `legal` holds flat logit indices padded with 4672 (a zero column is appended)."""
+        n, width = len(player), legal.shape[1]
+        st = self._slot(slot, n, width)
+        for h, d, a in zip(st["h_in"], st["d_in"], (boards, player, castling, ep)):
+            h[:n].numpy()[...] = a
+            d[:n].copy_(h[:n], non_blocking=True)
+        h_legal = st["h_legal"][: n * width].view(n, width)
+        h_legal.numpy()[...] = legal
+        d_legal = st["d_legal"][: n * width].view(n, width)
+        d_legal.copy_(h_legal, non_blocking=True)
+        out = st["h_logits"][: n * width].view(n, width)
+        out_v = st["h_values"][:n]
+        top = self.buckets[-1]
+        for s0 in range(0, n, top):
+            m = min(top, n - s0)
+            bucket = next(b for b in self.buckets if m <= b)
+            bufs = self._buffers(bucket)
+            for buf, d in zip(bufs, st["d_in"]):
+                buf[:m].copy_(d[s0:s0 + m])
+                buf[m:].zero_()
+            logits, value = self.model(*bufs)
+            flat = torch.cat([logits[:m].reshape(m, -1), logits.new_zeros(m, 1)], dim=1)
+            out[s0:s0 + m].copy_(flat.gather(1, d_legal[s0:s0 + m].long()).float(), non_blocking=True)
+            out_v[s0:s0 + m].copy_(self.value_scalar(value[:m].float()).squeeze(-1), non_blocking=True)
+        if st["event"] is not None:
+            st["event"].record()
+        return slot, n, width, (boards, player, castling, ep, legal)
+
+    def wait(self, handle) -> tuple[np.ndarray, np.ndarray]:
+        """The batch's results, valid until the slot's next launch."""
+        slot, n, width, inputs = handle
+        st = self.slots[slot]
+        if st["event"] is not None:
+            st["event"].synchronize()
+        logits = st["h_logits"][: n * width].view(n, width).numpy()
+        values = st["h_values"][:n].numpy()
+        self.launched += 1
+        if self.verify_every and self.launched % self.verify_every == 0:
+            self._verify(inputs, logits, values)
+        return logits, values
+
+    def _verify(self, inputs, logits: np.ndarray, values: np.ndarray):
+        boards, player, castling, ep, legal = inputs
+        full, ref_v = self(boards, player, castling, ep)
+        full = np.concatenate([full.reshape(len(full), 64 * 73), np.zeros((len(full), 1), np.float32)], 1)
+        ref = np.take_along_axis(full, legal.astype(np.int64), axis=1)
+        if not (np.allclose(logits, ref, rtol=0, atol=1e-2) and np.allclose(values, ref_v, rtol=0, atol=1e-3)):
+            raise RuntimeError(
+                f"async forward check failed: max |dlogit| {np.abs(logits - ref).max():.4f}, "
+                f"max |dvalue| {np.abs(values - ref_v).max():.4f}")
 
 
 class ShardWriter:
     """npz shards with the selfplay_value_games.py columns + CSR visit dists."""
 
-    SCALAR_COLS = ("player", "castling", "ep", "halfmove", "z", "root_v")
+    SCALAR_COLS = ("player", "castling", "ep", "halfmove", "z", "root_v", "full")
 
     def __init__(self, out_dir: Path, flush_positions: int = 10_000):
         self.out_dir = out_dir
@@ -141,7 +243,7 @@ class ShardWriter:
             "visit_ptr": ptr,
         }
         casts = {"player": np.uint8, "castling": np.uint8, "ep": np.uint8,
-                 "halfmove": np.uint16, "z": np.float32, "root_v": np.float32}
+                 "halfmove": np.uint16, "z": np.float32, "root_v": np.float32, "full": np.uint8}
         for c in self.SCALAR_COLS:
             arrays[c] = np.concatenate(self.cols[c]).astype(casts[c])
         path = self.out_dir / f"positions_{self.shard_idx:04d}.npz"
@@ -157,9 +259,34 @@ def main():
     p.add_argument("--ema", action="store_true")
     p.add_argument("--out", required=True)
     p.add_argument("--games", type=int, default=200)
-    p.add_argument("--sims", type=int, default=128)
+    p.add_argument("--sims", type=int, default=128,
+                   help="search budget of a full move (the policy targets)")
+    p.add_argument("--fast-sims", type=int, default=0,
+                   help="playout cap randomization: budget of a fast move (0 = every move is full)")
+    p.add_argument("--full-frac", type=float, default=1.0,
+                   help="probability that a move is a full search when --fast-sims > 0")
+    p.add_argument("--cap-total", choices=("none", "fast", "all"), default="none",
+                   help="budgets that count the reused tree's warm visits (the root's total "
+                        "visits) instead of fresh sims: none, fast moves only, or all moves; "
+                        "not --legacy-engine, which has no tree reuse")
+    p.add_argument("--dirichlet-alpha", type=float, default=0.0,
+                   help="root noise on full searches (AlphaZero chess: 0.3); 0 = off")
+    p.add_argument("--dirichlet-eps", type=float, default=0.25)
+    p.add_argument("--max-hours", type=float, default=0.0,
+                   help="stop after this running time, frozen time excluded (games in flight "
+                        "are dropped); 0 = no limit")
     p.add_argument("--parallel-games", type=int, default=64)
-    p.add_argument("--leaves-per-wave", type=int, default=4)
+    p.add_argument("--sim-batch", type=int, default=16,
+                   help="leaves per search wave (the bot's --sim-batch)")
+    p.add_argument("--threads", type=int, default=6, help="CPU threads for the searches")
+    p.add_argument("--legacy-engine", action="store_true",
+                   help="the older self-play search (immediate TT backups, no tree reuse)")
+    p.add_argument("--engines", type=int, default=2,
+                   help="engine halves taking turns on the GPU (2 = the CPU searches one while "
+                        "the GPU evaluates the other); 1 = no overlap")
+    p.add_argument("--verify-every", type=int, default=50,
+                   help="recompute every N-th async batch synchronously and compare (0 = never)")
+    p.add_argument("--leaves-per-wave", type=int, default=4, help="--legacy-engine only")
     p.add_argument("--c-puct", type=float, default=1.0)
     p.add_argument("--fpu", type=float, default=0.2)
     p.add_argument("--move-temp", type=float, default=1.0)
@@ -178,7 +305,9 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     games_log = out_dir / "games.jsonl"
-    id_offset = sum(1 for _ in open(games_log)) if games_log.exists() else 0
+    # Ids of a run are interleaved across engines, so resume after the largest one.
+    id_offset = (max((json.loads(line)["id"] for line in open(games_log)), default=-1) + 1
+                 if games_log.exists() else 0)
     if id_offset:
         print(f"Resuming after {id_offset} existing games in {out_dir}")
     (out_dir / "generation_config.json").write_text(json.dumps(vars(args), indent=2))
@@ -187,6 +316,8 @@ def main():
         "num_sims": args.sims,
         "num_parallel_games": args.parallel_games,
         "leaves_per_wave": args.leaves_per_wave,
+        "sim_batch": args.sim_batch,
+        "threads": args.threads,
         "c_puct": args.c_puct,
         "fpu": args.fpu,
         "move_temp": args.move_temp,
@@ -196,28 +327,35 @@ def main():
         "no_resign_frac": args.no_resign_frac,
         "max_plies": args.max_plies,
         "tt_cap": args.tt_cap,
+        "fast_sims": args.fast_sims,
+        "full_frac": args.full_frac,
+        "cap_total_full": args.cap_total == "all",
+        "cap_total_fast": args.cap_total in ("fast", "all"),
+        "dirichlet_alpha": args.dirichlet_alpha,
+        "dirichlet_eps": args.dirichlet_eps,
     }
     openings = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] + list(OPENINGS)
-    engine = selfplay_core.Engine(json.dumps(cfg), openings, args.seed + id_offset, args.games)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
+    forward.verify_every = args.verify_every
     writer = ShardWriter(out_dir, flush_positions=args.flush_positions)
 
     counts = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
     done_games, n_positions = 0, 0
-    t0 = time.time()
     log = open(games_log, "a")
+    if args.legacy_engine:
+        engines = [selfplay_core.Engine(json.dumps(cfg), openings, args.seed + id_offset, args.games)]
+    else:
+        cfg["tt_cap"] = min(args.tt_cap, 200_000)  # per game here, one shared TT in Engine
+        k_eng = max(1, args.engines)
+        cfg["num_parallel_games"] = max(1, args.parallel_games // k_eng)
+        engines = [selfplay_core.SelfPlayEngine(
+            json.dumps(cfg), openings, args.seed + id_offset + 1_000_003 * k,
+            args.games // k_eng + (k < args.games % k_eng)) for k in range(k_eng)]
 
-    while not engine.done():
-        boards, player, castling, ep = engine.collect()
-        if len(player) > 0:
-            logits, values = forward(boards, player, castling, ep)
-        else:
-            logits = np.zeros((0, 64, 73), dtype=np.float32)
-            values = np.zeros(0, dtype=np.float32)
-        engine.apply(logits, values)
-
-        for g in engine.drain_finished():
-            gid = id_offset + g["id"]
+    def record(games: list, k: int):
+        nonlocal done_games, n_positions
+        for g in games:
+            gid = id_offset + g["id"] * len(engines) + k
             z = g["z_white"]
             result = "1-0" if z > 0 else "0-1" if z < 0 else "1/2-1/2"
             counts[result] += 1
@@ -231,14 +369,50 @@ def main():
             log.flush()
             done_games += 1
             if done_games % 20 == 0:
-                el = time.time() - t0
-                _, _, _, tt = engine.stats()
+                el = max(active, 1e-9)
+                tt = sum(e.stats()[3] for e in engines)
                 print(f"{done_games}/{args.games} games | {n_positions} pos | "
                       f"{done_games / el * 3600:.0f} games/h | tt={tt}", flush=True)
 
+    # The budget counts running time only. A wave never takes 10 minutes, so a longer gap
+    # between two waves is the process being frozen (the RL loop's night pause).
+    budget = args.max_hours * 3600 if args.max_hours > 0 else float("inf")
+    active, last = 0.0, time.monotonic()
+    inflight = [None] * len(engines)
+    while not (all(e.done() for e in engines) and all(h is None for h in inflight)):
+        now = time.monotonic()
+        if now - last < 600:
+            active += now - last
+        last = now
+        if active >= budget:
+            print(f"time budget of {args.max_hours} h reached", flush=True)
+            break
+        for k, eng in enumerate(engines):
+            if args.legacy_engine:  # synchronous, full logits
+                boards, player, castling, ep = eng.collect()
+                if len(player) > 0:
+                    logits, values = forward(boards, player, castling, ep)
+                else:
+                    logits = np.zeros((0, 64, 73), dtype=np.float32)
+                    values = np.zeros(0, dtype=np.float32)
+                eng.apply(logits, values)
+                record(eng.drain_finished(), k)
+                continue
+            if inflight[k] is not None:
+                eng.apply_legal(*forward.wait(inflight[k]))
+                inflight[k] = None
+            if eng.done():
+                continue
+            boards, player, castling, ep, legal = eng.collect()
+            record(eng.drain_finished(), k)
+            if len(player):
+                inflight[k] = forward.launch(k, boards, player, castling, ep, legal)
+            elif not eng.done():
+                raise RuntimeError("engine returned an empty batch with games left")
+
     writer.flush()
     log.close()
-    el = time.time() - t0
+    el = max(active, 1e-9)
     print(f"\nDone: {done_games} games, {n_positions} positions | "
           f"W {counts['1-0']} / D {counts['1/2-1/2']} / B {counts['0-1']} | "
           f"{el / 60:.1f} min ({done_games / el * 3600:.0f} games/h)")
