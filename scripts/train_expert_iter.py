@@ -6,14 +6,27 @@ produced by `scripts/selfplay_rust.py`:
 
   * policy: cross-entropy against the **MCTS visit distribution** (CSR
     visit_idx/visit_cnt/visit_ptr, indices = from_square * 73 + action_plane),
-  * value : MSE against the game outcome z (stm-POV), with the same halfmove
-    ramp as pretraining and an optional KataGo-style soft mix toward root_v,
+    on full searches only when the data was generated with playout cap
+    randomization (the `full` column; fast searches are too shallow to teach),
+  * value : the game outcome z (stm-POV) on every position, optionally mixed
+    KataGo-style toward the search's root_v -- MSE for a scalar head,
+    cross-entropy for a WDL head,
   * a **KL anchor** to a frozen copy of the base net, to keep the policy from
-    collapsing away from its 2100-Elo prior (cf. grpo_puzzles.py).
+    collapsing away from its prior (cf. grpo_puzzles.py),
+  * optionally, **human replay** (`--human-shards`): a fraction of every step
+    is ordinary supervised loss on the human shards, so the net does not forget
+    what the self-play data never shows it.
+
+`--data` takes several directories: a replay window over the last generations.
 
 Validation splits by game id (consecutive positions of a game are near
 duplicates and would leak). The frozen base net's val loss is reported as the
 baseline before training. Output is a standard model dir loadable by every bot.
+
+**Checkpoint selection.** exit2 had the best held-out loss of any run and the
+worst gate (doc/selfplay_rl.md): val loss anti-correlates with playing
+strength. So the default `--select last` exports the final EMA weights and
+leaves the verdict to a match; `--select val` restores the old behaviour.
 
 Usage
 -----
@@ -21,6 +34,13 @@ Usage
         --data data/selfplay/v2.1-400sims-exit \
         --base data/models/pos2move_v2.1 \
         --out  data/models/pos2move_v2.1-exit1
+
+Several generations plus human replay (what scripts/rl_generation.sh runs):
+
+    uv run python scripts/train_expert_iter.py \
+        --data data/rl/selfplay/gen01 data/rl/selfplay/gen02 \
+        --base data/rl/models/gen02 --out data/rl/models/cand03 \
+        --epochs 1 --soft-mix 0.5 --human-shards data/shards/elite_k32_v2 --human-frac 0.2
 
 Gate the result before promoting it:
 
@@ -49,54 +69,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from grpo_puzzles import load_model  # shared model loader
+from chesstransformer.datasets.flat_shard_dataset import FlatShardDataset, make_dataloader
 from chesstransformer.models.transformer.pos2move_v2 import NUM_ACTION_PLANES
 
 ACTION_SPACE = 64 * NUM_ACTION_PLANES  # 4672
+# Game ids restart at 0 in every self-play directory; offset them per directory
+# so the game-level val split stays a split across a replay window.
+GAME_ID_STRIDE = 1 << 32
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────
 class SelfplayDataset(Dataset):
     """All shards with visit distributions, concatenated in RAM.
 
-    Returns raw per-position fields; the dense policy target is built in the
-    collate fn so we only ever materialise (B, 4672) for the current batch.
+    Kept in the on-disk dtypes (a few million positions as int64 boards would
+    be gigabytes) and widened per batch in the collate fn, which also builds the
+    dense policy target so only (B, 4672) is ever materialised.
     """
 
-    def __init__(self, data_dir: Path):
-        shards = sorted(data_dir.glob("positions_*.npz"))
-        if not shards:
-            raise FileNotFoundError(f"no positions_*.npz in {data_dir}")
-
-        boards, player, castling, ep, halfmove, z, root_v, game_id = ([] for _ in range(8))
+    def __init__(self, data_dirs: list[Path]):
+        boards, player, castling, ep, halfmove, z, root_v, game_id, full = ([] for _ in range(9))
         v_idx, v_cnt, v_len = [], [], []
-        skipped = 0
-        for s in shards:
-            d = np.load(s)
-            if "visit_idx" not in d:
-                skipped += 1
-                continue
-            boards.append(d["boards"])
-            player.append(d["player"]); castling.append(d["castling"]); ep.append(d["ep"])
-            halfmove.append(d["halfmove"]); z.append(d["z"]); root_v.append(d["root_v"])
-            game_id.append(d["game_id"])
-            v_idx.append(d["visit_idx"].astype(np.int64))
-            v_cnt.append(d["visit_cnt"].astype(np.float32))
-            v_len.append(np.diff(d["visit_ptr"]))  # per-position support length
+        skipped = n_shards = 0
+        for di, data_dir in enumerate(data_dirs):
+            shards = sorted(Path(data_dir).glob("positions_*.npz"))
+            if not shards:
+                raise FileNotFoundError(f"no positions_*.npz in {data_dir}")
+            n_shards += len(shards)
+            for s in shards:
+                d = np.load(s)
+                if "visit_idx" not in d:
+                    skipped += 1
+                    continue
+                boards.append(d["boards"])
+                player.append(d["player"]); castling.append(d["castling"]); ep.append(d["ep"])
+                halfmove.append(d["halfmove"]); z.append(d["z"]); root_v.append(d["root_v"])
+                game_id.append(d["game_id"].astype(np.int64) + di * GAME_ID_STRIDE)
+                # Data from before playout cap randomization: every search was full.
+                full.append(d["full"] if "full" in d else np.ones(len(d["z"]), dtype=np.uint8))
+                v_idx.append(d["visit_idx"])
+                v_cnt.append(d["visit_cnt"])
+                v_len.append(np.diff(d["visit_ptr"]))  # per-position support length
 
         if not boards:
-            raise RuntimeError(f"{len(shards)} shard(s) found but none carry visit_idx "
+            raise RuntimeError(f"{n_shards} shard(s) found but none carry visit_idx "
                                "(regenerate with scripts/selfplay_rust.py)")
         if skipped:
             print(f"  skipped {skipped} shard(s) without visit distributions")
 
-        self.boards = np.concatenate(boards).astype(np.int64)        # (N, 64)
-        self.player = np.concatenate(player).astype(np.int64)
-        self.castling = np.concatenate(castling).astype(np.int64)
-        self.ep = np.concatenate(ep).astype(np.int64)
+        self.boards = np.concatenate(boards)                          # (N, 64) uint8
+        self.player = np.concatenate(player)
+        self.castling = np.concatenate(castling)
+        self.ep = np.concatenate(ep)
         self.halfmove = np.concatenate(halfmove).astype(np.float32)
         self.z = np.concatenate(z).astype(np.float32)
         self.root_v = np.concatenate(root_v).astype(np.float32)
-        self.game_id = np.concatenate(game_id).astype(np.int64)
+        self.game_id = np.concatenate(game_id)
+        self.full = np.concatenate(full).astype(np.float32)
 
         self.v_idx = np.concatenate(v_idx)
         self.v_cnt = np.concatenate(v_cnt)
@@ -113,39 +142,58 @@ class SelfplayDataset(Dataset):
             "board": self.boards[i], "player": self.player[i],
             "castling": self.castling[i], "ep": self.ep[i],
             "halfmove": self.halfmove[i], "z": self.z[i], "root_v": self.root_v[i],
-            "v_idx": self.v_idx[a:b], "v_cnt": self.v_cnt[a:b],
+            "full": self.full[i], "v_idx": self.v_idx[a:b], "v_cnt": self.v_cnt[a:b],
         }
 
 
 def collate(batch):
     B = len(batch)
-    board = torch.from_numpy(np.stack([b["board"] for b in batch]))
+    board = torch.from_numpy(np.stack([b["board"] for b in batch])).long()
     player = torch.tensor([b["player"] for b in batch], dtype=torch.long)
     castling = torch.tensor([b["castling"] for b in batch], dtype=torch.long)
     ep = torch.tensor([b["ep"] for b in batch], dtype=torch.long)
     halfmove = torch.tensor([b["halfmove"] for b in batch], dtype=torch.float32)
     z = torch.tensor([b["z"] for b in batch], dtype=torch.float32)
     root_v = torch.tensor([b["root_v"] for b in batch], dtype=torch.float32)
+    full = torch.tensor([b["full"] for b in batch], dtype=torch.float32)
 
     # Dense, normalised visit distribution over the full action space.
     policy = torch.zeros(B, ACTION_SPACE, dtype=torch.float32)
     for i, b in enumerate(batch):
-        cnt = torch.from_numpy(b["v_cnt"])
+        cnt = torch.from_numpy(b["v_cnt"].astype(np.float32))
         total = cnt.sum()
         if total > 0:
-            policy[i, torch.from_numpy(b["v_idx"])] = cnt / total
-    return board, player, castling, ep, halfmove, z, root_v, policy
+            policy[i, torch.from_numpy(b["v_idx"].astype(np.int64))] = cnt / total
+    return board, player, castling, ep, halfmove, z, root_v, full, policy
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────
-def compute_loss(logits, value, policy_tgt, z, root_v, halfmove, ref_logits,
+def value_loss_per_sample(value, target):
+    """(per-sample loss, scalar Q) for a scalar target in [-1, 1], stm-POV.
+
+    A WDL head ([win, draw, loss] logits) is trained by cross-entropy against
+    the distribution with expectation `target` and the most draw mass,
+    (max(t, 0), 1 - |t|, max(-t, 0)) -- the one-hot outcome when t = z.
+    """
+    if value.size(-1) == 3:
+        tgt = torch.stack([target.clamp(min=0.0), 1.0 - target.abs(), (-target).clamp(min=0.0)], dim=-1)
+        logp = F.log_softmax(value.float(), dim=-1)
+        p = logp.exp()
+        return -(tgt * logp).sum(dim=-1), p[:, 0] - p[:, 2]
+    q = value.float().squeeze(-1)
+    return (q - target) ** 2, q
+
+
+def compute_loss(logits, value, policy_tgt, full, z, root_v, halfmove, ref_logits,
                  value_weight, kl_coef, soft_mix, ramp_halfmoves):
     B = logits.size(0)
     flat = logits.view(B, -1).float()
     logp = F.log_softmax(flat, dim=-1)
 
-    # Policy: cross-entropy with the soft visit-distribution target.
-    policy_loss = -(policy_tgt * logp).sum(dim=-1).mean()
+    # Policy: cross-entropy with the soft visit-distribution target, on full
+    # searches only.
+    per_pos = -(policy_tgt * logp).sum(dim=-1)
+    policy_loss = (per_pos * full).sum() / full.sum().clamp(min=1.0)
 
     # KL anchor to the frozen base policy: KL(pi || ref).
     if kl_coef > 0:
@@ -154,19 +202,45 @@ def compute_loss(logits, value, policy_tgt, z, root_v, halfmove, ref_logits,
     else:
         kl = torch.zeros((), device=logits.device)
 
-    # Value: ramped MSE against outcome z, optionally mixed toward root_v.
+    # Value: outcome z, optionally mixed toward root_v, ramped by halfmove.
     target_v = (1.0 - soft_mix) * z + soft_mix * root_v
-    progress = (halfmove / ramp_halfmoves).clamp(max=1.0)
-    value_loss = (progress * (value.float().squeeze(-1) - target_v) ** 2).mean()
+    per_v, q = value_loss_per_sample(value, target_v)
+    progress = (halfmove / ramp_halfmoves).clamp(max=1.0) if ramp_halfmoves > 0 else torch.ones_like(z)
+    value_loss = (progress * per_v).mean()
 
     total = policy_loss + value_weight * value_loss + kl_coef * kl
 
     with torch.no_grad():
         decisive = z != 0
-        sign_acc = ((value.float().squeeze(-1).sign() == z.sign()) & decisive).sum() / decisive.sum().clamp(min=1)
+        sign_acc = ((q.sign() == z.sign()) & decisive).sum() / decisive.sum().clamp(min=1)
     metrics = {"policy": policy_loss.detach(), "value": value_loss.detach(),
                "kl": kl.detach(), "sign_acc": sign_acc}
     return total, metrics
+
+
+def human_loss(model, hb, device, value_weight):
+    """Supervised loss on one batch of human shards: the played move and the
+    (tablebase-adjudicated, when the shards carry it) game result."""
+    board = hb["position"].to(device, non_blocking=True).long()
+    is_white = hb["is_white"].to(device, non_blocking=True).bool()
+    logits, value = model(board, is_white.long(),
+                          hb["castling_rights"].to(device, non_blocking=True).long(),
+                          hb["en_passant_file"].to(device, non_blocking=True).long())
+    B = board.size(0)
+    target = (hb["from_square"].to(device).long() * NUM_ACTION_PLANES
+              + hb["action_plane"].to(device).long())
+    policy = F.cross_entropy(logits.view(B, -1).float(), target)
+    result = hb["result_tb" if "result_tb" in hb else "result"].to(device).long()
+    z = torch.zeros(B, dtype=torch.float32, device=device)  # 1 = white won, 2 = black won
+    z[((result == 1) & is_white) | ((result == 2) & ~is_white)] = 1.0
+    z[((result == 1) & ~is_white) | ((result == 2) & is_white)] = -1.0
+    per_v, _ = value_loss_per_sample(value, z)
+    return policy + value_weight * per_v.mean()
+
+
+def cycle(loader):
+    while True:
+        yield from loader
 
 
 # ── EMA (fp32, mirrors pos2move_v2_trainer) ─────────────────────────────────
@@ -193,12 +267,13 @@ def evaluate(model, loader, device, args, ref_logits_fn=None):
     model.eval()
     tot = {"policy": 0.0, "value": 0.0, "sign_acc": 0.0}
     n = 0
-    for board, player, castling, ep, halfmove, z, root_v, policy in loader:
+    for board, player, castling, ep, halfmove, z, root_v, full, policy in loader:
         board, player, castling, ep = board.to(device), player.to(device), castling.to(device), ep.to(device)
         halfmove, z, root_v, policy = halfmove.to(device), z.to(device), root_v.to(device), policy.to(device)
+        full = full.to(device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
             logits, value = model(board, player, castling, ep)
-        _, m = compute_loss(logits, value, policy, z, root_v, halfmove,
+        _, m = compute_loss(logits, value, policy, full, z, root_v, halfmove,
                             logits, args.value_weight, 0.0, args.soft_mix, args.ramp_halfmoves)
         b = board.size(0)
         tot["policy"] += m["policy"].item() * b
@@ -210,10 +285,12 @@ def evaluate(model, loader, device, args, ref_logits_fn=None):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", required=True, help="dir of positions_*.npz with visit distributions")
+    p.add_argument("--data", required=True, nargs="+",
+                   help="dir(s) of positions_*.npz with visit distributions (a replay window)")
     p.add_argument("--base", default="data/models/pos2move_v2.1")
     p.add_argument("--out", required=True)
     p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--max-steps", type=int, default=0, help="stop after this many steps (0 = epochs only)")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-embedding", type=float, default=4e-5)
@@ -226,7 +303,13 @@ def main():
     p.add_argument("--ramp-halfmoves", type=float, default=40.0)
     p.add_argument("--val-frac", type=float, default=0.05, help="fraction of games held out")
     p.add_argument("--ema-decay", type=float, default=0.999)
-    p.add_argument("--patience", type=int, default=3, help="early-stop epochs without val improvement")
+    p.add_argument("--patience", type=int, default=3,
+                   help="early-stop epochs without val improvement (--select val only)")
+    p.add_argument("--select", choices=["last", "val"], default="last",
+                   help="export the final EMA weights (default) or the best val-loss epoch")
+    p.add_argument("--human-shards", default=None, help="flat shard dir for human replay")
+    p.add_argument("--human-frac", type=float, default=0.2,
+                   help="share of each step's loss (and samples) taken from --human-shards")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -237,17 +320,25 @@ def main():
     device = args.device
 
     # ── Data + game-level split ──────────────────────────────────────────
-    ds = SelfplayDataset(Path(args.data))
+    ds = SelfplayDataset([Path(d) for d in args.data])
     games = np.unique(ds.game_id)
     rng = np.random.default_rng(args.seed)
     rng.shuffle(games)
     n_val = max(1, int(args.val_frac * len(games)))
-    val_games = set(games[:n_val].tolist())
-    is_val = np.fromiter((g in val_games for g in ds.game_id), dtype=bool, count=len(ds))
+    is_val = np.isin(ds.game_id, games[:n_val])
     train_idx = np.nonzero(~is_val)[0]
     val_idx = np.nonzero(is_val)[0]
-    print(f"Positions: {len(ds):,} over {len(games):,} games | "
+    print(f"Positions: {len(ds):,} over {len(games):,} games ({ds.full.mean():.0%} full searches) | "
           f"train {len(train_idx):,} / val {len(val_idx):,} ({n_val} games)")
+
+    human_iter, human_bs = None, 0
+    if args.human_shards and args.human_frac > 0:
+        human_bs = max(1, round(args.batch_size * args.human_frac / (1.0 - args.human_frac)))
+        human_ds = FlatShardDataset(args.human_shards, "train")
+        human_iter = cycle(make_dataloader(human_ds, human_bs, shuffle=True, num_workers=2,
+                                           drop_last=True, seed=args.seed))
+        print(f"Human replay: {args.human_shards} ({len(human_ds):,} samples), "
+              f"{human_bs}/step, loss share {args.human_frac:.0%}")
 
     train_loader = DataLoader(torch.utils.data.Subset(ds, train_idx), batch_size=args.batch_size,
                               shuffle=True, num_workers=args.num_workers, collate_fn=collate,
@@ -282,6 +373,8 @@ def main():
         {"params": nodecay_p, "lr": args.lr, "weight_decay": 0.0},
     ])
     total_steps = max(1, len(train_loader) * args.epochs)
+    if args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
 
     def lr_lambda(step):
         if step < args.warmup_steps:
@@ -302,15 +395,20 @@ def main():
         t0 = time.time()
         run = {"policy": 0.0, "value": 0.0, "kl": 0.0}
         seen = 0
-        for board, player, castling, ep, halfmove, z, root_v, policy in train_loader:
+        for board, player, castling, ep, halfmove, z, root_v, full, policy in train_loader:
             board, player, castling, ep = board.to(device), player.to(device), castling.to(device), ep.to(device)
             halfmove, z, root_v, policy = halfmove.to(device), z.to(device), root_v.to(device), policy.to(device)
+            full = full.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
                 logits, value = model(board, player, castling, ep)
                 with torch.no_grad():
                     ref_logits, _ = ref(board, player, castling, ep)
-                loss, m = compute_loss(logits, value, policy, z, root_v, halfmove, ref_logits,
+                loss, m = compute_loss(logits, value, policy, full, z, root_v, halfmove, ref_logits,
                                        args.value_weight, args.kl_coef, args.soft_mix, args.ramp_halfmoves)
+                if human_iter is not None:
+                    h = human_loss(model, next(human_iter), device, args.value_weight)
+                    loss = (1.0 - args.human_frac) * loss + args.human_frac * h
+                    m["human"] = h.detach()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if args.max_grad_norm > 0:
@@ -322,8 +420,15 @@ def main():
             run["policy"] += m["policy"].item() * b
             run["value"] += m["value"].item() * b
             run["kl"] += m["kl"].item() * b
+            if "human" in m:
+                run["human"] = run.get("human", 0.0) + m["human"].item() * b
             seen += b
             step += 1
+            if step % 500 == 0:
+                print(f"  step {step}/{total_steps} | policy={run['policy'] / seen:.4f} "
+                      f"value={run['value'] / seen:.4f} kl={run['kl'] / seen:.4f}", flush=True)
+            if step >= total_steps:
+                break
         tr = {k: v / seen for k, v in run.items()}
 
         # Validate with EMA weights.
@@ -331,22 +436,26 @@ def main():
         val = evaluate(model, val_loader, device, args)
         val_loss = val["policy"] + args.value_weight * val["value"]
         print(f"Epoch {epoch}/{args.epochs} ({time.time()-t0:.0f}s) | "
-              f"train policy={tr['policy']:.4f} value={tr['value']:.4f} kl={tr['kl']:.4f} | "
+              f"train policy={tr['policy']:.4f} value={tr['value']:.4f} kl={tr['kl']:.4f}"
+              + (f" human={tr['human']:.4f}" if "human" in tr else "") + " | "
               f"val policy={val['policy']:.4f} value={val['value']:.4f} sign_acc={val['sign_acc']:.4f}")
 
         if val_loss < best_val - 1e-4:
             best_val = val_loss
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            if args.select == "val":
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             bad_epochs = 0
             print(f"  -> new best (val_loss={val_loss:.4f})")
         else:
             bad_epochs += 1
         swap_ema(model, ema)  # restore live weights for next epoch
-        if bad_epochs >= args.patience:
+        if step >= total_steps:
+            break
+        if args.select == "val" and bad_epochs >= args.patience:
             print(f"  early stop: no improvement for {args.patience} epochs")
             break
 
-    if best_state is None:  # never improved; export EMA of current
+    if best_state is None:  # --select last, or never improved: export the final EMA
         swap_ema(model, ema)
         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
@@ -355,9 +464,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     save_file(best_state, str(out / "model.safetensors"))
     shutil.copy(Path(args.base) / "model_config.json", out / "model_config.json")
-    meta = {"base": str(args.base), "data": str(args.data), "epochs": epoch,
+    meta = {"base": str(args.base), "data": [str(d) for d in args.data], "epochs": epoch,
+            "steps": step, "select": args.select,
             "kl_coef": args.kl_coef, "value_weight": args.value_weight, "soft_mix": args.soft_mix,
-            "baseline_val": base_val, "best_val_loss": best_val}
+            "human_shards": args.human_shards, "human_frac": args.human_frac if args.human_shards else 0.0,
+            "baseline_val": base_val, "last_val": val, "best_val_loss": best_val}
     (out / "expert_iter_meta.json").write_text(json.dumps(meta, indent=2))
     print(f"\nSaved to {out}. Gate vs base with scripts/engine_match.py before promoting.")
 
