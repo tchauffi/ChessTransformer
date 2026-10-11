@@ -16,11 +16,15 @@
 # data/shards/full2500_k8_v2 holds byte-identical samples to full2500_k8 -- only the new
 # label fields differ. The offset needs a WDL head, so this is also the first WDL run.
 #
-# --value-loss-weight 9: run_023 trained MSE at 5.0, which the old ramp-broadcast bug
-# made ~4.0 effective, i.e. a per-sample value gradient of ~4 x 2|v-z| ~ 6.8 against the
-# policy's ~0.8. WDL cross-entropy's gradient is ~0.77 per unit weight, so 9 keeps the
-# value/policy balance in the shared trunk where production had it. --value-rampup-halfmoves
-# 0 is what the bug effectively did too. Not swept -- a deliberate "change one thing" choice.
+# --value-loss-weight 9 was meant to keep run_023's value/policy balance in the trunk
+# (MSE 5.0, ~4.0 effective after the old ramp-broadcast bug), estimated from the loss
+# gradient at the head's output. MEASURED 2026-10-08 at step 40k, through the trunk itself:
+# |g_value|/|g_policy| per layer is 1.3-5.3 in run_026 vs 0.26-1.83 in run_023, i.e. ~2.75x
+# run_023's value share in the shared layers (median over layers 0-13), and ~5x in the last
+# three. Policy CE trailed run_023 by a flat ~0.035 from 15k on. Both optimizers are
+# scale-invariant, so the weight sets only that share -- ~3 matches run_023. Override with
+# trailing args (argparse keeps the last): `scripts/train_value_targets.sh --value-loss-weight 3`.
+# --value-rampup-halfmoves 0 is what the old bug effectively did too.
 #
 # Control run (same WDL head and weight, human labels, no offset):
 #   LABELS=human ELO_OFFSET=0 scripts/train_value_targets.sh
