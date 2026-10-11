@@ -12,12 +12,25 @@
 //! negamax backup, terminal rules incl. in-search threefold repetition).
 //! Encodings and tree primitives live in the shared `chess-core` crate —
 //! see the parity test.
+//!
+//! Two expert-iteration options, both off by default (parity holds):
+//!
+//! * Playout cap randomization (KataGo): with `fast_sims > 0`, each move is a
+//!   full search (`num_sims`) with probability `full_frac`, else a fast one
+//!   (`fast_sims`). Every position is recorded with a `full` flag; only full
+//!   searches are strong enough to be policy targets, while all of them carry
+//!   the game outcome. Fast moves buy more games -- more independent value
+//!   labels -- per GPU hour.
+//! * Root Dirichlet noise (AlphaZero): on full searches the root priors are
+//!   mixed `(1 - eps) * p + eps * Dir(alpha)`. Without it a move under ~0.5 %
+//!   prior is never visited, so the visit target can only re-confirm the prior.
 
 use std::collections::HashMap;
 
 use chess_core::encoding::{
     action_plane, encode_position, halfmove, move_coords, terminal_value, zobrist, NUM_PLANES,
 };
+use chess_core::search::sample_gamma;
 use chess_core::tree::{backup_vl, puct_select, softmax_priors, Node};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
 use pyo3::prelude::*;
@@ -37,6 +50,7 @@ struct Rec {
     ep: u8,
     halfmove: u16,
     root_v: f32,
+    full: u8,
     visit_idx: Vec<u16>, // from_sq * 73 + plane
     visit_cnt: Vec<u16>,
 }
@@ -49,6 +63,9 @@ struct Game {
     tree: Vec<Node>,
     sims_done: u32,
     inflight: u32,
+    move_sims: u32,      // search budget of the current move
+    full: bool,          // current move is a full search (policy target)
+    noise_applied: bool, // root noise already mixed into this move's root
     records: Vec<Rec>,
     moves_uci: Vec<String>,
     resign_allowed: bool,
@@ -100,7 +117,12 @@ struct Config {
     #[serde(default = "d_noresign")] no_resign_frac: f64,
     #[serde(default = "d_max_plies")] max_plies: u32,
     #[serde(default = "d_tt_cap")] tt_cap: usize,
+    #[serde(default)] fast_sims: u32,
+    #[serde(default = "d_one_f64")] full_frac: f64,
+    #[serde(default)] dirichlet_alpha: f64,
+    #[serde(default = "d_dir_eps")] dirichlet_eps: f64,
 }
+fn d_dir_eps() -> f64 { 0.25 }
 fn d_games() -> usize { 64 }
 fn d_leaves() -> u32 { 4 }
 fn d_cpuct() -> f64 { 1.0 }
@@ -126,6 +148,9 @@ struct Engine {
     nn_items: Vec<NnItem>,
     nn_index: HashMap<u64, usize>,
     tt: HashMap<u64, (Vec<f32>, f32)>, // priors (legal-move order) + stm value
+    // The previous TT generation. A full TT is rotated here instead of cleared, so the
+    // subtrees of the searches in progress stay cached across the rotation.
+    tt_old: HashMap<u64, (Vec<f32>, f32)>,
     finished: Vec<Finished>,
     rng: StdRng,
     started: usize,
@@ -139,11 +164,52 @@ impl Engine {
         vec![Node::default()]
     }
 
+    /// TT lookup across both generations; an old-generation hit is promoted.
+    fn tt_get(&mut self, key: u64) -> Option<(Vec<f32>, f32)> {
+        if let Some(e) = self.tt.get(&key) {
+            return Some(e.clone());
+        }
+        let e = self.tt_old.get(&key)?.clone();
+        self.tt.insert(key, e.clone());
+        Some(e)
+    }
+
+    /// (search budget, is_full) for the next move.
+    fn draw_budget(&mut self) -> (u32, bool) {
+        if self.cfg.fast_sims == 0 || self.rng.gen::<f64>() < self.cfg.full_frac {
+            (self.cfg.num_sims, true)
+        } else {
+            (self.cfg.fast_sims, false)
+        }
+    }
+
+    /// Mix Dirichlet noise into the root priors, once per full search, as soon as
+    /// the root is expanded. Never touches the TT, which keeps the clean priors.
+    fn maybe_noise_root(&mut self, gi: usize) {
+        let alpha = self.cfg.dirichlet_alpha;
+        let g = &self.games[gi];
+        if alpha <= 0.0 || !g.full || g.noise_applied || !g.tree[0].expanded {
+            return;
+        }
+        let k = g.tree[0].priors.len();
+        let noise: Vec<f64> = (0..k).map(|_| sample_gamma(&mut self.rng, alpha)).collect();
+        let total: f64 = noise.iter().sum();
+        let eps = self.cfg.dirichlet_eps;
+        let g = &mut self.games[gi];
+        if total > 0.0 {
+            for (p, n) in g.tree[0].priors.iter_mut().zip(&noise) {
+                *p = ((1.0 - eps) * (*p as f64) + eps * n / total) as f32;
+            }
+        }
+        g.noise_applied = true;
+    }
+
     fn new_game(&mut self) -> Game {
         let oi = self.rng.gen_range(0..self.openings.len());
         let pos = self.openings[oi].clone();
         let id = self.started;
         self.started += 1;
+        let (move_sims, full) = self.draw_budget();
         Game {
             id,
             start_fen: self.opening_fens[oi].clone(),
@@ -152,6 +218,9 @@ impl Engine {
             tree: Self::fresh_tree(),
             sims_done: 0,
             inflight: 0,
+            move_sims,
+            full,
+            noise_applied: false,
             records: Vec::new(),
             moves_uci: Vec::new(),
             resign_allowed: self.rng.gen::<f64>() >= self.cfg.no_resign_frac,
@@ -257,10 +326,12 @@ impl Engine {
             (best, rv, visit_idx, visit_cnt)
         };
 
+        let full = self.games[gi].full as u8;
         self.games[gi].records.push(Rec {
             tokens, player, castling, ep,
             halfmove: halfmove.min(u16::MAX as u32) as u16,
             root_v,
+            full,
             visit_idx, visit_cnt,
         });
         self.positions_recorded += 1;
@@ -327,9 +398,13 @@ impl Engine {
                 }
             }
             None => {
+                let (move_sims, full) = self.draw_budget();
                 let game = &mut self.games[gi];
                 game.tree = Self::fresh_tree();
                 game.sims_done = 0;
+                game.move_sims = move_sims;
+                game.full = full;
+                game.noise_applied = false;
             }
         }
     }
@@ -361,6 +436,7 @@ impl Engine {
             nn_items: Vec::new(),
             nn_index: HashMap::new(),
             tt: HashMap::new(),
+            tt_old: HashMap::new(),
             finished: Vec::new(),
             rng: StdRng::seed_from_u64(seed),
             started: 0,
@@ -393,7 +469,7 @@ impl Engine {
             }
             for _ in 0..self.cfg.leaves_per_wave {
                 let g = &self.games[gi];
-                if g.sims_done + g.inflight >= self.cfg.num_sims {
+                if g.sims_done + g.inflight >= g.move_sims {
                     break;
                 }
                 let root_unexpanded = !self.games[gi].tree[0].expanded;
@@ -411,9 +487,12 @@ impl Engine {
                     continue;
                 }
                 let moves: Vec<Move> = pos.legal_moves().to_vec();
-                if let Some((priors, value)) = self.tt.get(&key).cloned() {
+                if let Some((priors, value)) = self.tt_get(key) {
                     let game = &mut self.games[gi];
                     Self::resolve_leaf(game, node_idx, moves, &priors, value, &path);
+                    if node_idx == 0 {
+                        self.maybe_noise_root(gi);
+                    }
                     continue;
                 }
                 self.nn_index.entry(key).or_insert_with(|| {
@@ -477,7 +556,7 @@ impl Engine {
         }
 
         if self.tt.len() + self.nn_items.len() > self.cfg.tt_cap {
-            self.tt.clear(); // crude but rare; avoids unbounded growth
+            self.tt_old = std::mem::take(&mut self.tt);
         }
         for (i, item) in self.nn_items.iter().enumerate() {
             let mut scores: Vec<f32> = item
@@ -495,6 +574,9 @@ impl Engine {
             let game = &mut self.games[leaf.game];
             Self::resolve_leaf(game, leaf.node, leaf.moves, &priors, value, &leaf.path);
             game.inflight -= 1;
+            if leaf.node == 0 {
+                self.maybe_noise_root(leaf.game);
+            }
         }
         self.nn_items.clear();
         self.nn_index.clear();
@@ -502,7 +584,7 @@ impl Engine {
         for gi in 0..self.games.len() {
             if self.games[gi].active
                 && self.games[gi].inflight == 0
-                && self.games[gi].sims_done >= self.cfg.num_sims
+                && self.games[gi].sims_done >= self.games[gi].move_sims
             {
                 self.finish_move(gi);
             }
@@ -521,6 +603,7 @@ impl Engine {
                 (Vec::with_capacity(p), Vec::with_capacity(p), Vec::with_capacity(p));
             let mut halfmove = Vec::with_capacity(p);
             let (mut root_v, mut z) = (Vec::with_capacity(p), Vec::with_capacity(p));
+            let mut full = Vec::with_capacity(p);
             let (mut visit_idx, mut visit_cnt) = (Vec::new(), Vec::new());
             let mut visit_ptr = Vec::with_capacity(p + 1);
             visit_ptr.push(0i64);
@@ -531,6 +614,7 @@ impl Engine {
                 ep.push(r.ep);
                 halfmove.push(r.halfmove);
                 root_v.push(r.root_v);
+                full.push(r.full);
                 z.push(if r.player == 1 { f.z_white } else { -f.z_white });
                 visit_idx.extend_from_slice(&r.visit_idx);
                 visit_cnt.extend_from_slice(&r.visit_cnt);
@@ -543,6 +627,7 @@ impl Engine {
             d.set_item("ep", ep.into_pyarray(py))?;
             d.set_item("halfmove", halfmove.into_pyarray(py))?;
             d.set_item("root_v", root_v.into_pyarray(py))?;
+            d.set_item("full", full.into_pyarray(py))?;
             d.set_item("z", z.into_pyarray(py))?;
             d.set_item("visit_idx", visit_idx.into_pyarray(py))?;
             d.set_item("visit_cnt", visit_cnt.into_pyarray(py))?;
@@ -564,7 +649,7 @@ impl Engine {
 
     /// (games started, games completed, positions recorded, TT entries)
     fn stats(&self) -> (usize, usize, usize, usize) {
-        (self.started, self.completed, self.positions_recorded, self.tt.len())
+        (self.started, self.completed, self.positions_recorded, self.tt.len() + self.tt_old.len())
     }
 }
 
