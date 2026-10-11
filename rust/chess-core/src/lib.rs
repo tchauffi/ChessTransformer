@@ -13,4 +13,5 @@ pub mod encoding;
 pub mod eval;
 pub mod matchplay;
 pub mod search;
+pub mod selfplay;
 pub mod tree;
