@@ -25,7 +25,9 @@
 //!   mixed `(1 - eps) * p + eps * Dir(alpha)`. Without it a move under ~0.5 %
 //!   prior is never visited, so the visit target can only re-confirm the prior.
 //!
-//! `MatchEngine` (matches.rs) plays matches with the deployed bot's own search.
+//! `SelfPlayEngine` (selfplay_engine.rs) runs self-play on the deployed bot's
+//! own search instead, and `MatchEngine` (matches.rs) plays matches with it;
+//! this engine's search is the older one, kept for comparison.
 
 use std::collections::HashMap;
 
@@ -44,6 +46,7 @@ use shakmaty::fen::Fen;
 use shakmaty::{CastlingMode, Chess, Color, Move, Position};
 
 mod matches;
+mod selfplay_engine;
 
 // ── per-game state ───────────────────────────────────────────────────────
 
@@ -706,6 +709,7 @@ fn debug_zobrist(fen: &str) -> PyResult<u64> {
 fn selfplay_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<matches::MatchEngine>()?;
+    m.add_class::<selfplay_engine::SelfPlayEngine>()?;
     m.add_function(wrap_pyfunction!(debug_encode, m)?)?;
     m.add_function(wrap_pyfunction!(debug_move_planes, m)?)?;
     m.add_function(wrap_pyfunction!(debug_zobrist, m)?)?;
