@@ -70,10 +70,39 @@ class ReluSquared(nn.Module):
     def forward(self, x):
         return F.relu(x) ** 2
 
+class Smolgen(nn.Module):
+    """Position-dependent attention bias, after Leela Chess Zero's "smolgen".
+
+    The relation table gives each head one fixed bias per pair of squares, the same
+    in every position. Smolgen reads the whole board and writes a bias per head and
+    per pair for *this* position, so a head can follow an open file or a pin rather
+    than a geometric pattern. The board is compressed to a few numbers per token,
+    flattened, and mapped to a small code per head; one projection shared by every
+    layer (``gen_proj``, owned by the model) expands each code to a (T, T) bias.
+    Leela reports it plays as if the network were 50% larger, for 10% throughput.
+    """
+
+    def __init__(self, dim, num_heads, context_size, compress, hidden, gen):
+        super().__init__()
+        self.compress = nn.Linear(dim, compress, bias=False)
+        self.dense1 = nn.Linear(context_size * compress, hidden)
+        self.norm1 = nn.LayerNorm(hidden)
+        self.dense2 = nn.Linear(hidden, num_heads * gen)
+        self.norm2 = nn.LayerNorm(num_heads * gen)
+        self.num_heads = num_heads
+        self.context_size = context_size
+
+    def forward(self, x, gen_proj):  # (B, T, D) -> (B, H, T, T)
+        h = self.compress(x).flatten(1)
+        h = self.norm1(F.silu(self.dense1(h)))
+        h = self.norm2(F.silu(self.dense2(h))).unflatten(-1, (self.num_heads, -1))
+        return gen_proj(h).unflatten(-1, (self.context_size, self.context_size))
+
+
 class ChessGroupedQueryAttention(nn.Module):
     def __init__(
         self, d_in, d_out, num_heads, num_kv_groups, context_size, dropout=0.0, qkv_bias=False,
-        state_relation=False,
+        state_relation=False, attn_bias="buckets", smolgen=None,
     ):
         super().__init__()
 
@@ -99,14 +128,36 @@ class ChessGroupedQueryAttention(nn.Module):
         # Chess-geometry relative bias: one learned scalar per (head, relation).
         # Massively fewer params than a fully-learned (H, T, T) bias.
         self.num_relations = 9 if state_relation else 8
-        self.bias_table = nn.Parameter(torch.zeros(num_heads, self.num_relations))
         self.register_buffer(
             "rel_idx", _RELATION_INDEX_STATE if state_relation else _RELATION_INDEX,
             persistent=False,
         )
+        # attn_bias "full" learns one scalar per (head, token pair) instead. The
+        # relation buckets tie together pairs that should differ: two of the eight
+        # (king-adjacent, nearby) are shadowed by the file / rank / diagonal / knight
+        # rules and match no pair at all, 55% of square pairs share "far", and the
+        # table cannot tell a pawn's forward capture from a backward diagonal. A
+        # bucket checkpoint loads into it exactly (see _load_from_state_dict), and it
+        # costs nothing at inference: attention already takes a full (H, T, T) mask.
+        if attn_bias == "buckets":
+            self.bias_table = nn.Parameter(torch.zeros(num_heads, self.num_relations))
+            self.bias_full = None
+        elif attn_bias == "full":
+            self.bias_table = None
+            self.bias_full = nn.Parameter(torch.zeros(num_heads, context_size, context_size))
+        else:
+            raise ValueError(f"attn_bias must be 'buckets' or 'full', got {attn_bias!r}")
+        self.smolgen = Smolgen(d_in, num_heads, context_size, **smolgen) if smolgen else None
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # A bucket checkpoint into a full-table model: expand the table to the pairs.
+        old, new = prefix + "bias_table", prefix + "bias_full"
+        if self.bias_full is not None and old in state_dict and new not in state_dict:
+            table = state_dict.pop(old)
+            state_dict[new] = table[:, self.rel_idx.to(table.device)]
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-    def forward(self, x):
+    def forward(self, x, gen_proj=None):
         batch_size, num_tokens, embed_dim = x.shape
 
         queries = self.q_proj(x)
@@ -128,7 +179,12 @@ class ChessGroupedQueryAttention(nn.Module):
 
         # Build additive chess-geometry bias from the compact (H, 8) table.
         # Shape: (1, H, T, T) so SDPA broadcasts it across the batch.
-        attn_bias = self.bias_table[:, self.rel_idx].unsqueeze(0)
+        if self.bias_full is not None:
+            attn_bias = self.bias_full.unsqueeze(0)
+        else:
+            attn_bias = self.bias_table[:, self.rel_idx].unsqueeze(0)
+        if self.smolgen is not None:
+            attn_bias = attn_bias + self.smolgen(x, gen_proj)  # (B, H, T, T)
 
         context_vec = F.scaled_dot_product_attention(
             queries, keys, values,
@@ -160,7 +216,7 @@ class MLP(nn.Module):
     
 class ChessTransformerLayer(nn.Module):
     def __init__(self, dim, nb_heads, qkv_bias, context_size, dropout=0.1, layer_drop=0.0,
-                 state_relation=False):
+                 state_relation=False, attn_bias="buckets", smolgen=None):
         super().__init__()
         self.attn = ChessGroupedQueryAttention(
             d_in=dim,
@@ -171,23 +227,25 @@ class ChessTransformerLayer(nn.Module):
             dropout=dropout,
             qkv_bias=qkv_bias,
             state_relation=state_relation,
+            attn_bias=attn_bias,
+            smolgen=smolgen,
         )
         self.mlp = MLP(dim, dim * 4, dim, dropout=dropout)
         self.norm1 = nn.RMSNorm(dim)
         self.norm2 = nn.RMSNorm(dim)
         self.layer_drop = layer_drop
 
-    def forward(self, x):
+    def forward(self, x, gen_proj=None):
         # Stochastic depth: with prob `layer_drop`, skip the entire layer.
         # Applied independently to attn and mlp branches (sub-layer LayerDrop).
         if self.training and self.layer_drop > 0.0:
             # Per-sample keep mask would be more standard, but per-layer scalar matches your old behavior.
             keep_attn = torch.empty(1, device=x.device, dtype=x.dtype).bernoulli_(1.0 - self.layer_drop)
             keep_mlp  = torch.empty(1, device=x.device, dtype=x.dtype).bernoulli_(1.0 - self.layer_drop)
-            x = x + keep_attn * self.attn(self.norm1(x))
+            x = x + keep_attn * self.attn(self.norm1(x), gen_proj)
             x = x + keep_mlp  * self.mlp(self.norm2(x))
         else:
-            x = x + self.attn(self.norm1(x))
+            x = x + self.attn(self.norm1(x), gen_proj)
             x = x + self.mlp(self.norm2(x))
         return x
     
@@ -234,6 +292,11 @@ class Pos2MoveV2(nn.Module):
         state_relation: bool = False,
         value_elo_offset: bool = False,
         head_tower_layers: int = 0,
+        attn_bias: str = "buckets",
+        smolgen: bool = False,
+        smolgen_compress: int = 8,
+        smolgen_hidden: int = 128,
+        smolgen_gen: int = 64,
     ):
         super().__init__()
         if not 0 <= head_tower_layers < nb_transformer_layers:
@@ -282,6 +345,13 @@ class Pos2MoveV2(nn.Module):
         drop_rates = [layer_drop * i / max(1, nb_transformer_layers - 1)
                       for i in range(nb_transformer_layers)]
 
+        # Smolgen (see Smolgen): one (gen -> T*T) projection shared by every layer, as in
+        # Leela. It starts at zero, so a converted checkpoint plays exactly as before
+        # until training moves it.
+        smol = (dict(compress=smolgen_compress, hidden=smolgen_hidden, gen=smolgen_gen)
+                if smolgen else None)
+        self.smolgen_proj = nn.Linear(smolgen_gen, 67 * 67, bias=False) if smolgen else None
+
         def make_layer(i):
             return ChessTransformerLayer(
                 dim=embed_dim,
@@ -291,6 +361,8 @@ class Pos2MoveV2(nn.Module):
                 dropout=dropout,
                 layer_drop=drop_rates[i],
                 state_relation=state_relation,
+                attn_bias=attn_bias,
+                smolgen=smol,
             )
 
         # Per-head towers: the last `head_tower_layers` layers are duplicated, one copy
@@ -387,6 +459,8 @@ class Pos2MoveV2(nn.Module):
             with torch.no_grad():
                 layer.attn.proj.weight.mul_(scale)
                 layer.mlp.fc2.weight.mul_(scale)
+        if self.smolgen_proj is not None:
+            nn.init.zeros_(self.smolgen_proj.weight)
 
     def _trunk(self, board_tokens, player_token, castling_token, en_passant_token):
         """Shared forward up to the heads.
@@ -409,15 +483,16 @@ class Pos2MoveV2(nn.Module):
             player_emb + pos_emb[66],
         ], dim=1)  # (B, 67, D)
 
+        g = self.smolgen_proj
         for layer in self.transformer_layers:
-            x = layer(x)
+            x = layer(x, g)
 
         if self.head_tower_layers:
             xv = x
             for layer in self.policy_tower:
-                x = layer(x)
+                x = layer(x, g)
             for layer in self.value_tower:
-                xv = layer(xv)
+                xv = layer(xv, g)
             xv = self.value_norm(xv)
         x = self.final_norm(x)
         if not self.head_tower_layers:
