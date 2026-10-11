@@ -49,6 +49,9 @@ from chesstransformer.models.transformer.pos2move_v2 import Pos2MoveV2
 
 def load_model(base: Path, device: str) -> Pos2MoveV2:
     cfg = json.loads((base / "model_config.json").read_text())
+    if cfg.get("head_tower_layers"):
+        # extract_features reads the value features off the shared trunk.
+        raise SystemExit(f"{base} has per-head towers; this script only handles a shared trunk")
     m = Pos2MoveV2(**cfg)
     with safe_open(str(base / "model.safetensors"), framework="pt", device="cpu") as f:
         sd = {k: f.get_tensor(k) for k in f.keys()}

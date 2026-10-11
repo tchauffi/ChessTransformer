@@ -492,6 +492,12 @@ def main():
     parser.add_argument("--state-relation", action="store_true",
                         help="Give state-token<->square attention its own relation bias bucket "
                              "(9 categories) instead of sharing bucket 7 with 'far apart'.")
+    parser.add_argument("--head-tower-layers", type=int, default=0,
+                        help="Give each head a private copy of the last N transformer layers, so "
+                             "only the first num_layers - N are shared. Each head's path keeps "
+                             "num_layers layers; inference costs N extra layers. With towers, "
+                             "--value-loss-weight only sets the value objective's share of the "
+                             "shared layers (both optimizers are scale-invariant). 0 = v2.1.")
     # Model
     parser.add_argument("--preset", type=str, default="base", choices=list(PRESETS),
                         help="Model size. See PRESETS for per-GPU DDP memory. Individual "
@@ -722,6 +728,7 @@ def main():
         "value_pool": args.value_pool,
         "state_relation": args.state_relation,
         "value_elo_offset": args.elo_offset,
+        "head_tower_layers": args.head_tower_layers,
     }
     if accelerator.is_main_process:
         with (log_path / "model_config.json").open("w") as f:

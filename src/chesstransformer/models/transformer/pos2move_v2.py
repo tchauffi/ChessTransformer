@@ -233,8 +233,13 @@ class Pos2MoveV2(nn.Module):
         value_pool: str = "state",
         state_relation: bool = False,
         value_elo_offset: bool = False,
+        head_tower_layers: int = 0,
     ):
         super().__init__()
+        if not 0 <= head_tower_layers < nb_transformer_layers:
+            raise ValueError(
+                f"head_tower_layers must be in [0, {nb_transformer_layers}), got {head_tower_layers}"
+            )
         if value_head_type not in ("scalar", "wdl"):
             raise ValueError(f"value_head_type must be 'scalar' or 'wdl', got {value_head_type!r}")
         if value_pool not in ("state", "attn"):
@@ -277,22 +282,34 @@ class Pos2MoveV2(nn.Module):
         drop_rates = [layer_drop * i / max(1, nb_transformer_layers - 1)
                       for i in range(nb_transformer_layers)]
 
-        self.transformer_layers = nn.ModuleList(
-            [
-                ChessTransformerLayer(
-                    dim=embed_dim,
-                    nb_heads=num_heads,
-                    qkv_bias=kvq_bias,
-                    context_size=67,  # Max sequence length (64 squares + 3 extra tokens)
-                    dropout=dropout,
-                    layer_drop=drop_rates[i],
-                    state_relation=state_relation,
-                )
-                for i in range(nb_transformer_layers)
-            ]
-        )
+        def make_layer(i):
+            return ChessTransformerLayer(
+                dim=embed_dim,
+                nb_heads=num_heads,
+                qkv_bias=kvq_bias,
+                context_size=67,  # Max sequence length (64 squares + 3 extra tokens)
+                dropout=dropout,
+                layer_drop=drop_rates[i],
+                state_relation=state_relation,
+            )
+
+        # Per-head towers: the last `head_tower_layers` layers are duplicated, one copy
+        # private to each head, so each head still sees nb_transformer_layers layers but
+        # only the first nb - K are shared. The two objectives barely *conflict* --
+        # their trunk gradients are near-orthogonal (|cos| < 0.11 in every layer of
+        # run_026) -- they *compete*: Muon and AdamW are scale-invariant, so the value
+        # loss weight sets nothing but the value objective's share of each update to
+        # the parameters both heads train. A tower gives each head layers it does not
+        # have to share; the weight then only balances the shared part. 0 = v2.1.
+        n_shared = nb_transformer_layers - head_tower_layers
+        self.head_tower_layers = head_tower_layers
+        self.transformer_layers = nn.ModuleList([make_layer(i) for i in range(n_shared)])
+        tower = range(n_shared, nb_transformer_layers)
+        self.policy_tower = nn.ModuleList([make_layer(i) for i in tower]) if head_tower_layers else None
+        self.value_tower = nn.ModuleList([make_layer(i) for i in tower]) if head_tower_layers else None
 
         self.final_norm = nn.RMSNorm(embed_dim)
+        self.value_norm = nn.RMSNorm(embed_dim) if head_tower_layers else None
 
         policy_hidden = embed_dim // 2
         self.move_head = nn.Sequential(
@@ -360,9 +377,13 @@ class Pos2MoveV2(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        # Scale down the projections that write into the residual stream
+        # Scale down the projections that write into the residual stream. A tower layer
+        # sits at the same depth of its head's path as the layer it replaces, so it
+        # gets the same scale.
         scale = (2 * nb_layers) ** -0.5
-        for layer in self.transformer_layers:
+        for layer in self.modules():
+            if not isinstance(layer, ChessTransformerLayer):
+                continue
             with torch.no_grad():
                 layer.attn.proj.weight.mul_(scale)
                 layer.mlp.fc2.weight.mul_(scale)
@@ -391,12 +412,21 @@ class Pos2MoveV2(nn.Module):
         for layer in self.transformer_layers:
             x = layer(x)
 
+        if self.head_tower_layers:
+            xv = x
+            for layer in self.policy_tower:
+                x = layer(x)
+            for layer in self.value_tower:
+                xv = layer(xv)
+            xv = self.value_norm(xv)
         x = self.final_norm(x)
+        if not self.head_tower_layers:
+            xv = x
 
         if self.value_pool is not None:
-            value_features = self.value_pool(x)  # (B, D) over all 67 tokens
+            value_features = self.value_pool(xv)  # (B, D) over all 67 tokens
         else:
-            value_features = x[:, -3:, :].mean(dim=1)  # v2.1: mean of the 3 state tokens
+            value_features = xv[:, -3:, :].mean(dim=1)  # v2.1: mean of the 3 state tokens
 
         move_logits = self.move_head(x[:, :64, :])  # (B, 64, NUM_ACTION_PLANES)
         return move_logits, value_features
