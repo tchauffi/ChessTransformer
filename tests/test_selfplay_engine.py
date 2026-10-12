@@ -55,7 +55,7 @@ def _visit_sums(g):
 
 def test_same_records_as_the_legacy_engine():
     new, old = _run(dict(num_sims=16))[0], _run(dict(num_sims=16), cls=selfplay_core.Engine)[0]
-    assert set(new) == set(old)
+    assert set(new) == set(old) | {"rule50", "repetition"}  # the legacy engine predates them
     for k in ("boards", "player", "castling", "ep", "halfmove", "root_v", "full", "z",
               "visit_idx", "visit_cnt", "visit_ptr"):
         assert new[k].dtype == old[k].dtype, k
