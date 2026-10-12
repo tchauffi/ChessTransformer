@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Convert a Pos2MoveV2 checkpoint to a richer attention bias without changing its play.
+"""Convert a Pos2MoveV2 checkpoint to opt-in architecture features without changing its play.
 
-  --full     relation buckets -> one learned bias per (head, token pair), filled from
-             the buckets, so every pair starts at the value it had.
-  --smolgen  add Leela-style position-dependent attention bias (Smolgen); its shared
-             output projection starts at zero, so it adds nothing until trained.
+  --full        relation buckets -> one learned bias per (head, token pair), filled from
+                the buckets, so every pair starts at the value it had.
+  --smolgen     add Leela-style position-dependent attention bias (Smolgen); its shared
+                output projection starts at zero, so it adds nothing until trained.
+  --rule-state  add the fifty-move counter and repetition count inputs; their embeddings
+                start at zero, so they add nothing until trained.
+
+Features the source already has are kept, so a converted checkpoint can be converted again.
 
 The converted network computes the same function as the source. The script checks that
 on random positions and on the start position before saving.
@@ -30,13 +34,14 @@ def main():
     p.add_argument("--dst", required=True)
     p.add_argument("--full", action="store_true", help="attn_bias 'full'")
     p.add_argument("--smolgen", action="store_true")
+    p.add_argument("--rule-state", action="store_true", help="rule50 + repetition inputs")
     p.add_argument("--compress", type=int, default=8)
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--gen", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
-    if not (args.full or args.smolgen):
-        p.error("nothing to convert: pass --full and/or --smolgen")
+    if not (args.full or args.smolgen or args.rule_state):
+        p.error("nothing to convert: pass --full, --smolgen and/or --rule-state")
 
     src, dst = Path(args.src), Path(args.dst)
     cfg = json.loads((src / "model_config.json").read_text())
@@ -50,10 +55,13 @@ def main():
     if args.smolgen:
         new_cfg.update(smolgen=True, smolgen_compress=args.compress, smolgen_hidden=args.hidden,
                        smolgen_gen=args.gen)
+    if args.rule_state:
+        new_cfg["rule_state"] = True
     torch.manual_seed(args.seed)
     new = Pos2MoveV2(**new_cfg)
     missing, unexpected = new.load_state_dict(dict(sd), strict=False)
-    stray = [k for k in missing if "smolgen" not in k]
+    added = ("smolgen", "rule50_embedding", "repetition_embedding")
+    stray = [k for k in missing if not any(a in k for a in added)]
     if stray or unexpected:
         raise SystemExit(f"unexpected key mismatch: missing {stray}, unexpected {unexpected}")
 
@@ -66,9 +74,10 @@ def main():
     x[0][0] = torch.tensor([4, 2, 3, 5, 6, 3, 2, 4] + [1] * 8 + [0] * 32
                            + [7] * 8 + [10, 8, 9, 11, 12, 9, 8, 10])
     x[1][0], x[2][0], x[3][0] = 1, 15, 8
+    rules = dict(rule50=torch.randint(0, 101, (B,), generator=g), repetition=torch.randint(0, 3, (B,), generator=g))
     old.eval(), new.eval()
     with torch.no_grad():
-        (lo, vo), (ln, vn) = old(*x), new(*x)
+        (lo, vo), (ln, vn) = old(*x, **rules), new(*x, **rules)
     dl, dv = (lo - ln).abs().max().item(), (vo - vn).abs().max().item()
     print(f"max |d logits| {dl:.2e} | max |d value| {dv:.2e}")
     if dl > 1e-4 or dv > 1e-4:

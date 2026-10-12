@@ -8,6 +8,8 @@ NUM_ACTION_PLANES = 73
 BOARD_SQUARES = 64
 EXTRA_TOKENS = 3  # castling, en_passant, player
 CONTEXT_SIZE = BOARD_SQUARES + EXTRA_TOKENS  # 67
+RULE50_MAX = 100  # halfmove clock values 0..100; 100 = the fifty-move draw can be claimed
+REPETITION_MAX = 2  # earlier occurrences of the position: 0, 1, 2+
 
 
 def build_chess_relation_index(
@@ -297,6 +299,7 @@ class Pos2MoveV2(nn.Module):
         smolgen_compress: int = 8,
         smolgen_hidden: int = 128,
         smolgen_gen: int = 64,
+        rule_state: bool = False,
     ):
         super().__init__()
         if not 0 <= head_tower_layers < nb_transformer_layers:
@@ -339,6 +342,18 @@ class Pos2MoveV2(nn.Module):
         self.castling_embedding = nn.Embedding(16, embed_dim)  # 4-bit bitmask: 0-15
         self.en_passant_embedding = nn.Embedding(9, embed_dim)  # 8 files + no en passant (8)
         self.player_embedding = nn.Embedding(2, embed_dim)  # White or Black
+
+        # Draw rules the board cannot show: the fifty-move counter (halfmove clock) and how
+        # often the position already occurred in the game + search path. Without them a
+        # position one repetition or a few moves from a forced draw reads the same as a
+        # fresh one, and the value head has to average the two. They are added to the
+        # player token (no new token, so the attention layout is unchanged) and start at
+        # zero, so a converted checkpoint plays exactly as before until trained. Callers
+        # that pass neither (the human shards carry no game history) get the old model.
+        self.rule_state = rule_state
+        if rule_state:
+            self.rule50_embedding = nn.Embedding(RULE50_MAX + 1, embed_dim)
+            self.repetition_embedding = nn.Embedding(REPETITION_MAX + 1, embed_dim)
 
         # Linearly increasing layer drop rate: deeper layers drop more.
         # This is the "Deep Networks with Stochastic Depth" schedule.
@@ -461,8 +476,12 @@ class Pos2MoveV2(nn.Module):
                 layer.mlp.fc2.weight.mul_(scale)
         if self.smolgen_proj is not None:
             nn.init.zeros_(self.smolgen_proj.weight)
+        if self.rule_state:
+            nn.init.zeros_(self.rule50_embedding.weight)
+            nn.init.zeros_(self.repetition_embedding.weight)
 
-    def _trunk(self, board_tokens, player_token, castling_token, en_passant_token):
+    def _trunk(self, board_tokens, player_token, castling_token, en_passant_token,
+               rule50=None, repetition=None):
         """Shared forward up to the heads.
 
         Returns ``(move_logits, value_features)``. Split out so training can read
@@ -474,6 +493,11 @@ class Pos2MoveV2(nn.Module):
         castling_emb = self.castling_embedding(castling_token).unsqueeze(1)  # (B, 1, D)
         en_passant_emb = self.en_passant_embedding(en_passant_token).unsqueeze(1)  # (B, 1, D)
         player_emb = self.player_embedding(player_token).unsqueeze(1)  # (B, 1, D)
+        if self.rule_state and rule50 is not None and repetition is not None:
+            player_emb = player_emb + (
+                self.rule50_embedding(rule50.long().clamp(0, RULE50_MAX))
+                + self.repetition_embedding(repetition.long().clamp(0, REPETITION_MAX))
+            ).unsqueeze(1)
 
         x = token_emb + pos_emb[:64]  # Add positional embedding to board tokens
         x = torch.cat([
@@ -507,7 +531,7 @@ class Pos2MoveV2(nn.Module):
         return move_logits, value_features
 
     def forward(self, board_tokens, player_token, castling_token, en_passant_token,
-                elo_gap=None):
+                elo_gap=None, rule50=None, repetition=None):
         """``(move_logits, value)`` with ``value`` the **raw** head output.
 
         (B, 1) for a scalar head -- byte-identical to v2.1 -- and (B, 3) logits
@@ -519,12 +543,16 @@ class Pos2MoveV2(nn.Module):
         for training only: with ``value_elo_offset`` it shifts the win/loss logits
         by the rating gap (see ``elo_beta``). Leave it ``None`` at inference.
 
+        ``rule50`` (B,) is the halfmove clock and ``repetition`` (B,) the number of
+        earlier occurrences of the position in the game + search path; both only
+        reach a ``rule_state`` model, and only when both are given.
+
         Deliberately the only forward path: DDP registers its gradient-sync hooks
         on ``forward``, and ``torch.compile`` only traces what goes through
         ``__call__``, so a separate training entry point would quietly lose both.
         """
         move_logits, value_features = self._trunk(
-            board_tokens, player_token, castling_token, en_passant_token
+            board_tokens, player_token, castling_token, en_passant_token, rule50, repetition
         )
         value = self.value_head(value_features)
         if elo_gap is not None and self.elo_beta is not None:
