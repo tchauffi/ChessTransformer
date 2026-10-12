@@ -300,6 +300,7 @@ class Pos2MoveV2(nn.Module):
         smolgen_hidden: int = 128,
         smolgen_gen: int = 64,
         rule_state: bool = False,
+        rule50_free: int | None = None,
     ):
         super().__init__()
         if not 0 <= head_tower_layers < nb_transformer_layers:
@@ -350,9 +351,21 @@ class Pos2MoveV2(nn.Module):
         # player token (no new token, so the attention layout is unchanged) and start at
         # zero, so a converted checkpoint plays exactly as before until trained. Callers
         # that pass neither (the human shards carry no game history) get the old model.
+        #
+        # ``rule50_free`` = N: the clock reaches the network only as its distance into the
+        # last 100 - N plies before the draw, (clock - N) / (100 - N) clamped at 0, along one
+        # learned direction. Below N the input is exactly zero. ``None`` = one learned vector
+        # per clock value -- which, trained on human games, read clock 0 as "a capture was
+        # just played" and gave clocks 20+ (0.7% of human samples, common at search leaves
+        # of quiet lines) noisy embeddings: a capture and a quiet sibling then differed by a
+        # clock-dependent error of ~0.05 in value. run_029 lost to gen00 with it.
         self.rule_state = rule_state
+        self.rule50_free = rule50_free
         if rule_state:
-            self.rule50_embedding = nn.Embedding(RULE50_MAX + 1, embed_dim)
+            if rule50_free is not None and not 0 <= rule50_free < RULE50_MAX:
+                raise ValueError(f"rule50_free must be in [0, {RULE50_MAX}), got {rule50_free}")
+            rows = RULE50_MAX + 1 if rule50_free is None else 1
+            self.rule50_embedding = nn.Embedding(rows, embed_dim)
             self.repetition_embedding = nn.Embedding(REPETITION_MAX + 1, embed_dim)
 
         # Linearly increasing layer drop rate: deeper layers drop more.
@@ -494,8 +507,13 @@ class Pos2MoveV2(nn.Module):
         en_passant_emb = self.en_passant_embedding(en_passant_token).unsqueeze(1)  # (B, 1, D)
         player_emb = self.player_embedding(player_token).unsqueeze(1)  # (B, 1, D)
         if self.rule_state and rule50 is not None and repetition is not None:
+            if self.rule50_free is None:
+                clock = self.rule50_embedding(rule50.long().clamp(0, RULE50_MAX))
+            else:
+                near = (rule50.float().clamp(0, RULE50_MAX) - self.rule50_free).clamp_min(0)
+                clock = (near / (RULE50_MAX - self.rule50_free)).unsqueeze(-1) * self.rule50_embedding.weight[0]
             player_emb = player_emb + (
-                self.rule50_embedding(rule50.long().clamp(0, RULE50_MAX))
+                clock.to(player_emb.dtype)
                 + self.repetition_embedding(repetition.long().clamp(0, REPETITION_MAX))
             ).unsqueeze(1)
 

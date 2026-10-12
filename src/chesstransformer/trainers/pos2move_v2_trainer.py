@@ -506,6 +506,10 @@ def main():
     parser.add_argument("--rule-state", action="store_true",
                         help="Feed the halfmove clock and the repetition count to the model. "
                              "Needs v3 shards (build_shards.py records both).")
+    parser.add_argument("--rule50-free", type=int, default=None,
+                        help="With --rule-state: the clock reaches the model only past this many "
+                             "plies, as one ramp up to the fifty-move draw (Pos2MoveV2 "
+                             "rule50_free). Default: one learned vector per clock value.")
     parser.add_argument("--head-tower-layers", type=int, default=0,
                         help="Give each head a private copy of the last N transformer layers, so "
                              "only the first num_layers - N are shared. Each head's path keeps "
@@ -569,6 +573,8 @@ def main():
                      "pass --shards")
     if args.rule_state and args.shards is None:
         parser.error("--rule-state reads shard format v3 fields; pass --shards")
+    if args.rule50_free is not None and not args.rule_state:
+        parser.error("--rule50-free needs --rule-state")
 
     # Epochs are gone as a unit of training length. They were never comparable between the
     # two data paths — the HDF5 dataset is indexed by *game* (738 optimizer steps/epoch) and
@@ -751,6 +757,7 @@ def main():
         "attn_bias": args.attn_bias,
         "smolgen": args.smolgen,
         "rule_state": args.rule_state,
+        "rule50_free": args.rule50_free,
     }
     if accelerator.is_main_process:
         with (log_path / "model_config.json").open("w") as f:

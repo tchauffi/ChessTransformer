@@ -187,3 +187,32 @@ def test_human_shards_record_the_rule_state(tmp_path):
     batch = FlatShardDataset(out)[list(range(len(rows)))]
     assert batch["rule50"].tolist() == rows["rule50"].tolist()
     assert batch["repetition"].tolist() == rows["repetition"].tolist()
+
+
+def test_free_clock_plies_do_not_reach_the_network():
+    """rule50_free: below the threshold the clock changes nothing; past it, a smooth ramp."""
+    torch.manual_seed(0)
+    m = Pos2MoveV2(**CFG, rule_state=True, rule50_free=60).eval()
+    assert m.rule50_embedding.weight.shape == (1, CFG["embed_dim"])
+    with torch.no_grad():
+        m.rule50_embedding.weight.normal_(0.0, 0.5)
+        rep = torch.zeros(6, dtype=torch.long)
+        out = {c: m(*_inputs(), rule50=torch.full((6,), c), repetition=rep)[1] for c in (0, 30, 60, 61, 80, 100)}
+    assert torch.equal(out[0], out[30]) and torch.equal(out[0], out[60])
+    assert not torch.allclose(out[60], out[61])
+    d = lambda a, b: (out[a] - out[b]).abs().mean()
+    assert d(60, 61) < d(60, 80) < d(60, 100)  # monotone ramp, no per-value noise
+
+
+def test_converter_adds_a_free_clock(tmp_path):
+    import subprocess
+    torch.manual_seed(0)
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    save_file(Pos2MoveV2(**CFG).state_dict(), str(src / "model.safetensors"))
+    (src / "model_config.json").write_text(json.dumps(CFG))
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "convert_attn_bias.py"), "--src", str(src),
+                    "--dst", str(dst), "--rule-state", "--rule50-free", "60"], check=True,
+                   env={"PYTHONPATH": str(ROOT / "src"), "PATH": "/usr/bin:/bin"}, capture_output=True)
+    cfg = json.loads((dst / "model_config.json").read_text())
+    assert cfg["rule_state"] is True and cfg["rule50_free"] == 60

@@ -6,7 +6,8 @@
   --smolgen     add Leela-style position-dependent attention bias (Smolgen); its shared
                 output projection starts at zero, so it adds nothing until trained.
   --rule-state  add the fifty-move counter and repetition count inputs; their embeddings
-                start at zero, so they add nothing until trained.
+                start at zero, so they add nothing until trained. --rule50-free N feeds the
+                clock only past N plies (Pos2MoveV2 rule50_free).
 
 Features the source already has are kept, so a converted checkpoint can be converted again.
 
@@ -35,6 +36,8 @@ def main():
     p.add_argument("--full", action="store_true", help="attn_bias 'full'")
     p.add_argument("--smolgen", action="store_true")
     p.add_argument("--rule-state", action="store_true", help="rule50 + repetition inputs")
+    p.add_argument("--rule50-free", type=int, default=None,
+                   help="with --rule-state: clock plies the network does not see (default: all seen)")
     p.add_argument("--compress", type=int, default=8)
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--gen", type=int, default=64)
@@ -57,6 +60,10 @@ def main():
                        smolgen_gen=args.gen)
     if args.rule_state:
         new_cfg["rule_state"] = True
+        if args.rule50_free is not None:
+            new_cfg["rule50_free"] = args.rule50_free
+    elif args.rule50_free is not None:
+        p.error("--rule50-free needs --rule-state")
     torch.manual_seed(args.seed)
     new = Pos2MoveV2(**new_cfg)
     missing, unexpected = new.load_state_dict(dict(sd), strict=False)
