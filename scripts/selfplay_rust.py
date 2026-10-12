@@ -55,6 +55,10 @@ class Forward:
         self.model = load_model(Path(model_dir), device).bfloat16().eval()
         # Search backs up a scalar; a WDL head is reduced to p(win) - p(loss).
         self.value_scalar = self.model.value_scalar
+        # A rule-state network takes two more inputs: halfmove clock, repetitions.
+        self.rule_state = bool(getattr(self.model, "rule_state", False))
+        self.n_inputs = 6 if self.rule_state else 4
+        self._warned = False
         if use_ema:
             ema = torch.load(Path(model_dir) / "ema_state.pt", map_location="cpu", weights_only=True)
             ema = {k.replace("_orig_mod.", ""): v for k, v in ema.items()}
@@ -66,40 +70,55 @@ class Forward:
         self.bufs = {}
         self.slots = {}  # async staging buffers, one set per in-flight batch
         for b in buckets:  # warm up every bucket so CUDA-graph capture is up front
-            self._buffers(b)
-            bt, pl, ca, ep = self.bufs[b]
+            bufs = self._buffers(b)
             for _ in range(3):
-                self.model(bt, pl, ca, ep)
+                self._run(bufs)
         if device == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()  # the eager warm-up runs' blocks, not the graphs' pool
 
     def _buffers(self, bucket: int):
         if bucket not in self.bufs:
-            self.bufs[bucket] = (
-                torch.zeros(bucket, 64, dtype=torch.long, device=self.device),
-                torch.zeros(bucket, dtype=torch.long, device=self.device),
-                torch.zeros(bucket, dtype=torch.long, device=self.device),
-                torch.zeros(bucket, dtype=torch.long, device=self.device),
-            )
+            self.bufs[bucket] = (torch.zeros(bucket, 64, dtype=torch.long, device=self.device),) + tuple(
+                torch.zeros(bucket, dtype=torch.long, device=self.device) for _ in range(self.n_inputs - 1))
         return self.bufs[bucket]
+
+    def _run(self, bufs):
+        if self.rule_state:
+            return self.model(*bufs[:4], rule50=bufs[4], repetition=bufs[5])
+        return self.model(*bufs)
+
+    def _inputs(self, boards, player, castling, ep, rule50, repetition) -> list[np.ndarray]:
+        """The network's input arrays. A rule-state network given no rule state (the
+        legacy engine) reads every position as fresh: clock 0, no repetition."""
+        arrays = [boards, player, castling, ep]
+        if self.rule_state:
+            if rule50 is None or repetition is None:
+                if not self._warned:
+                    print("WARNING: rule-state network fed no rule state; using clock 0, no repetition",
+                          flush=True)
+                    self._warned = True
+                rule50 = np.zeros(len(player), np.uint8)
+                repetition = np.zeros(len(player), np.uint8)
+            arrays += [rule50, repetition]
+        return arrays
 
     @torch.no_grad()
     def __call__(self, boards: np.ndarray, player: np.ndarray, castling: np.ndarray,
-                 ep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                 ep: np.ndarray, rule50: np.ndarray | None = None,
+                 repetition: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        arrays = self._inputs(boards, player, castling, ep, rule50, repetition)
         n = len(player)
         bucket = next((b for b in self.buckets if n <= b), self.buckets[-1])
         if n > self.buckets[-1]:  # split oversized batches
-            l1, v1 = self(boards[:bucket], player[:bucket], castling[:bucket], ep[:bucket])
-            l2, v2 = self(boards[bucket:], player[bucket:], castling[bucket:], ep[bucket:])
+            l1, v1 = self(*[a[:bucket] for a in arrays])
+            l2, v2 = self(*[a[bucket:] for a in arrays])
             return np.concatenate([l1, l2]), np.concatenate([v1, v2])
-        bt, pl, ca, e = self._buffers(bucket)
-        bt.zero_(); pl.zero_(); ca.zero_(); e.zero_()
-        bt[:n] = torch.from_numpy(boards.astype(np.int64)).to(self.device)
-        pl[:n] = torch.from_numpy(player.astype(np.int64)).to(self.device)
-        ca[:n] = torch.from_numpy(castling.astype(np.int64)).to(self.device)
-        e[:n] = torch.from_numpy(ep.astype(np.int64)).to(self.device)
-        logits, value = self.model(bt, pl, ca, e)
+        bufs = self._buffers(bucket)
+        for buf, a in zip(bufs, arrays):
+            buf.zero_()
+            buf[:n] = torch.from_numpy(a.astype(np.int64)).to(self.device)
+        logits, value = self._run(bufs)
         return (
             logits[:n].float().cpu().numpy(),
             self.value_scalar(value[:n].float()).squeeze(-1).cpu().numpy(),
@@ -134,8 +153,8 @@ class Forward:
 
             st = {"cap": cap, "wcap": wcap,
                   "event": torch.cuda.Event() if self.device == "cuda" else None,
-                  "h_in": [host((cap, 64), torch.uint8)] + [host(cap, torch.uint8) for _ in range(3)],
-                  "d_in": [dev((cap, 64), torch.uint8)] + [dev(cap, torch.uint8) for _ in range(3)],
+                  "h_in": [host((cap, 64), torch.uint8)] + [host(cap, torch.uint8) for _ in range(self.n_inputs - 1)],
+                  "d_in": [dev((cap, 64), torch.uint8)] + [dev(cap, torch.uint8) for _ in range(self.n_inputs - 1)],
                   "h_legal": host(cap * wcap, torch.int16), "d_legal": dev(cap * wcap, torch.int16),
                   "h_logits": host(cap * wcap, torch.float32), "h_values": host(cap, torch.float32)}
             self.slots[slot] = st
@@ -143,12 +162,15 @@ class Forward:
 
     @torch.no_grad()
     def launch(self, slot: int, boards: np.ndarray, player: np.ndarray, castling: np.ndarray,
-               ep: np.ndarray, legal: np.ndarray):
+               ep: np.ndarray, legal: np.ndarray, rule50: np.ndarray | None = None,
+               repetition: np.ndarray | None = None):
         """Queue a forward; `wait(handle)` returns (legal logits (n, width), values (n,)).
-        `legal` holds flat logit indices padded with 4672 (a zero column is appended)."""
+        `legal` holds flat logit indices padded with 4672 (a zero column is appended);
+        `rule50` / `repetition` are the engine's `rule_state()` for a rule-state network."""
+        arrays = self._inputs(boards, player, castling, ep, rule50, repetition)
         n, width = len(player), legal.shape[1]
         st = self._slot(slot, n, width)
-        for h, d, a in zip(st["h_in"], st["d_in"], (boards, player, castling, ep)):
+        for h, d, a in zip(st["h_in"], st["d_in"], arrays):
             h[:n].numpy()[...] = a
             d[:n].copy_(h[:n], non_blocking=True)
         h_legal = st["h_legal"][: n * width].view(n, width)
@@ -165,13 +187,13 @@ class Forward:
             for buf, d in zip(bufs, st["d_in"]):
                 buf[:m].copy_(d[s0:s0 + m])
                 buf[m:].zero_()
-            logits, value = self.model(*bufs)
+            logits, value = self._run(bufs)
             flat = torch.cat([logits[:m].reshape(m, -1), logits.new_zeros(m, 1)], dim=1)
             out[s0:s0 + m].copy_(flat.gather(1, d_legal[s0:s0 + m].long()).float(), non_blocking=True)
             out_v[s0:s0 + m].copy_(self.value_scalar(value[:m].float()).squeeze(-1), non_blocking=True)
         if st["event"] is not None:
             st["event"].record()
-        return slot, n, width, (boards, player, castling, ep, legal)
+        return slot, n, width, (arrays, legal)
 
     def wait(self, handle) -> tuple[np.ndarray, np.ndarray]:
         """The batch's results, valid until the slot's next launch."""
@@ -187,8 +209,8 @@ class Forward:
         return logits, values
 
     def _verify(self, inputs, logits: np.ndarray, values: np.ndarray):
-        boards, player, castling, ep, legal = inputs
-        full, ref_v = self(boards, player, castling, ep)
+        arrays, legal = inputs
+        full, ref_v = self(*arrays)
         full = np.concatenate([full.reshape(len(full), 64 * 73), np.zeros((len(full), 1), np.float32)], 1)
         ref = np.take_along_axis(full, legal.astype(np.int64), axis=1)
         if not (np.allclose(logits, ref, rtol=0, atol=1e-2) and np.allclose(values, ref_v, rtol=0, atol=1e-3)):
@@ -201,6 +223,8 @@ class ShardWriter:
     """npz shards with the selfplay_value_games.py columns + CSR visit dists."""
 
     SCALAR_COLS = ("player", "castling", "ep", "halfmove", "z", "root_v", "full")
+    # Recorded by SelfPlayEngine only; a shard keeps them when every game has them.
+    RULE_COLS = ("rule50", "repetition")
 
     def __init__(self, out_dir: Path, flush_positions: int = 10_000):
         self.out_dir = out_dir
@@ -209,7 +233,7 @@ class ShardWriter:
         self._reset()
 
     def _reset(self):
-        self.cols = {c: [] for c in self.SCALAR_COLS}
+        self.cols = {c: [] for c in self.SCALAR_COLS + self.RULE_COLS}
         self.boards, self.game_id = [], []
         self.visit_idx, self.visit_cnt = [], []
         self.visit_lens = []
@@ -220,6 +244,9 @@ class ShardWriter:
         self.boards.append(np.asarray(g["boards"], dtype=np.uint8))
         for c in self.SCALAR_COLS:
             self.cols[c].append(np.asarray(g[c]))
+        for c in self.RULE_COLS:
+            if c in g:
+                self.cols[c].append(np.asarray(g[c]))
         self.game_id.append(np.full(p, game_id, dtype=np.uint32))
         self.visit_idx.append(np.asarray(g["visit_idx"], dtype=np.uint16))
         self.visit_cnt.append(np.asarray(g["visit_cnt"], dtype=np.uint16))
@@ -246,6 +273,9 @@ class ShardWriter:
                  "halfmove": np.uint16, "z": np.float32, "root_v": np.float32, "full": np.uint8}
         for c in self.SCALAR_COLS:
             arrays[c] = np.concatenate(self.cols[c]).astype(casts[c])
+        for c in self.RULE_COLS:
+            if len(self.cols[c]) == len(self.game_id):
+                arrays[c] = np.concatenate(self.cols[c]).astype(np.uint8)
         path = self.out_dir / f"positions_{self.shard_idx:04d}.npz"
         np.savez_compressed(path, **arrays)
         print(f"  wrote {path.name} ({self.n} positions)", flush=True)
@@ -336,6 +366,7 @@ def main():
     }
     openings = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] + list(OPENINGS)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
+    cfg["rule_state"] = forward.rule_state
     forward.verify_every = args.verify_every
     writer = ShardWriter(out_dir, flush_positions=args.flush_positions)
 
@@ -404,9 +435,10 @@ def main():
             if eng.done():
                 continue
             boards, player, castling, ep, legal = eng.collect()
+            rule = eng.rule_state() if forward.rule_state else (None, None)
             record(eng.drain_finished(), k)
             if len(player):
-                inflight[k] = forward.launch(k, boards, player, castling, ep, legal)
+                inflight[k] = forward.launch(k, boards, player, castling, ep, legal, *rule)
             elif not eng.done():
                 raise RuntimeError("engine returned an empty batch with games left")
 

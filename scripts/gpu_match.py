@@ -67,13 +67,17 @@ class Half:
 
     def launch(self, forwards, slot: int):
         boards, player, castling, ep, nets, legal = self.engine.collect()
+        rule50 = repetition = None
+        if any(f.rule_state for f in forwards):
+            rule50, repetition = self.engine.rule_state()
         self.n, self.width = len(player), legal.shape[1]
         self.handles = []
         for net, fwd in enumerate(forwards):
             rows = np.flatnonzero(nets == net)
             if len(rows):
+                rule = (rule50[rows], repetition[rows]) if fwd.rule_state else (None, None)
                 self.handles.append((rows, fwd, fwd.launch(2 * slot + net, boards[rows], player[rows],
-                                                           castling[rows], ep[rows], legal[rows])))
+                                                           castling[rows], ep[rows], legal[rows], *rule)))
 
     def apply(self):
         logits = np.empty((self.n, self.width), dtype=np.float32)
@@ -142,13 +146,15 @@ def main() -> None:
         "threads": args.threads,
         "tt_cap": args.tt_cap,
     }
-    halves = [Half(cfg, lines, list(range(k, args.openings, k_eng))) for k in range(k_eng)]
     # Two compiled networks share the card: capture graphs up to 512 rows only (larger
     # batches are split), half of self-play's set.
     forwards = [Forward(m, args.device, False, not args.no_compile, buckets=(64, 128, 256, 512))
                 for m in (args.model_a, args.model_b)]
     for fwd in forwards:
         fwd.verify_every = args.verify_every
+    # Each side's search caches its net's evaluations per rule state if the net reads it.
+    cfg["rule_state_a"], cfg["rule_state_b"] = (f.rule_state for f in forwards)
+    halves = [Half(cfg, lines, list(range(k, args.openings, k_eng))) for k in range(k_eng)]
     n_games = 2 * args.openings
     print(f"{la}: {args.model_a}\n{lb}: {args.model_b}\n"
           f"{args.openings} openings x 2 colours = {n_games} games, {args.max_sims} sims/move "

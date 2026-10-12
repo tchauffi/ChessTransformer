@@ -91,7 +91,8 @@ class SelfplayDataset(Dataset):
     def __init__(self, data_dirs: list[Path]):
         boards, player, castling, ep, halfmove, z, root_v, game_id, full = ([] for _ in range(9))
         v_idx, v_cnt, v_len = [], [], []
-        skipped = n_shards = 0
+        rule50, repetition = [], []
+        skipped = n_shards = no_rules = 0
         for di, data_dir in enumerate(data_dirs):
             shards = sorted(Path(data_dir).glob("positions_*.npz"))
             if not shards:
@@ -111,12 +112,26 @@ class SelfplayDataset(Dataset):
                 v_idx.append(d["visit_idx"])
                 v_cnt.append(d["visit_cnt"])
                 v_len.append(np.diff(d["visit_ptr"]))  # per-position support length
+                # Rule state: recorded by SelfPlayEngine, or backfilled next to the shard
+                # (scripts/backfill_rule_state.py) for data generated before it existed.
+                side = s.with_name(s.name.replace("positions_", "rule_state_"))
+                r = d if "rule50" in d else (np.load(side) if side.exists() else None)
+                if r is None:
+                    no_rules += 1
+                else:
+                    if len(r["rule50"]) != len(d["z"]):
+                        raise ValueError(f"{side}: {len(r['rule50'])} rule states for {len(d['z'])} positions")
+                    rule50.append(r["rule50"]); repetition.append(r["repetition"])
 
         if not boards:
             raise RuntimeError(f"{n_shards} shard(s) found but none carry visit_idx "
                                "(regenerate with scripts/selfplay_rust.py)")
         if skipped:
             print(f"  skipped {skipped} shard(s) without visit distributions")
+        # A rule-state network needs the rule state of every position (main() checks).
+        self.has_rule_state = no_rules == 0
+        if no_rules and rule50:
+            print(f"  {no_rules} shard(s) without rule state: rule state unused")
 
         self.boards = np.concatenate(boards)                          # (N, 64) uint8
         self.player = np.concatenate(player)
@@ -127,6 +142,9 @@ class SelfplayDataset(Dataset):
         self.root_v = np.concatenate(root_v).astype(np.float32)
         self.game_id = np.concatenate(game_id)
         self.full = np.concatenate(full).astype(np.float32)
+        n = len(self.z)
+        self.rule50 = np.concatenate(rule50) if self.has_rule_state else np.zeros(n, np.uint8)
+        self.repetition = np.concatenate(repetition) if self.has_rule_state else np.zeros(n, np.uint8)
 
         self.v_idx = np.concatenate(v_idx)
         self.v_cnt = np.concatenate(v_cnt)
@@ -144,6 +162,7 @@ class SelfplayDataset(Dataset):
             "castling": self.castling[i], "ep": self.ep[i],
             "halfmove": self.halfmove[i], "z": self.z[i], "root_v": self.root_v[i],
             "full": self.full[i], "v_idx": self.v_idx[a:b], "v_cnt": self.v_cnt[a:b],
+            "rule50": self.rule50[i], "repetition": self.repetition[i],
         }
 
 
@@ -165,7 +184,16 @@ def collate(batch):
         total = cnt.sum()
         if total > 0:
             policy[i, torch.from_numpy(b["v_idx"].astype(np.int64))] = cnt / total
-    return board, player, castling, ep, halfmove, z, root_v, full, policy
+    rule50 = torch.tensor([b["rule50"] for b in batch], dtype=torch.long)
+    repetition = torch.tensor([b["repetition"] for b in batch], dtype=torch.long)
+    return board, player, castling, ep, halfmove, z, root_v, full, policy, rule50, repetition
+
+
+def rule_inputs(model, rule50, repetition, device) -> dict:
+    """The rule-state keyword inputs for a network that reads them, else none."""
+    if not getattr(model, "rule_state", False):
+        return {}
+    return {"rule50": rule50.to(device), "repetition": repetition.to(device)}
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────
@@ -279,12 +307,13 @@ def evaluate(model, loader, device, args, ref_logits_fn=None):
     model.eval()
     tot = {"policy": 0.0, "value": 0.0, "sign_acc": 0.0}
     n = 0
-    for board, player, castling, ep, halfmove, z, root_v, full, policy in loader:
+    for board, player, castling, ep, halfmove, z, root_v, full, policy, rule50, repetition in loader:
         board, player, castling, ep = board.to(device), player.to(device), castling.to(device), ep.to(device)
         halfmove, z, root_v, policy = halfmove.to(device), z.to(device), root_v.to(device), policy.to(device)
         full = full.to(device)
+        rules = rule_inputs(model, rule50, repetition, device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
-            logits, value = model(board, player, castling, ep)
+            logits, value = model(board, player, castling, ep, **rules)
         _, m = compute_loss(logits, value, policy, full, z, root_v, halfmove,
                             logits, args.value_weight, 0.0, args.soft_mix, args.ramp_halfmoves)
         b = board.size(0)
@@ -308,7 +337,8 @@ def main():
     p.add_argument("--lr-embedding", type=float, default=4e-5)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--new-lr-mult", type=float, default=1.0,
-                   help="lr multiplier for smolgen / full-table attention-bias parameters")
+                   help="lr multiplier for the parameters convert_attn_bias.py adds (smolgen, the "
+                        "full bias table, the rule-state embeddings)")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                    help="torch.compile the training forwards: 2.2x the steps/s of eager on gen01 and "
                         "9.4 vs >15.4 GiB on the smolgen model, which eager cannot fit at batch 512")
@@ -371,6 +401,9 @@ def main():
 
     # ── Model + frozen reference ─────────────────────────────────────────
     model = load_model(Path(args.base), device)
+    if getattr(model, "rule_state", False) and not ds.has_rule_state:
+        raise SystemExit("the network reads the rule state but some shards carry none: run "
+                         "scripts/backfill_rule_state.py on " + " ".join(args.data))
     if not args.train_dropout:
         for mod in model.modules():
             if isinstance(mod, nn.Dropout):
@@ -394,13 +427,13 @@ def main():
           f"value_mse={base_val['value']:.4f} | sign_acc={base_val['sign_acc']:.4f}")
 
     # ── Optimizer + warmup→linear-decay schedule ─────────────────────────
-    # Attention-bias parameters added by scripts/convert_attn_bias.py start from zero (smolgen)
-    # or from the bucket values (bias_full), so --new-lr-mult lets them move within one
+    # Parameters added by scripts/convert_attn_bias.py start from zero (smolgen, the rule-state
+    # embeddings) or from the bucket values (bias_full), so --new-lr-mult lets them move within one
     # generation. The full table is kept out of weight decay: decay would pull it toward
     # zero, away from the bucket values it was filled with.
     emb, decay_p, nodecay_p, new_decay, new_nodecay = [], [], [], [], []
     for n_, t in model.named_parameters():
-        if "smolgen" in n_ or "bias_full" in n_:
+        if any(k in n_ for k in ("smolgen", "bias_full", "rule50_embedding", "repetition_embedding")):
             (new_decay if t.ndim >= 2 and "bias_full" not in n_ else new_nodecay).append(t)
         elif "embedding" in n_:
             emb.append(t)
@@ -443,14 +476,15 @@ def main():
         t0 = time.time()
         run = {"policy": 0.0, "value": 0.0, "kl": 0.0}
         seen = 0
-        for board, player, castling, ep, halfmove, z, root_v, full, policy in train_loader:
+        for board, player, castling, ep, halfmove, z, root_v, full, policy, rule50, repetition in train_loader:
             board, player, castling, ep = board.to(device), player.to(device), castling.to(device), ep.to(device)
             halfmove, z, root_v, policy = halfmove.to(device), z.to(device), root_v.to(device), policy.to(device)
             full = full.to(device)
+            rules = rule_inputs(model, rule50, repetition, device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
-                logits, value = fwd(board, player, castling, ep)
+                logits, value = fwd(board, player, castling, ep, **rules)
                 with torch.no_grad():
-                    ref_logits, _ = ref_fwd(board, player, castling, ep)
+                    ref_logits, _ = ref_fwd(board, player, castling, ep, **rules)
                 loss, m = compute_loss(logits, value, policy, full, z, root_v, halfmove, ref_logits,
                                        args.value_weight, args.kl_coef, args.soft_mix, args.ramp_halfmoves)
                 if human_iter is not None:

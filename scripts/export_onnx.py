@@ -42,9 +42,11 @@ class ScalarValueWrapper(torch.nn.Module):
         super().__init__()
         self.inner = inner
 
-    def forward(self, board_tokens, player_token, castling_token, en_passant_token):
+    def forward(self, board_tokens, player_token, castling_token, en_passant_token,
+                rule50=None, repetition=None):
         move_logits, value = self.inner(
-            board_tokens, player_token, castling_token, en_passant_token
+            board_tokens, player_token, castling_token, en_passant_token,
+            rule50=rule50, repetition=repetition,
         )
         return move_logits, self.inner.value_scalar(value)
 
@@ -91,6 +93,7 @@ def export_onnx(
     # The exported graph must always emit a scalar "value" -- rust/ct-bot's nn.rs
     # reads value[[i, 0]] and would otherwise silently take a raw WDL logit as Q.
     # For a scalar head value_scalar is the identity, so this changes nothing.
+    rule_state = bool(getattr(model, "rule_state", False))
     model = ScalarValueWrapper(model).eval()
 
     # Dummy inputs. Batch=2, not 1: torch.export specializes size-1 dims to
@@ -99,6 +102,13 @@ def export_onnx(
     player_token = torch.randint(0, 2, (2,))
     castling_token = torch.randint(0, 16, (2,))
     en_passant_token = torch.randint(0, 9, (2,))
+    inputs = (board_tokens, player_token, castling_token, en_passant_token)
+    names = ["board_tokens", "player_token", "castling_token", "en_passant_token"]
+    # A rule-state network takes the halfmove clock and repetition count too; ct-bot
+    # feeds them when the graph declares these input names.
+    if rule_state:
+        inputs += (torch.randint(0, 101, (2,)), torch.randint(0, 3, (2,)))
+        names += ["rule50", "repetition"]
 
     if output_path is None:
         output_path = model_dir / ("model_ema.onnx" if use_ema else "model.onnx")
@@ -107,18 +117,11 @@ def export_onnx(
     print(f"Exporting to {output_path} …")
     torch.onnx.export(
         model,
-        (board_tokens, player_token, castling_token, en_passant_token),
+        inputs,
         str(output_path),
-        input_names=["board_tokens", "player_token", "castling_token", "en_passant_token"],
+        input_names=names,
         output_names=["move_logits", "value"],
-        dynamic_axes={
-            "board_tokens": {0: "batch"},
-            "player_token": {0: "batch"},
-            "castling_token": {0: "batch"},
-            "en_passant_token": {0: "batch"},
-            "move_logits": {0: "batch"},
-            "value": {0: "batch"},
-        },
+        dynamic_axes={**{n: {0: "batch"} for n in names}, "move_logits": {0: "batch"}, "value": {0: "batch"}},
         # The legacy TorchScript exporter cannot export aten::rms_norm; the
         # dynamo exporter decomposes it (lands on opset 18).
         opset_version=18,

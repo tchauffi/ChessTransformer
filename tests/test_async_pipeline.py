@@ -42,6 +42,7 @@ class FakeForward:
     """Row-deterministic stand-in with Forward's interface (the second network differs)."""
 
     instances = 0
+    rule_state = False
 
     def __init__(self, model_dir, device, use_ema, compile_model, buckets=None):
         self.salt = FakeForward.instances * 1.7
@@ -54,7 +55,7 @@ class FakeForward:
         logits = np.sin(h[:, None, None] * 0.013 + FLAT[None] * 0.37) * 3
         return logits.astype(np.float32), np.tanh(np.sin(h * 0.029)).astype(np.float32)
 
-    def launch(self, slot, boards, player, castling, ep, legal):
+    def launch(self, slot, boards, player, castling, ep, legal, rule50=None, repetition=None):
         full, values = self(boards, player, castling, ep)
         flat = np.concatenate([full.reshape(len(full), 64 * 73), np.zeros((len(full), 1), np.float32)], 1)
         self.pending[slot] = (np.take_along_axis(flat, legal.astype(np.int64), 1), values)

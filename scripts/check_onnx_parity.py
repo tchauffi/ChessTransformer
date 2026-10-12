@@ -89,6 +89,16 @@ def batch_inputs(boards: list[chess.Board]):
     )
 
 
+def rule_feed(sess, boards: list[chess.Board], repetition=None) -> dict:
+    """The rule-state inputs if the graph declares them: halfmove clock (as ct-bot reads
+    it from a FEN) and the given repetition counts (0 without history)."""
+    if "rule50" not in {i.name for i in sess.get_inputs()}:
+        return {}
+    rep = np.zeros(len(boards), np.int64) if repetition is None else repetition
+    return {"rule50": np.array([min(b.halfmove_clock, 100) for b in boards], dtype=np.int64),
+            "repetition": rep.astype(np.int64)}
+
+
 def check_rust(rust_bin: str, onnx_path: Path, boards: list[chess.Board], tol: float) -> list[str]:
     """Compare `ct-bot eval --fen` priors/value vs a python-onnxruntime softmax."""
     import onnxruntime as ort
@@ -105,7 +115,8 @@ def check_rust(rust_bin: str, onnx_path: Path, boards: list[chess.Board], tol: f
         bt, pl, ca, ep = batch_inputs([board])
         logits, value = sess.run(
             ["move_logits", "value"],
-            {"board_tokens": bt, "player_token": pl, "castling_token": ca, "en_passant_token": ep},
+            {"board_tokens": bt, "player_token": pl, "castling_token": ca, "en_passant_token": ep,
+             **rule_feed(sess, [board])},
         )
         moves = list(board.legal_moves)
         scores = np.array([
@@ -147,11 +158,16 @@ def main():
     boards = sample_positions(args.n, args.seed)
     bt, pl, ca, ep = batch_inputs(boards)
 
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    # Random repetition counts so a rule-state graph's repetition path is exercised too.
+    rule = rule_feed(sess, boards, np.random.default_rng(args.seed).integers(0, 3, len(boards)))
+
     model = load_torch_model(model_dir, args.ema)
     with torch.no_grad():
         t_logits, t_value = model(
             torch.from_numpy(bt), torch.from_numpy(pl),
             torch.from_numpy(ca), torch.from_numpy(ep),
+            **{k: torch.from_numpy(v) for k, v in rule.items()},
         )
         # The export emits the scalar search backs up (export_onnx.ScalarValueWrapper);
         # compare against that, not a WDL head's raw (B, 3) logits, which numpy would
@@ -160,10 +176,9 @@ def main():
     t_logits = t_logits.numpy()
     t_value = t_value.numpy()
 
-    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     o_logits, o_value = sess.run(
         ["move_logits", "value"],
-        {"board_tokens": bt, "player_token": pl, "castling_token": ca, "en_passant_token": ep},
+        {"board_tokens": bt, "player_token": pl, "castling_token": ca, "en_passant_token": ep, **rule},
     )
 
     d_logits = np.abs(t_logits - o_logits).max()
