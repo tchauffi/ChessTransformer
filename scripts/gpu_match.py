@@ -107,6 +107,12 @@ def main() -> None:
     p.add_argument("--sim-batch", type=int, default=16, help="leaves per search wave (ct-bot)")
     p.add_argument("--c-puct", type=float, default=1.0)
     p.add_argument("--fpu", type=float, default=0.2)
+    p.add_argument("--prior-temp", type=float, default=1.0,
+                   help="softmax temperature of the policy priors (ct-bot --prior-temp)")
+    for side in ("a", "b"):  # per-net overrides of the three search settings
+        p.add_argument(f"--c-puct-{side}", type=float, default=None)
+        p.add_argument(f"--fpu-{side}", type=float, default=None)
+        p.add_argument(f"--prior-temp-{side}", type=float, default=None)
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--parallel-games", type=int, default=128, help="games in flight, all halves")
     p.add_argument("--engines", type=int, default=2,
@@ -146,11 +152,19 @@ def main() -> None:
         "sim_batch": args.sim_batch,
         "c_puct": args.c_puct,
         "fpu": args.fpu,
+        "prior_temp": args.prior_temp,
         "max_plies": args.max_plies,
         "num_parallel_games": max(1, args.parallel_games // k_eng),
         "threads": args.threads,
         "tt_cap": args.tt_cap,
     }
+    search = {}
+    for side in ("a", "b"):
+        for key in ("c_puct", "fpu", "prior_temp"):
+            v = getattr(args, f"{key}_{side}")
+            cfg[f"{key}_{side}"] = v if v is not None else cfg[key]
+        search[side] = (f"c_puct {cfg[f'c_puct_{side}']}, fpu {cfg[f'fpu_{side}']}, "
+                        f"prior_temp {cfg[f'prior_temp_{side}']}")
     # Two compiled networks share the card: capture graphs up to 512 rows only (larger
     # batches are split), half of self-play's set.
     forwards = [Forward(m, args.device, False, not args.no_compile, buckets=(64, 128, 256, 512))
@@ -165,7 +179,7 @@ def main() -> None:
     halves = [Half(cfg, lines, list(range(k, args.openings, k_eng)), args.blind_rule_state)
               for k in range(k_eng)]
     n_games = 2 * args.openings
-    print(f"{la}: {args.model_a}\n{lb}: {args.model_b}\n"
+    print(f"{la}: {args.model_a} ({search['a']})\n{lb}: {args.model_b} ({search['b']})\n"
           f"{args.openings} openings x 2 colours = {n_games} games, {args.max_sims} sims/move "
           f"+ {args.ponder_max_sims} ponder, {min(args.parallel_games, n_games)} at once"
           f"{', SPRT' if args.sprt else ''}\n", flush=True)
