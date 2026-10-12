@@ -11,6 +11,11 @@ pub struct EvalRequest {
     pub player: u8,
     pub castling: u8,
     pub ep: u8,
+    /// Halfmove clock, capped at 100 (`encoding::rule_state`).
+    pub rule50: u8,
+    /// Earlier occurrences of the position in game history + search path, capped at 2.
+    /// Networks without rule-state inputs ignore both fields.
+    pub repetition: u8,
     /// The legal moves' flat logit indices (from_sq * 73 + plane), in the
     /// search's move order -- filled only with `SearchParams::legal_in_requests`,
     /// so a batched driver can gather those logits on the GPU and send back a
@@ -29,6 +34,12 @@ pub struct EvalOutput {
 /// Batched position evaluation.
 pub trait Evaluator {
     fn eval_batch(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>>;
+
+    /// The network reads `rule50` / `repetition`; `Search::new` then caches its
+    /// evaluations per rule state (`SearchParams::rule_state`).
+    fn reads_rule_state(&self) -> bool {
+        false
+    }
 }
 
 /// For searches driven step by step, whose evaluations arrive through `resolve`.

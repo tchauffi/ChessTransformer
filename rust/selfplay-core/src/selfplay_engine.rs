@@ -78,6 +78,9 @@ struct Config {
     cap_total_full: bool,
     #[serde(default)]
     cap_total_fast: bool,
+    /// The network reads the rule state: cache its evaluations per rule state.
+    #[serde(default)]
+    rule_state: bool,
 }
 fn d_games() -> usize { 128 }
 fn d_batch() -> usize { 16 }
@@ -113,6 +116,9 @@ pub struct SelfPlayEngine {
     /// Legal-move count per position of the last collect, and the padded width.
     legal_lens: Vec<u16>,
     legal_width: usize,
+    /// Rule state (halfmove clock, repetitions) per position of the last collect.
+    rule50: Vec<u8>,
+    repetition: Vec<u8>,
 }
 
 impl SelfPlayEngine {
@@ -166,6 +172,7 @@ impl SelfPlayEngine {
             no_resign_frac: c.no_resign_frac, max_plies: c.max_plies, sim_batch: c.sim_batch,
             c_puct: c.c_puct, fpu: c.fpu, prior_temp: c.prior_temp, tt_cap: c.tt_cap,
             cap_total_full: c.cap_total_full, cap_total_fast: c.cap_total_fast,
+            rule_state: c.rule_state,
         };
         let mut e = SelfPlayEngine {
             rules,
@@ -183,6 +190,8 @@ impl SelfPlayEngine {
             owners: Vec::new(),
             legal_lens: Vec::new(),
             legal_width: 1,
+            rule50: Vec::new(),
+            repetition: Vec::new(),
         };
         e.fill();
         Ok(e)
@@ -225,6 +234,8 @@ impl SelfPlayEngine {
         self.owners.clear();
         let (mut boards, mut player, mut castling, mut ep) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        self.rule50.clear();
+        self.repetition.clear();
         for (gi, g) in self.games.iter().enumerate() {
             if let Some(reqs) = g.pending() {
                 for r in reqs {
@@ -232,6 +243,8 @@ impl SelfPlayEngine {
                     player.push(r.player);
                     castling.push(r.castling);
                     ep.push(r.ep);
+                    self.rule50.push(r.rule50);
+                    self.repetition.push(r.repetition);
                 }
                 self.owners.push((gi, reqs.len()));
             }
@@ -248,6 +261,13 @@ impl SelfPlayEngine {
             ep.into_pyarray(py),
             PyArray1::from_vec(py, legal).reshape([n, width]).expect("reshape"),
         ))
+    }
+
+    /// (rule50, repetition) of the last collect's positions, in its order -- the extra
+    /// inputs of a network with rule-state inputs.
+    #[allow(clippy::type_complexity)]
+    fn rule_state<'py>(&self, py: Python<'py>) -> (Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<u8>>) {
+        (PyArray1::from_slice(py, &self.rule50), PyArray1::from_slice(py, &self.repetition))
     }
 
     /// Like `apply`, with the legal moves' logits already gathered: row i holds
@@ -329,6 +349,7 @@ impl SelfPlayEngine {
             let mut boards = Vec::with_capacity(p * 64);
             let (mut player, mut castling, mut ep) = (Vec::new(), Vec::new(), Vec::new());
             let (mut halfmove, mut root_v, mut z, mut full) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut rule50, mut repetition) = (Vec::new(), Vec::new());
             let (mut visit_idx, mut visit_cnt) = (Vec::new(), Vec::new());
             let mut visit_ptr = vec![0i64];
             for r in recs {
@@ -337,6 +358,8 @@ impl SelfPlayEngine {
                 castling.push(r.castling);
                 ep.push(r.ep);
                 halfmove.push(r.halfmove);
+                rule50.push(r.rule50);
+                repetition.push(r.repetition);
                 root_v.push(r.root_v);
                 full.push(r.full);
                 z.push(if r.player == 1 { z_white } else { -z_white });
@@ -350,6 +373,8 @@ impl SelfPlayEngine {
             d.set_item("castling", castling.into_pyarray(py))?;
             d.set_item("ep", ep.into_pyarray(py))?;
             d.set_item("halfmove", halfmove.into_pyarray(py))?;
+            d.set_item("rule50", rule50.into_pyarray(py))?;
+            d.set_item("repetition", repetition.into_pyarray(py))?;
             d.set_item("root_v", root_v.into_pyarray(py))?;
             d.set_item("full", full.into_pyarray(py))?;
             d.set_item("z", z.into_pyarray(py))?;

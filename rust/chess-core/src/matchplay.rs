@@ -31,10 +31,12 @@ pub struct SideParams {
     pub prior_temp: f32,
     pub sim_batch: usize,
     pub tt_cap: usize,
+    /// Per net (0 = A): it reads the rule state (`SearchParams::rule_state`).
+    pub rule_state: [bool; 2],
 }
 
 impl SideParams {
-    fn search_params(&self) -> SearchParams {
+    fn search_params(&self, s: usize) -> SearchParams {
         SearchParams {
             c_puct: self.c_puct,
             fpu: self.fpu,
@@ -42,6 +44,7 @@ impl SideParams {
             sim_batch: self.sim_batch,
             tt_cap: self.tt_cap,
             legal_in_requests: true,
+            rule_state: self.rule_state[s],
             ..SearchParams::default()
         }
     }
@@ -84,8 +87,8 @@ pub struct MatchGame {
 
 impl MatchGame {
     pub fn new(id: usize, start: Chess, a_white: bool, params: SideParams) -> Self {
-        let side = || Side {
-            search: Search::new(NoEval, params.search_params()),
+        let side = |s: usize| Side {
+            search: Search::new(NoEval, params.search_params(s)),
             job: None,
             pondering: false,
             out: None,
@@ -99,7 +102,7 @@ impl MatchGame {
             start,
             moves: Vec::new(),
             moves_uci: Vec::new(),
-            sides: [side(), side()],
+            sides: [side(0), side(1)],
             end: None,
         };
         g.check_end(0);
@@ -284,7 +287,10 @@ mod tests {
     }
 
     fn params(sim_batch: usize) -> SideParams {
-        SideParams { c_puct: 1.0, fpu: 0.2, prior_temp: 1.0, sim_batch, tt_cap: 2_000_000 }
+        SideParams {
+            c_puct: 1.0, fpu: 0.2, prior_temp: 1.0, sim_batch, tt_cap: 2_000_000,
+            rule_state: [false, false],
+        }
     }
 
     /// The batched driver, one game.
@@ -306,7 +312,7 @@ mod tests {
     /// The bot's own flow, sequentially through `go()`: our search, then our
     /// ponder to completion, then the opponent's turn.
     fn sequential(start: &Chess, a_white: bool, rules: MatchRules, sim_batch: usize) -> Vec<String> {
-        let mk = |s: usize| Search::new(HashEval(SALTS[s]), params(sim_batch).search_params());
+        let mk = |s: usize| Search::new(HashEval(SALTS[s]), params(sim_batch).search_params(s));
         let mut sides = [mk(0), mk(1)];
         let mut moves: Vec<Move> = Vec::new();
         let mut out = Vec::new();

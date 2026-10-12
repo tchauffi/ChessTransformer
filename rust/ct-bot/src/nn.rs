@@ -16,6 +16,9 @@ pub use chess_core::eval::{EvalOutput, EvalRequest, Evaluator};
 
 pub struct OnnxEvaluator {
     session: Session,
+    /// The graph takes the rule-state inputs (`rule50`, `repetition`). Older graphs
+    /// (v2.1 and every bucket / smolgen export) have four inputs and are fed four.
+    rule_state: bool,
 }
 
 /// ort builder errors carry a non-Send recovery payload; strip it for anyhow.
@@ -49,9 +52,18 @@ impl OnnxEvaluator {
         }
         let session = ort_ok(builder.commit_from_file(model))
             .with_context(|| format!("loading ONNX model {}", model.display()))?;
-        log::info!("ONNX model loaded: {} ({} intra threads)", model.display(), threads);
-        Ok(Self { session })
+        let names: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
+        let rule_state = names.contains(&"rule50") && names.contains(&"repetition");
+        log::info!(
+            "ONNX model loaded: {} ({} intra threads{})",
+            model.display(),
+            threads,
+            if rule_state { ", rule-state inputs" } else { "" }
+        );
+        Ok(Self { session, rule_state })
     }
+
+
 
     fn eval_batch_impl(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>> {
         let n = batch.len();
@@ -62,6 +74,8 @@ impl OnnxEvaluator {
         let mut player = Array1::<i64>::zeros(n);
         let mut castling = Array1::<i64>::zeros(n);
         let mut ep = Array1::<i64>::zeros(n);
+        let mut rule50 = Array1::<i64>::zeros(n);
+        let mut repetition = Array1::<i64>::zeros(n);
         for (i, r) in batch.iter().enumerate() {
             for (j, &t) in r.tokens.iter().enumerate() {
                 boards[[i, j]] = t as i64;
@@ -69,14 +83,23 @@ impl OnnxEvaluator {
             player[i] = r.player as i64;
             castling[i] = r.castling as i64;
             ep[i] = r.ep as i64;
+            rule50[i] = r.rule50 as i64;
+            repetition[i] = r.repetition as i64;
         }
 
-        let outputs = self.session.run(ort::inputs![
+        let mut inputs = ort::inputs![
             "board_tokens" => ort::value::Tensor::from_array(boards)?,
             "player_token" => ort::value::Tensor::from_array(player)?,
             "castling_token" => ort::value::Tensor::from_array(castling)?,
             "en_passant_token" => ort::value::Tensor::from_array(ep)?,
-        ])?;
+        ];
+        if self.rule_state {
+            inputs.extend(ort::inputs![
+                "rule50" => ort::value::Tensor::from_array(rule50)?,
+                "repetition" => ort::value::Tensor::from_array(repetition)?,
+            ]);
+        }
+        let outputs = self.session.run(inputs)?;
 
         let logits: Array3<f32> = outputs["move_logits"]
             .try_extract_array::<f32>()?
@@ -103,5 +126,9 @@ impl OnnxEvaluator {
 impl Evaluator for OnnxEvaluator {
     fn eval_batch(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>> {
         self.eval_batch_impl(batch)
+    }
+
+    fn reads_rule_state(&self) -> bool {
+        self.rule_state
     }
 }
