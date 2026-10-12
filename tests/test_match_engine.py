@@ -95,3 +95,28 @@ def test_gathered_logits_play_the_same_games():
         return sorted((g["id"], g["moves"]) for g in games)
 
     assert run(True) == run(False)
+
+
+@pytest.mark.parametrize("key,value", [("c_puct", 3.0), ("fpu", 0.6), ("prior_temp", 2.0)])
+def test_per_net_search_settings_change_only_that_net(key, value):
+    fens, a_white = [START, ITALIAN, START], [True, False, False]
+    base = dict(sims=48, ponder_sims=24, max_plies=24, threads=2)
+
+    def run(**extra):
+        games = _play(selfplay_core.MatchEngine(json.dumps({**base, **extra}), fens, a_white),
+                      _position_net)
+        return {g["id"]: g["moves"] for g in games}
+
+    ref = run()
+    assert run(**{f"{key}_a": base.get(key, {"c_puct": 1.0, "fpu": 0.2, "prior_temp": 1.0}[key])}) == ref
+    for side in ("a", "b"):
+        got = run(**{f"{key}_{side}": value})
+        assert got != ref
+        for gid, moves in got.items():
+            first = next((i for i, (x, y) in enumerate(zip(moves, ref[gid])) if x != y), None)
+            if first is None:
+                continue
+            # the first deviation is a move of the net whose setting changed
+            a_moves_first = chess.Board(fens[gid]).turn == chess.WHITE
+            a_to_move = (first % 2 == 0) == (a_moves_first == a_white[gid])
+            assert a_to_move == (side == "a"), (gid, first)
