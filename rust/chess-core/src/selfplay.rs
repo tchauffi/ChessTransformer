@@ -27,7 +27,7 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 use shakmaty::{CastlingMode, Chess, Color, Move, Position};
 
-use crate::encoding::{action_plane, encode_position, halfmove, move_coords, terminal_value, zobrist,
+use crate::encoding::{action_plane, encode_position, halfmove, move_coords, rule_state, terminal_value, zobrist,
                       NUM_PLANES};
 use crate::search::{EvalOutput, EvalRequest, Job, NoEval, RootNoise, Search, SearchParams, Step};
 
@@ -53,6 +53,8 @@ pub struct SelfPlayRules {
     /// instead of counting fresh sims.
     pub cap_total_full: bool,
     pub cap_total_fast: bool,
+    /// The network reads the rule state (`SearchParams::rule_state`).
+    pub rule_state: bool,
 }
 
 pub struct Record {
@@ -61,6 +63,9 @@ pub struct Record {
     pub castling: u8,
     pub ep: u8,
     pub halfmove: u16,
+    /// The root's rule state (`encoding::rule_state`) over the game so far.
+    pub rule50: u8,
+    pub repetition: u8,
     pub root_v: f32,
     pub full: u8,
     pub visit_idx: Vec<u16>, // from_sq * 73 + plane
@@ -101,6 +106,7 @@ impl SelfPlayGame {
             move_temp_plies: rules.temp_plies,
             tt_cap: rules.tt_cap,
             legal_in_requests: true,
+            rule_state: rules.rule_state,
             ..SearchParams::default()
         };
         let mut search = Search::new(NoEval, params);
@@ -204,6 +210,8 @@ impl SelfPlayGame {
 
     fn record(&mut self, root_v: f32) {
         let (tokens, player, castling, ep) = encode_position(&self.pos);
+        let (key, prior) = self.history.split_last().expect("history holds the current position");
+        let (rule50, repetition) = rule_state(&self.pos, prior, *key);
         let (mut visit_idx, mut visit_cnt) = (Vec::new(), Vec::new());
         for (mv, n, _, _) in self.search.root_stats() {
             if n > 0 {
@@ -218,6 +226,8 @@ impl SelfPlayGame {
             castling,
             ep,
             halfmove: halfmove(&self.pos).min(u16::MAX as u32) as u16,
+            rule50,
+            repetition,
             root_v,
             full: self.full as u8,
             visit_idx,
@@ -296,6 +306,7 @@ mod tests {
             move_temp: 1.0, temp_plies: 10, resign_threshold: 2.0, resign_plies: 6,
             no_resign_frac: 0.1, max_plies: 40, sim_batch: 16, c_puct: 1.0, fpu: 0.2,
             prior_temp: 1.0, tt_cap: 2_000_000, cap_total_full: false, cap_total_fast: false,
+            rule_state: false,
         }
     }
 

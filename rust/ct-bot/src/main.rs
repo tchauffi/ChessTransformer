@@ -266,10 +266,13 @@ fn cmd_eval(args: &EvalArgs) -> Result<()> {
     let fen: Fen = args.fen.parse()?;
     let pos: Chess = fen.into_position(CastlingMode::Standard)?;
     let (tokens, player, castling, ep) = encode_position(&pos);
+    let (rule50, repetition) = chess_core::encoding::rule_state(&pos, &[], 0);
 
     let mut eval = args.model.evaluator()?;
     let out = eval
-        .eval_batch(&[nn::EvalRequest { tokens, player, castling, ep, legal: Vec::new() }])?
+        .eval_batch(&[nn::EvalRequest {
+            tokens, player, castling, ep, rule50, repetition, legal: Vec::new(),
+        }])?
         .remove(0);
 
     let moves = pos.legal_moves();

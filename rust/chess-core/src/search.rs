@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crate::encoding::{
-    action_plane, encode_position, halfmove, move_coords, search_terminal_value, zobrist,
+    action_plane, encode_position, halfmove, move_coords, rule_key, rule_state,
+    search_terminal_value, zobrist,
     NUM_PLANES,
 };
 use crate::tree::{backup_vl, puct_select, softmax_priors, Node};
@@ -45,6 +46,10 @@ pub struct SearchParams {
     /// Fill `EvalRequest::legal` (batched drivers that gather legal logits on
     /// the GPU). The bot leaves it off and evaluates full logits.
     pub legal_in_requests: bool,
+    /// The network reads the rule state (`EvalRequest::rule50` / `repetition`), so its
+    /// evaluations are cached per (position, rule state) instead of per position.
+    /// Requests carry the rule state either way; off, the search is unchanged.
+    pub rule_state: bool,
     /// Syzygy tables. In-tree, positions reached by a capture or pawn move
     /// that the tables cover are scored exactly (WDL) instead of by the value
     /// head. At a covered root, a won position plays the DTZ-optimal move
@@ -64,6 +69,7 @@ impl Default for SearchParams {
             move_temp_plies: 0,
             tt_cap: 2_000_000,
             legal_in_requests: false,
+            rule_state: false,
             syzygy: None,
         }
     }
@@ -248,7 +254,8 @@ pub struct Search<E: Evaluator> {
 }
 
 impl<E: Evaluator> Search<E> {
-    pub fn new(eval: E, params: SearchParams) -> Self {
+    pub fn new(eval: E, mut params: SearchParams) -> Self {
+        params.rule_state |= eval.reads_rule_state();
         let pos = Chess::default();
         let history = vec![zobrist(&pos)];
         Search {
@@ -452,7 +459,10 @@ impl<E: Evaluator> Search<E> {
                     if self.tree[0].expanded {
                         continue;
                     }
-                    let key = *self.history.last().unwrap();
+                    let pos_key = *self.history.last().unwrap();
+                    let prior = &self.history[..self.history.len() - 1];
+                    let (rule50, repetition) = rule_state(&self.pos, prior, pos_key);
+                    let key = self.eval_key(pos_key, rule50, repetition);
                     let moves: Vec<Move> = self.pos.legal_moves().to_vec();
                     assert!(!moves.is_empty(), "go() on a terminal position");
                     if let Some((priors, _)) = self.tt.get(&key).cloned() {
@@ -463,7 +473,9 @@ impl<E: Evaluator> Search<E> {
                     let (tokens, player, castling, ep) = encode_position(&self.pos);
                     let legal = self.legal_of(&moves);
                     job.stage = Stage::RootPending(key, moves);
-                    return Step::Eval(vec![EvalRequest { tokens, player, castling, ep, legal }]);
+                    return Step::Eval(vec![EvalRequest {
+                        tokens, player, castling, ep, rule50, repetition, legal,
+                    }]);
                 }
                 Stage::Waves => {
                     if job.stopped || job.sims_done >= job.sims {
@@ -667,6 +679,8 @@ impl<E: Evaluator> Search<E> {
                 continue;
             }
             let moves: Vec<Move> = pos.legal_moves().to_vec();
+            let (rule50, repetition) = rule_state(&pos, &all_keys[..all_keys.len() - 1], key);
+            let key = self.eval_key(key, rule50, repetition);
             // Defer cached (TT) hits and NN leaves alike: their virtual loss
             // stays applied through the wave so concurrent descents diversify
             // (mirrors Pos2MoveV2MctsBot._run_batch). Backing TT hits up
@@ -680,7 +694,7 @@ impl<E: Evaluator> Search<E> {
                 let batch_idx = *batch_index.entry(key).or_insert_with(|| {
                     let (tokens, player, castling, ep) = encode_position(&pos);
                     let legal = if legal_in_requests { legal_indices(&moves) } else { Vec::new() };
-                    batch.push(EvalRequest { tokens, player, castling, ep, legal });
+                    batch.push(EvalRequest { tokens, player, castling, ep, rule50, repetition, legal });
                     batch.len() - 1
                 });
                 LeafEval::Batch(batch_idx)
@@ -839,14 +853,24 @@ impl<E: Evaluator> Search<E> {
         out
     }
 
-    /// Raw value-head estimate for a position (side-to-move POV), no search.
+    /// Raw value-head estimate for a position (side-to-move POV), no search and no
+    /// game history (repetition count 0).
     pub fn raw_value(&mut self, pos: &Chess) -> Result<f32> {
         let (tokens, player, castling, ep) = encode_position(pos);
+        let (rule50, repetition) = rule_state(pos, &[], 0);
         Ok(self
             .eval
-            .eval_batch(&[EvalRequest { tokens, player, castling, ep, legal: Vec::new() }])?
+            .eval_batch(&[EvalRequest {
+                tokens, player, castling, ep, rule50, repetition, legal: Vec::new(),
+            }])?
             .remove(0)
             .value)
+    }
+
+    /// TT / batch key of an evaluation: the position, plus its rule state when the
+    /// network reads it.
+    fn eval_key(&self, pos_key: u64, rule50: u8, repetition: u8) -> u64 {
+        if self.params.rule_state { rule_key(pos_key, rule50, repetition) } else { pos_key }
     }
 
     fn insert_tt(&mut self, key: u64, priors: Vec<f32>, value: f32) {
@@ -967,6 +991,70 @@ mod tests {
             .unwrap()
             .to_move(p)
             .unwrap()
+    }
+
+    /// Uniform outputs; records every request's (tokens, rule50, repetition).
+    struct RecordingEval {
+        seen: Arc<std::sync::Mutex<Vec<([u8; 64], u8, u8)>>>,
+        rule_state: bool,
+    }
+
+    impl Evaluator for RecordingEval {
+        fn eval_batch(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>> {
+            self.seen.lock().unwrap().extend(batch.iter().map(|r| (r.tokens, r.rule50, r.repetition)));
+            Ok(batch
+                .iter()
+                .map(|_| EvalOutput { logits: vec![0.0; 64 * NUM_PLANES], value: 0.0 })
+                .collect())
+        }
+
+        fn reads_rule_state(&self) -> bool {
+            self.rule_state
+        }
+    }
+
+    #[test]
+    fn rule_state_counts_earlier_occurrences_and_caps() {
+        let p = pos("8/8/8/4k3/8/8/4K3/7R w - - 37 60");
+        assert_eq!(crate::encoding::rule_state(&p, &[], 7), (37, 0));
+        assert_eq!(crate::encoding::rule_state(&p, &[7, 1, 7], 7), (37, 2));
+        assert_eq!(crate::encoding::rule_state(&p, &[7, 7, 7, 7], 7), (37, 2));
+        let p = pos("8/8/8/4k3/8/8/4K3/7R w - - 140 90");
+        assert_eq!(crate::encoding::rule_state(&p, &[], 7).0, 100);
+        let k = crate::encoding::rule_key(7, 4, 1);
+        assert!(k != 7 && k != crate::encoding::rule_key(7, 4, 0) && k != crate::encoding::rule_key(7, 5, 1));
+    }
+
+    #[test]
+    fn requests_carry_the_rule_state_and_key_the_cache_by_it() {
+        // The start position again after the knights go out and back: same board,
+        // halfmove clock 4, one earlier occurrence.
+        let start = Chess::default();
+        let start_tokens = encode_position(&start).0;
+        let (mut p, mut moves) = (start.clone(), Vec::new());
+        for u in ["g1f3", "g8f6", "f3g1", "f6g8"] {
+            let m = mv(&p, u);
+            p.play_unchecked(&m);
+            moves.push(m);
+        }
+        for rule_state in [false, true] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let eval = RecordingEval { seen: seen.clone(), rule_state };
+            let mut s = Search::new(eval, SearchParams::default());
+            s.set_position(start.clone(), &[]);
+            s.go(64, None, &AtomicBool::new(false)).unwrap();
+            assert_eq!(seen.lock().unwrap()[0], (start_tokens, 0, 0), "the root: fresh clock, no repetition");
+            let before = seen.lock().unwrap().len();
+            s.set_position(start.clone(), &moves);
+            s.go(64, None, &AtomicBool::new(false)).unwrap();
+            let again: Vec<_> =
+                seen.lock().unwrap()[before..].iter().filter(|r| r.0 == start_tokens).cloned().collect();
+            if rule_state {
+                assert_eq!(again.first(), Some(&(start_tokens, 4, 1)), "a new evaluation under the new rule state");
+            } else {
+                assert!(again.is_empty(), "without rule-state inputs the cached evaluation is reused: {again:?}");
+            }
+        }
     }
 
     #[test]

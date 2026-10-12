@@ -85,6 +85,11 @@ struct MatchConfig {
     max_plies: u32,
     #[serde(default = "d_threads")]
     threads: usize,
+    /// Net A / net B reads the rule state: cache its evaluations per rule state.
+    #[serde(default)]
+    rule_state_a: bool,
+    #[serde(default)]
+    rule_state_b: bool,
 }
 fn d_sims() -> u32 { 4000 }
 fn d_ponder() -> u32 { 2000 }
@@ -115,6 +120,9 @@ pub struct MatchEngine {
     /// Legal-move count per position of the last collect, and the padded width.
     legal_lens: Vec<u16>,
     legal_width: usize,
+    /// Rule state (halfmove clock, repetitions) per position of the last collect.
+    rule50: Vec<u8>,
+    repetition: Vec<u8>,
 }
 
 impl MatchEngine {
@@ -178,11 +186,12 @@ impl MatchEngine {
                          cfg.prior_temp_b.unwrap_or(cfg.prior_temp)],
             sim_batch: cfg.sim_batch,
             tt_cap: cfg.tt_cap,
+            rule_state: [cfg.rule_state_a, cfg.rule_state_b],
         };
         let mut m = MatchEngine {
             cfg, rules, params, fens, starts, a_white, games: Vec::new(), started: 0,
             completed: 0, finished: Vec::new(), owners: Vec::new(), legal_lens: Vec::new(),
-            legal_width: 1,
+            legal_width: 1, rule50: Vec::new(), repetition: Vec::new(),
         };
         m.fill();
         Ok(m)
@@ -223,6 +232,8 @@ impl MatchEngine {
         }
 
         self.owners.clear();
+        self.rule50.clear();
+        self.repetition.clear();
         let (mut boards, mut player, mut castling, mut ep, mut net) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (gi, g) in self.games.iter().enumerate() {
@@ -234,6 +245,8 @@ impl MatchEngine {
                         castling.push(r.castling);
                         ep.push(r.ep);
                         net.push(s as u8);
+                        self.rule50.push(r.rule50);
+                        self.repetition.push(r.repetition);
                     }
                     self.owners.push((gi, s, reqs.len()));
                 }
@@ -252,6 +265,13 @@ impl MatchEngine {
             net.into_pyarray(py),
             PyArray1::from_vec(py, legal).reshape([n, width]).expect("reshape"),
         ))
+    }
+
+    /// (rule50, repetition) of the last collect's positions, in its order -- the extra
+    /// inputs of a network with rule-state inputs.
+    #[allow(clippy::type_complexity)]
+    fn rule_state<'py>(&self, py: Python<'py>) -> (Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<u8>>) {
+        (PyArray1::from_slice(py, &self.rule50), PyArray1::from_slice(py, &self.repetition))
     }
 
     /// Like `apply`, with the legal moves' logits already gathered: row i holds

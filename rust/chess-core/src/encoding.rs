@@ -109,6 +109,23 @@ pub fn zobrist(pos: &Chess) -> u64 {
     h.0
 }
 
+/// The draw-rule state a network with rule-state inputs reads: the halfmove clock
+/// capped at 100, and how often `key` (the position's zobrist) already occurs in
+/// `prior_keys` -- the game history and search path *before* this position -- capped
+/// at 2. Mirrors the Python side (`scripts/backfill_rule_state.py`).
+pub fn rule_state(pos: &Chess, prior_keys: &[u64], key: u64) -> (u8, u8) {
+    let rule50 = pos.halfmoves().min(100) as u8;
+    let repetition = prior_keys.iter().filter(|&&k| k == key).count().min(2) as u8;
+    (rule50, repetition)
+}
+
+/// Cache key of an evaluation by a network that reads the rule state: the same board
+/// under another halfmove clock or repetition count is a different network input.
+pub fn rule_key(key: u64, rule50: u8, repetition: u8) -> u64 {
+    key ^ (u64::from(rule50) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (u64::from(repetition) + 1).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+}
+
 /// Terminal value from the side-to-move POV, or None. `keys` is the sequence
 /// of zobrist keys of all positions seen (game history + search path),
 /// including the current position — mirrors python-chess is_repetition(3)

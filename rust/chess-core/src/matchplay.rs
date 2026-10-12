@@ -32,6 +32,8 @@ pub struct SideParams {
     pub prior_temp: [f32; 2],
     pub sim_batch: usize,
     pub tt_cap: usize,
+    /// Per net (0 = A): it reads the rule state (`SearchParams::rule_state`).
+    pub rule_state: [bool; 2],
 }
 
 impl SideParams {
@@ -43,6 +45,7 @@ impl SideParams {
             sim_batch: self.sim_batch,
             tt_cap: self.tt_cap,
             legal_in_requests: true,
+            rule_state: self.rule_state[s],
             ..SearchParams::default()
         }
     }
@@ -284,11 +287,11 @@ mod tests {
     fn each_net_searches_with_its_own_settings() {
         let p = SideParams {
             c_puct: [1.0, 2.5], fpu: [0.2, 0.05], prior_temp: [1.0, 1.4], sim_batch: 16,
-            tt_cap: 1000,
+            tt_cap: 1000, rule_state: [true, false],
         };
         let (a, b) = (p.search_params(0), p.search_params(1));
-        assert_eq!((a.c_puct, a.fpu, a.prior_temp), (1.0, 0.2, 1.0));
-        assert_eq!((b.c_puct, b.fpu, b.prior_temp), (2.5, 0.05, 1.4));
+        assert_eq!((a.c_puct, a.fpu, a.prior_temp, a.rule_state), (1.0, 0.2, 1.0, true));
+        assert_eq!((b.c_puct, b.fpu, b.prior_temp, b.rule_state), (2.5, 0.05, 1.4, false));
     }
 
     fn pos(fen: &str) -> Chess {
@@ -298,6 +301,7 @@ mod tests {
     fn params(sim_batch: usize) -> SideParams {
         SideParams {
             c_puct: [1.0; 2], fpu: [0.2; 2], prior_temp: [1.0; 2], sim_batch, tt_cap: 2_000_000,
+            rule_state: [false, false],
         }
     }
 
