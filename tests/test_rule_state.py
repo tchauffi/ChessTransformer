@@ -140,3 +140,50 @@ def test_selfplay_engine_records_the_rule_state():
     for g in games:
         _, r50, rep = game_rule_state(g["fen"], g["moves"])
         assert g["rule50"].tolist() == r50.tolist() and g["repetition"].tolist() == rep.tolist()
+
+
+def test_human_shards_record_the_rule_state(tmp_path):
+    """build_shards.py writes the same rule state the search computes (format v3)."""
+    import h5py
+    import build_shards
+    from backfill_rule_state import game_rule_state
+    from chesstransformer.datasets.flat_shard_dataset import FlatShardDataset
+    from chesstransformer.models.tokenizer.move_tokenizer import MoveTokenizer
+    games = [["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8", "e2e4", "e7e5", "g1f3"],
+             ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5c6", "d7c6", "e1g1", "f7f6"]]
+    mt = MoveTokenizer()
+    h5 = tmp_path / "games.h5"
+    with h5py.File(h5, "w") as f:
+        moves = f.create_dataset("moves", (len(games),), dtype=h5py.vlen_dtype(np.int16))
+        for i, g in enumerate(games):
+            moves[i] = np.array([mt.vocab[u] for u in g], np.int16)
+        f["num_moves"] = np.array([len(g) for g in games], np.int16)
+        f["result"] = np.zeros(len(games), np.int8)
+        f["white_elo"] = f["black_elo"] = np.full(len(games), 2500, np.int16)
+    out = tmp_path / "shards"
+    out.mkdir()
+    build_shards._worker_init({"syzygy": None})
+    build_shards._CFG.update(h5_path=str(h5), out_dir=str(out), k=64, seed=0, min_elo=None,
+                             max_elo=None, sample_weighting="uniform", skip_opening_plies=0,
+                             sample_mode="unique")
+    meta = build_shards.build_shard({"shard_id": 0, "game_start": 0, "game_end": len(games)})
+    rows = np.load(out / meta["path"])
+    want = {}
+    for gi, g in enumerate(games):
+        _, r50, rep = game_rule_state(chess.STARTING_FEN, g)
+        want[gi] = (r50, rep)
+    starts = np.flatnonzero(np.r_[True, np.diff(rows["move_number"].astype(int)) < 0])
+    assert len(starts) == len(games)
+    for gi, (a, b) in enumerate(zip(starts, np.r_[starts[1:], len(rows)])):
+        ply = rows["move_number"][a:b]
+        assert rows["rule50"][a:b].tolist() == want[gi][0][ply].tolist()
+        assert rows["repetition"][a:b].tolist() == want[gi][1][ply].tolist()
+    assert rows["repetition"].max() == 2  # the knight shuffle comes back to the start twice
+
+    from chesstransformer.datasets.shard_format import FORMAT_VERSION, dtype_to_meta
+    (out / "meta.json").write_text(json.dumps({
+        "format_version": FORMAT_VERSION, "record_dtype": dtype_to_meta(), "pad_action": 4672,
+        "splits": {"train": [0]}, "shards": [{**meta, "shard_id": 0}]}))
+    batch = FlatShardDataset(out)[list(range(len(rows)))]
+    assert batch["rule50"].tolist() == rows["rule50"].tolist()
+    assert batch["repetition"].tolist() == rows["repetition"].tolist()

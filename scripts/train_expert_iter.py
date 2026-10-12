@@ -254,7 +254,10 @@ def human_loss(model, hb, device, value_weight, elo_gap=True):
     With ``elo_gap`` the rating gap goes through the value head's Elo offset, as in
     pretraining (pos2move_v2_trainer.prepare_batch). Without it a human result is read
     as a game between equals, so the head is taught to explain the stronger player's
-    wins through the position -- the bias the offset exists to remove."""
+    wins through the position -- the bias the offset exists to remove.
+
+    Shards built with the rule state (format v3) feed it to a network that reads it;
+    older ones leave it absent, as for any position without a game history."""
     board = hb["position"].to(device, non_blocking=True).long()
     is_white = hb["is_white"].to(device, non_blocking=True).bool()
     gap = None
@@ -265,7 +268,9 @@ def human_loss(model, hb, device, value_weight, elo_gap=True):
     logits, value = model(board, is_white.long(),
                           hb["castling_rights"].to(device, non_blocking=True).long(),
                           hb["en_passant_file"].to(device, non_blocking=True).long(),
-                          elo_gap=gap)
+                          elo_gap=gap,
+                          **(rule_inputs(model, hb["rule50"].long(), hb["repetition"].long(), device)
+                             if "rule50" in hb else {}))
     B = board.size(0)
     target = (hb["from_square"].to(device).long() * NUM_ACTION_PLANES
               + hb["action_plane"].to(device).long())

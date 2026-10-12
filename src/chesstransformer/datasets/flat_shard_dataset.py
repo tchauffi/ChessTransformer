@@ -47,10 +47,10 @@ from chesstransformer.datasets.shard_format import (
 #: for an embedding lookup that accepts int32 anyway.
 _SCALAR_FIELDS = ("from_square", "action_plane", "castling_rights", "en_passant_file", "is_white")
 
-#: Value-target fields added in format v2 (see ``shard_format``). Passed through when the
-#: directory has them; a v1 directory simply does not, and the trainer refuses the flags
-#: that need them.
-_OPTIONAL_FIELDS = ("elo_gap", "result_tb", "value_exact")
+#: Value-target fields added in format v2 and rule-state fields added in v3 (see
+#: ``shard_format``). Passed through when the directory has them; an older directory simply
+#: does not, and the trainer refuses the flags that need them.
+_OPTIONAL_FIELDS = ("elo_gap", "result_tb", "value_exact", "rule50", "repetition")
 
 
 class FlatShardDataset(torch.utils.data.Dataset):

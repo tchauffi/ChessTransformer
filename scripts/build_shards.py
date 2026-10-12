@@ -284,6 +284,7 @@ def build_shard(task: dict) -> dict:
             end = len(game_moves) if _TB is not None else last_sampled + 1
             game_rows = []  # (row, ply) of samples that take the game's TB verdict
             tb_verdict = tb_ply = None
+            seen: dict = {}  # position -> occurrences so far, for the repetition count
             for ply in range(end + 1):
                 if (_TB is not None and tb_verdict is None
                         and chess.popcount(board.occupied) <= _TB_MEN):
@@ -292,6 +293,11 @@ def build_shard(task: dict) -> dict:
                         tb_ply = ply
                 if ply == end:
                     break  # the position after the last move only feeds the verdict
+
+                # Same key as chess_core's zobrist: board, side, castling, legal e.p.
+                key = board._transposition_key()
+                earlier = seen.get(key, 0)
+                seen[key] = earlier + 1
 
                 while next_wanted < len(plies) and plies[next_wanted] == ply:
                     target = _TOKEN_TO_MOVE[int(game_moves[ply])]
@@ -302,6 +308,8 @@ def build_shard(task: dict) -> dict:
                         rec["result"] = result
                         rec["move_number"] = ply
                         rec["elo_gap"] = gap if board.turn else -gap
+                        rec["rule50"] = min(board.halfmove_clock, 100)
+                        rec["repetition"] = min(earlier, 2)
                         rec["result_tb"] = result
                         own = (_tb_result(board) if _TB is not None
                                and chess.popcount(board.occupied) <= _TB_MEN else None)
