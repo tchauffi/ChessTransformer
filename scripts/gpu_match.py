@@ -59,8 +59,9 @@ class Half:
     """One MatchEngine over every `k`-th opening (both colours of an opening stay in
     one engine). Local game j is opening `openings[j // 2]`."""
 
-    def __init__(self, cfg: dict, lines: list[str], openings: list[int]):
+    def __init__(self, cfg: dict, lines: list[str], openings: list[int], blind_rules: bool = False):
         self.openings = openings
+        self.blind_rules = blind_rules  # rule-state nets get clock 0, no repetition
         fens, a_white = schedule([lines[o] for o in openings])
         self.engine = selfplay_core.MatchEngine(json.dumps(cfg), fens, a_white)
         self.handles = None  # [(rows, handle)] of the batch in flight, one per network
@@ -68,14 +69,15 @@ class Half:
     def launch(self, forwards, slot: int):
         boards, player, castling, ep, nets, legal = self.engine.collect()
         rule50 = repetition = None
-        if any(f.rule_state for f in forwards):
+        if any(f.rule_state for f in forwards) and not self.blind_rules:
             rule50, repetition = self.engine.rule_state()
         self.n, self.width = len(player), legal.shape[1]
         self.handles = []
         for net, fwd in enumerate(forwards):
             rows = np.flatnonzero(nets == net)
             if len(rows):
-                rule = (rule50[rows], repetition[rows]) if fwd.rule_state else (None, None)
+                rule = ((rule50[rows], repetition[rows]) if fwd.rule_state and not self.blind_rules
+                        else (None, None))
                 self.handles.append((rows, fwd, fwd.launch(2 * slot + net, boards[rows], player[rows],
                                                            castling[rows], ep[rows], legal[rows], *rule)))
 
@@ -125,6 +127,9 @@ def main() -> None:
     p.add_argument("--verify-every", type=int, default=50,
                    help="recompute every N-th async batch synchronously and compare (0 = never)")
     p.add_argument("--games-out", type=Path, default=None, help="append one JSON line per game")
+    p.add_argument("--blind-rule-state", action="store_true",
+                   help="feed rule-state networks clock 0 and no repetition (an ablation of the "
+                        "two inputs without retraining)")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
@@ -153,8 +158,12 @@ def main() -> None:
     for fwd in forwards:
         fwd.verify_every = args.verify_every
     # Each side's search caches its net's evaluations per rule state if the net reads it.
-    cfg["rule_state_a"], cfg["rule_state_b"] = (f.rule_state for f in forwards)
-    halves = [Half(cfg, lines, list(range(k, args.openings, k_eng))) for k in range(k_eng)]
+    cfg["rule_state_a"], cfg["rule_state_b"] = (f.rule_state and not args.blind_rule_state
+                                                for f in forwards)
+    for f in forwards:
+        f._warned = args.blind_rule_state  # the zeros are the point, not a mistake
+    halves = [Half(cfg, lines, list(range(k, args.openings, k_eng)), args.blind_rule_state)
+              for k in range(k_eng)]
     n_games = 2 * args.openings
     print(f"{la}: {args.model_a}\n{lb}: {args.model_b}\n"
           f"{args.openings} openings x 2 colours = {n_games} games, {args.max_sims} sims/move "
