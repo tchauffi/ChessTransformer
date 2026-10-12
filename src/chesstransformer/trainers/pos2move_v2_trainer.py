@@ -122,7 +122,8 @@ def resolve_precision(requested: str) -> str:
     return requested
 
 
-def unpack_batch(batch, device, value_labels: str = "human", elo_offset: bool = False):
+def unpack_batch(batch, device, value_labels: str = "human", elo_offset: bool = False,
+                 rule_state: bool = False):
     """Normalise a batch from either data path into the tensors the loss expects.
 
     The shard loader ships the legal mask as a ``(B, 64)`` uint16 index list — 64 KB per
@@ -134,7 +135,8 @@ def unpack_batch(batch, device, value_labels: str = "human", elo_offset: bool = 
     one (``result_tb``, shard format v2). ``elo_offset`` returns the rating gap the model
     adds to its value logits -- zeroed on samples whose label is their own tablebase
     result, since perfect play does not depend on who is playing. ``elo_gap`` is ``None``
-    otherwise, which is also what inference passes.
+    otherwise, which is also what inference passes. ``rule_state`` returns the halfmove
+    clock and repetition count (shard format v3); ``None`` otherwise.
     """
     if "legal_idx" in batch:
         legal_planes = scatter_legal_planes(batch["legal_idx"].to(device, non_blocking=True))
@@ -164,6 +166,9 @@ def unpack_batch(batch, device, value_labels: str = "human", elo_offset: bool = 
         "is_white": batch["is_white"].to(device, non_blocking=True).bool(),
         "move_number": batch["move_number"].to(device, non_blocking=True).long(),
         "elo_gap": elo_gap,
+        "rule50": batch["rule50"].to(device, non_blocking=True).long() if rule_state else None,
+        "repetition": (batch["repetition"].to(device, non_blocking=True).long()
+                       if rule_state else None),
     }
 
 
@@ -492,6 +497,15 @@ def main():
     parser.add_argument("--state-relation", action="store_true",
                         help="Give state-token<->square attention its own relation bias bucket "
                              "(9 categories) instead of sharing bucket 7 with 'far apart'.")
+    parser.add_argument("--attn-bias", type=str, default="buckets", choices=["buckets", "full"],
+                        help="Attention bias per head: 'buckets' = one learned value per relation "
+                             "category (v2.1), 'full' = one per token pair.")
+    parser.add_argument("--smolgen", action="store_true",
+                        help="Add a position-dependent attention bias generated from the "
+                             "current tokens (Leela's smolgen) to every layer.")
+    parser.add_argument("--rule-state", action="store_true",
+                        help="Feed the halfmove clock and the repetition count to the model. "
+                             "Needs v3 shards (build_shards.py records both).")
     parser.add_argument("--head-tower-layers", type=int, default=0,
                         help="Give each head a private copy of the last N transformer layers, so "
                              "only the first num_layers - N are shared. Each head's path keeps "
@@ -553,6 +567,8 @@ def main():
     if (args.elo_offset or args.value_labels != "human") and args.shards is None:
         parser.error("--elo-offset and --value-labels tablebase read shard format v2 fields; "
                      "pass --shards")
+    if args.rule_state and args.shards is None:
+        parser.error("--rule-state reads shard format v3 fields; pass --shards")
 
     # Epochs are gone as a unit of training length. They were never comparable between the
     # two data paths — the HDF5 dataset is indexed by *game* (738 optimizer steps/epoch) and
@@ -708,9 +724,12 @@ def main():
                                  "nothing. Rebuild with build_shards.py --syzygy.")
         if args.elo_offset:
             need.add("elo_gap")
+        if args.rule_state:
+            need |= {"rule50", "repetition"}
         if need - have:
-            raise SystemExit(f"{args.shards} lacks {sorted(need - have)} (format v1); "
-                             "rebuild it with scripts/build_shards.py")
+            raise SystemExit(f"{args.shards} lacks {sorted(need - have)} (format "
+                             f"v{shard_meta['format_version']}); rebuild it with "
+                             "scripts/build_shards.py")
         if args.value_labels == "tablebase":
             rank0_print(f"Value labels: tablebase ({shard_meta.get('num_tb_relabelled', 0):,} "
                         f"relabelled, {shard_meta.get('num_tb_exact', 0):,} exact samples)")
@@ -729,6 +748,9 @@ def main():
         "state_relation": args.state_relation,
         "value_elo_offset": args.elo_offset,
         "head_tower_layers": args.head_tower_layers,
+        "attn_bias": args.attn_bias,
+        "smolgen": args.smolgen,
+        "rule_state": args.rule_state,
     }
     if accelerator.is_main_process:
         with (log_path / "model_config.json").open("w") as f:
@@ -943,9 +965,10 @@ def main():
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation", leave=False,
                               disable=not accelerator.is_main_process):
-                b = unpack_batch(batch, device, args.value_labels, args.elo_offset)
+                b = unpack_batch(batch, device, args.value_labels, args.elo_offset, args.rule_state)
                 move_logits, value = model(b["board"], b["player"], b["castling"], b["en_passant"],
-                                           elo_gap=b["elo_gap"])
+                                           elo_gap=b["elo_gap"], rule50=b["rule50"],
+                                           repetition=b["repetition"])
                 loss, metrics = compute_loss(
                     move_logits, value,
                     b["from_sq"], b["action_plane"],
@@ -1089,7 +1112,7 @@ def main():
         start_pass_shuffle(train_loader, data_pass)
         for batch in train_loader:
             with accelerator.accumulate(model):
-                b = unpack_batch(batch, device, args.value_labels, args.elo_offset)
+                b = unpack_batch(batch, device, args.value_labels, args.elo_offset, args.rule_state)
                 board, player = b["board"], b["player"]
                 castling, en_passant = b["castling"], b["en_passant"]
                 from_sq, action_plane = b["from_sq"], b["action_plane"]
@@ -1097,7 +1120,8 @@ def main():
                 is_white, move_number = b["is_white"], b["move_number"]
 
                 move_logits, value = model(board, player, castling, en_passant,
-                                           elo_gap=b["elo_gap"])
+                                           elo_gap=b["elo_gap"], rule50=b["rule50"],
+                                           repetition=b["repetition"])
                 loss, metrics = compute_loss(
                     move_logits, value,
                     from_sq, action_plane,
@@ -1223,7 +1247,7 @@ def main():
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing", leave=False,
                           disable=not accelerator.is_main_process):
-            b = unpack_batch(batch, device, args.value_labels, args.elo_offset)
+            b = unpack_batch(batch, device, args.value_labels, args.elo_offset, args.rule_state)
             board, player = b["board"], b["player"]
             castling, en_passant = b["castling"], b["en_passant"]
             from_sq, action_plane = b["from_sq"], b["action_plane"]
@@ -1231,7 +1255,8 @@ def main():
             is_white, move_number = b["is_white"], b["move_number"]
 
             move_logits, value = model(board, player, castling, en_passant,
-                                       elo_gap=b["elo_gap"])
+                                       elo_gap=b["elo_gap"], rule50=b["rule50"],
+                                       repetition=b["repetition"])
             loss, metrics = compute_loss(
                 move_logits, value,
                 from_sq, action_plane,
