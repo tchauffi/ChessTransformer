@@ -26,19 +26,20 @@ use shakmaty::{CastlingMode, Chess, Color, Move, Position};
 /// Search settings of one side (ct-bot flags).
 #[derive(Clone, Copy)]
 pub struct SideParams {
-    pub c_puct: f64,
-    pub fpu: f64,
-    pub prior_temp: f32,
+    /// Per net (0 = A), so each network can play with its own search settings.
+    pub c_puct: [f64; 2],
+    pub fpu: [f64; 2],
+    pub prior_temp: [f32; 2],
     pub sim_batch: usize,
     pub tt_cap: usize,
 }
 
 impl SideParams {
-    fn search_params(&self) -> SearchParams {
+    fn search_params(&self, s: usize) -> SearchParams {
         SearchParams {
-            c_puct: self.c_puct,
-            fpu: self.fpu,
-            prior_temp: self.prior_temp,
+            c_puct: self.c_puct[s],
+            fpu: self.fpu[s],
+            prior_temp: self.prior_temp[s],
             sim_batch: self.sim_batch,
             tt_cap: self.tt_cap,
             legal_in_requests: true,
@@ -84,8 +85,8 @@ pub struct MatchGame {
 
 impl MatchGame {
     pub fn new(id: usize, start: Chess, a_white: bool, params: SideParams) -> Self {
-        let side = || Side {
-            search: Search::new(NoEval, params.search_params()),
+        let side = |s: usize| Side {
+            search: Search::new(NoEval, params.search_params(s)),
             job: None,
             pondering: false,
             out: None,
@@ -99,7 +100,7 @@ impl MatchGame {
             start,
             moves: Vec::new(),
             moves_uci: Vec::new(),
-            sides: [side(), side()],
+            sides: [side(0), side(1)],
             end: None,
         };
         g.check_end(0);
@@ -279,12 +280,25 @@ mod tests {
 
     const SALTS: [f64; 2] = [0.0, 1.7];
 
+    #[test]
+    fn each_net_searches_with_its_own_settings() {
+        let p = SideParams {
+            c_puct: [1.0, 2.5], fpu: [0.2, 0.05], prior_temp: [1.0, 1.4], sim_batch: 16,
+            tt_cap: 1000,
+        };
+        let (a, b) = (p.search_params(0), p.search_params(1));
+        assert_eq!((a.c_puct, a.fpu, a.prior_temp), (1.0, 0.2, 1.0));
+        assert_eq!((b.c_puct, b.fpu, b.prior_temp), (2.5, 0.05, 1.4));
+    }
+
     fn pos(fen: &str) -> Chess {
         fen.parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap()
     }
 
     fn params(sim_batch: usize) -> SideParams {
-        SideParams { c_puct: 1.0, fpu: 0.2, prior_temp: 1.0, sim_batch, tt_cap: 2_000_000 }
+        SideParams {
+            c_puct: [1.0; 2], fpu: [0.2; 2], prior_temp: [1.0; 2], sim_batch, tt_cap: 2_000_000,
+        }
     }
 
     /// The batched driver, one game.
@@ -306,7 +320,7 @@ mod tests {
     /// The bot's own flow, sequentially through `go()`: our search, then our
     /// ponder to completion, then the opponent's turn.
     fn sequential(start: &Chess, a_white: bool, rules: MatchRules, sim_batch: usize) -> Vec<String> {
-        let mk = |s: usize| Search::new(HashEval(SALTS[s]), params(sim_batch).search_params());
+        let mk = |s: usize| Search::new(HashEval(SALTS[s]), params(sim_batch).search_params(s));
         let mut sides = [mk(0), mk(1)];
         let mut moves: Vec<Move> = Vec::new();
         let mut out = Vec::new();
