@@ -6,6 +6,10 @@
 #   systemd-run --user --unit ct-human-sgr --working-directory "$PWD" \
 #     bash -c 'scripts/queue_human_sgr.sh > logs/queue_human_sgr.log 2>&1'
 #
+# RULE50_FREE=N passes --rule50-free N (the clock reaches the net only past N plies) and TAG
+# names the match label and games file. run_029 (2026-10-12) ran without it: its per-value
+# clock embeddings lost to gen00 (~-54 Elo at 129 games).
+#
 # Same corpus (elite_db.h5, K=32, seed 0: the same samples as elite_k32_v2 plus the two v3
 # fields), same steps, lr, value recipe and seed as run_028: only the architecture differs.
 # The self-play fine-tune of smolgen (cand02_sg) lost -31 Elo after over-fitting 4.6M
@@ -20,7 +24,9 @@ export PYTHONPATH="$CODE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 SHARDS=data/shards/elite_k32_v3
 BASE=data/rl/models/gen00
-GAMES_OUT=data/rl/gates/human_sgr_vs_gen00.jsonl
+TAG="${TAG:-human_sgr}"
+RULE50_FREE="${RULE50_FREE:-}"
+GAMES_OUT="data/rl/gates/${TAG}_vs_gen00.jsonl"
 log() { echo "[$(date '+%F %T')] $*"; }
 
 if [[ ! -f "$SHARDS/meta.json" ]]; then
@@ -38,7 +44,7 @@ before="$(ls -d logs/pos2move_v2/run_* 2>/dev/null | sort | tail -1)"
   --num-workers 0 --compile \
   --value-head wdl --value-loss-weight 3 --value-rampup-halfmoves 0 \
   --value-labels tablebase --elo-offset --head-tower-layers 3 --value-pool attn \
-  --attn-bias full --smolgen --rule-state \
+  --attn-bias full --smolgen --rule-state ${RULE50_FREE:+--rule50-free "$RULE50_FREE"} \
   || { log "training failed"; exit 1; }
 RUN="$(ls -d logs/pos2move_v2/run_* | sort | tail -1)"
 if [[ "$RUN" == "$before" ]]; then log "no new run dir"; exit 1; fi
@@ -64,7 +70,7 @@ ok=0
 for extra in "" "--no-compile --engines 1"; do
   rm -f "$GAMES_OUT"
   timeout "$left" "$PY" "$CODE_ROOT/scripts/gpu_match.py" --model-a "$CAND" --model-b "$BASE" \
-    --label-a human_sgr --label-b gen00 --openings 200 --max-sims 4000 --ponder-max-sims 2000 \
+    --label-a "$TAG" --label-b gen00 --openings 200 --max-sims 4000 --ponder-max-sims 2000 \
     --sprt --games-out "$GAMES_OUT" $extra | tail -14
   rc=${PIPESTATUS[0]}
   ((rc == 0)) && { ok=1; break; }
