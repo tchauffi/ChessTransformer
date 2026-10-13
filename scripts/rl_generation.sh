@@ -25,6 +25,8 @@
 #    starts to overfit. The final weights are exported: val loss does not pick checkpoints
 #    (exit2 had the best val loss and the worst gate). Compiled: 2.2x the eager speed, and a
 #    smolgen champion does not fit eager at batch 512 (>15.4 GiB; compiled 9.4).
+#    POLICY_TARGET=gumbel trains the policy on Gumbel completed-Q targets instead of the
+#    visit counts; unset, it is read from $RL/policy_target (default visits).
 # 3. Gate. Candidate vs champion over GATE_GAMES games; promoted on a score >= 50%. A worse
 #    candidate rarely clears that (a -30 Elo net passes ~1% of the time at 400 games) and an
 #    equal one is a free reshuffle, as AlphaZero always promoted. FORCE_PROMOTE=1 promotes
@@ -60,6 +62,7 @@ V21=data/models/pos2move_v2.1
 HUMAN_SHARDS="${HUMAN_SHARDS:-data/shards/elite_k32_v2}"
 FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(cat "$RL/forced_playouts" 2>/dev/null || echo 0)}"
 KATAGO_ON_FAIL="${KATAGO_ON_FAIL:-0}"
+POLICY_TARGET="${POLICY_TARGET:-$(cat "$RL/policy_target" 2>/dev/null || echo visits)}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
@@ -149,10 +152,11 @@ if [[ ! -f "$CAND/model.safetensors" ]]; then
     d="$RL/selfplay/gen$(printf %02d $k)"
     ((k >= 1)) && [[ -f "$d/.selfplay_done" ]] && DATA+=("$d")
   done
-  log "training $CAND from $CHAMP_NAME on ${DATA[*]}, $EPOCHS epochs"
+  log "training $CAND from $CHAMP_NAME on ${DATA[*]}, $EPOCHS epochs, $POLICY_TARGET policy targets"
   uv run python scripts/train_expert_iter.py --data "${DATA[@]}" --base "$CHAMP" --out "$CAND" \
     --epochs "$EPOCHS" --batch-size 512 --lr 1e-4 --kl-coef 0.1 --soft-mix 0.5 --value-weight 1.0 \
     --human-shards "$HUMAN_SHARDS" --human-frac 0.2 --select last --compile \
+    --policy-target "$POLICY_TARGET" \
     || { log "training failed"; exit 1; }
   uv run --with onnxscript python scripts/export_onnx.py "$CAND" -o "$CAND/model.onnx" \
     || { log "export failed"; exit 1; }
