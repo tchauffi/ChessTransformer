@@ -133,3 +133,76 @@ def test_human_replay_feeds_the_rating_gap():
         exact_no_gap = human_loss(m, _human_batch(exact=True), "cpu", 1.0, elo_gap=False)
     assert not torch.isclose(with_gap, no_gap)
     assert torch.isclose(exact, exact_no_gap)  # tablebase results ignore who was stronger
+
+
+# ── Gumbel completed-Q policy targets ───────────────────────────────────────
+def test_completed_q_target_matches_the_paper_on_a_hand_example():
+    from train_expert_iter import completed_q_targets
+    # One position: prior .6/.3/.1, visits 10/5/0, Q .1/.3/-, network value 0.
+    prior, n, q = np.array([.6, .3, .1]), np.array([10, 5, 0]), np.array([.1, .3, 0.])
+    pi = completed_q_targets(prior, n, q, np.array([0, 3]), np.array([0.0]), np.array([0.0]))
+    v_mix = (0.0 + 15 * (.6 * .1 + .3 * .3) / .9) / 16           # 0.15625
+    cq = np.array([.1, .3, v_mix])
+    want = prior * np.exp((50 + 10) * 0.1 * (cq + 1) / 2)
+    np.testing.assert_allclose(pi, want / want.sum(), rtol=1e-5)
+    assert pi[1] > prior[1] and pi[0] < prior[0]  # the better-valued move gains, by Q not visits
+
+
+def test_completed_q_target_properties():
+    from train_expert_iter import completed_q_targets
+    rng = np.random.default_rng(0)
+    lens = rng.integers(2, 30, size=50)
+    ptr = np.concatenate([[0], np.cumsum(lens)])
+    prior = rng.dirichlet(np.ones(lens.sum()))  # any positive weights; normalised per position below
+    for i in range(50):
+        prior[ptr[i]:ptr[i + 1]] /= prior[ptr[i]:ptr[i + 1]].sum()
+    n = rng.integers(0, 40, size=lens.sum()) * (rng.random(lens.sum()) < 0.5)
+    q = np.where(n > 0, rng.uniform(-1, 1, lens.sum()), 0.0)
+    net_v, fb = rng.uniform(-1, 1, 50), np.zeros(50)
+    pi = completed_q_targets(prior, n, q, ptr, net_v, fb)
+    seg = np.repeat(np.arange(50), lens)
+    np.testing.assert_allclose(np.bincount(seg, weights=pi), 1.0, rtol=1e-5)
+    # No value scale: the prior itself.
+    np.testing.assert_allclose(completed_q_targets(prior, n, q, ptr, net_v, fb, c_scale=0.0), prior, rtol=1e-5)
+    # Unvisited moves share one completed value: their prior ratios survive.
+    for i in range(50):
+        sl = slice(ptr[i], ptr[i + 1])
+        un = n[sl] == 0
+        if un.sum() >= 2:
+            np.testing.assert_allclose((pi[sl] / prior[sl])[un], (pi[sl] / prior[sl])[un][0], rtol=1e-4)
+    # A NaN network value falls back to the given one.
+    nan_v = net_v.copy(); nan_v[3] = np.nan
+    fb2 = net_v.copy()
+    np.testing.assert_allclose(completed_q_targets(prior, n, q, ptr, nan_v, fb2), pi, rtol=1e-5)
+
+
+def test_dataset_takes_gumbel_targets_from_the_root_search_columns(tmp_path):
+    from train_expert_iter import SelfplayDataset, completed_q_targets
+    P = 4
+    lens = np.array([3, 2, 4, 3]); ptr = np.concatenate([[0], np.cumsum(lens)])
+    legal_idx = np.arange(lens.sum(), dtype=np.uint16) * 7
+    prior = np.concatenate([np.full(k, 1 / k) for k in lens]).astype(np.float16)
+    legal_n = np.array([5, 3, 0, 8, 0, 2, 2, 2, 2, 0, 6, 1], dtype=np.uint16)
+    legal_q = np.where(legal_n > 0, 0.1, 0.0).astype(np.float16)
+    vis = legal_n > 0
+    shard = dict(boards=np.zeros((P, 64), np.uint8), player=np.ones(P, np.uint8), castling=np.zeros(P, np.uint8),
+                 ep=np.zeros(P, np.uint8), halfmove=np.arange(P, dtype=np.uint16), z=np.zeros(P, np.float32),
+                 root_v=np.zeros(P, np.float32), full=np.array([1, 0, 1, 0], np.uint8),
+                 game_id=np.zeros(P, np.uint32), visit_idx=legal_idx[vis], visit_cnt=legal_n[vis],
+                 visit_ptr=np.concatenate([[0], np.cumsum([vis[ptr[i]:ptr[i + 1]].sum() for i in range(P)])]),
+                 legal_idx=legal_idx, legal_prior=prior, legal_n=legal_n, legal_q=legal_q, legal_ptr=ptr,
+                 root_net_v=np.zeros(P, np.float32))
+    np.savez(tmp_path / "positions_0000.npz", **shard)
+    plain = SelfplayDataset([tmp_path])
+    assert plain.full.tolist() == [1, 0, 1, 0] and plain.v_cnt.dtype == np.uint16
+    g = SelfplayDataset([tmp_path], policy_target="gumbel")
+    np.testing.assert_array_equal(g.v_idx, legal_idx)
+    np.testing.assert_allclose(g.v_cnt, completed_q_targets(prior, legal_n, legal_q, ptr, shard["root_net_v"],
+                                                            shard["root_v"]), rtol=1e-6)
+    assert g.full.tolist() == [1, 0, 1, 0]
+    assert SelfplayDataset([tmp_path], policy_target="gumbel", gumbel_fast=True).full.tolist() == [1, 1, 1, 1]
+    for k in ("legal_idx", "legal_prior", "legal_n", "legal_q", "legal_ptr", "root_net_v"):
+        del shard[k]
+    np.savez(tmp_path / "positions_0000.npz", **shard)
+    with pytest.raises(ValueError, match="root search columns"):
+        SelfplayDataset([tmp_path], policy_target="gumbel")
