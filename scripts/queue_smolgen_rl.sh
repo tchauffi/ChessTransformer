@@ -16,10 +16,11 @@
 #    parity-checked, then installed as cand02. The old-architecture cand02 (gen01 on the
 #    same data, +6 Elo over gen01 after 387 of 400 gate games) moves to cand02_old with its
 #    gate games.
-# 2. rl_generation.sh gates the new cand02 against the champion gen01 and promotes it on a
-#    score >= 50%. Promoted: the smolgen net plays gen03's self-play and the loop goes on
-#    back to back, as ct-rl-loop always has. Not promoted: gen01 stays champion and the
-#    loop stops for a decision.
+# 2. rl_generation.sh gates the new cand02 against the champion gen01 and promotes it
+#    whatever the score (FORCE_PROMOTE=1; user: "Let's use smolgen for now as it is
+#    theoretically the best model"): the gate measures where the smolgen line starts, and
+#    history.tsv reads "forced" if it lost. The smolgen net then plays gen03's self-play
+#    and the loop goes on back to back, as ct-rl-loop always has.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -56,11 +57,9 @@ if [[ ! -f "$CAND/SOURCE" ]] || ! grep -q sg_base "$CAND/SOURCE"; then
   log "smolgen: $CAND is now sg_base trained on gen01 + gen02 (old cand02 in cand02_old)"
 fi
 
-/bin/bash scripts/rl_generation.sh >> "$LOG" 2>&1 || { log "smolgen: generation failed, loop stopped"; exit 1; }
-if [[ "$(readlink "$RL/champion")" != models/gen02 ]]; then
-  log "smolgen: cand02 not promoted, gen01 stays champion; loop stopped for a decision"
-  exit 0
-fi
+FORCE_PROMOTE=1 /bin/bash scripts/rl_generation.sh >> "$LOG" 2>&1 \
+  || { log "smolgen: generation failed, loop stopped"; exit 1; }
+[[ "$(readlink "$RL/champion")" == models/gen02 ]] || { log "smolgen: gen02 not installed, loop stopped"; exit 1; }
 log "smolgen: champion is the smolgen net (gen02); the loop goes on"
 while [[ ! -f "$RL/STOP" ]]; do
   /bin/bash scripts/rl_generation.sh >> "$LOG" 2>&1 || { log "generation failed, loop stopped"; exit 1; }
