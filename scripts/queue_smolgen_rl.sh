@@ -21,6 +21,9 @@
 #    theoretically the best model"): the gate measures where the smolgen line starts, and
 #    history.tsv reads "forced" if it lost. The smolgen net then plays gen03's self-play
 #    and the loop goes on back to back, as ct-rl-loop always has.
+# 3. The first candidate that fails its gate turns on KataGo forced playouts + policy
+#    target pruning for the self-play after it (KATAGO_ON_FAIL; user: "If it fails self
+#    play let's try katago").
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -62,6 +65,6 @@ FORCE_PROMOTE=1 /bin/bash scripts/rl_generation.sh >> "$LOG" 2>&1 \
 [[ "$(readlink "$RL/champion")" == models/gen02 ]] || { log "smolgen: gen02 not installed, loop stopped"; exit 1; }
 log "smolgen: champion is the smolgen net (gen02); the loop goes on"
 while [[ ! -f "$RL/STOP" ]]; do
-  /bin/bash scripts/rl_generation.sh >> "$LOG" 2>&1 || { log "generation failed, loop stopped"; exit 1; }
+  KATAGO_ON_FAIL=1 /bin/bash scripts/rl_generation.sh >> "$LOG" 2>&1 || { log "generation failed, loop stopped"; exit 1; }
 done
 log "STOP file found, loop ended"
