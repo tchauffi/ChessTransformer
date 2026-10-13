@@ -14,6 +14,9 @@
 #    tree reuse (~800 fresh). CAP_TOTAL=all counts the reused tree's warm visits toward
 #    both budgets (fast: fast moves only; none: fresh sims on top of the reused tree, which
 #    cost 2.7x the old engine's evaluations per position in gen02's first half hour).
+#    FORCED_PLAYOUTS=k adds KataGo forced playouts + policy target pruning to the full
+#    searches (k=2 in KataGo); unset, k is read from $RL/forced_playouts, which
+#    KATAGO_ON_FAIL=1 writes (k=2) the first time a candidate fails its gate.
 # 2. Train. A candidate from the champion, EPOCHS passes over the last WINDOW generations
 #    of self-play: policy on the visit distributions, WDL value on the outcome mixed 50/50
 #    with the root Q (less label variance -- the value head overfit last time), KL-anchored
@@ -55,6 +58,8 @@ MATCH_SIMS="${MATCH_SIMS:-4000}"
 PONDER_SIMS="${PONDER_SIMS:-2000}"
 V21=data/models/pos2move_v2.1
 HUMAN_SHARDS="${HUMAN_SHARDS:-data/shards/elite_k32_v2}"
+FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(cat "$RL/forced_playouts" 2>/dev/null || echo 0)}"
+KATAGO_ON_FAIL="${KATAGO_ON_FAIL:-0}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
@@ -116,12 +121,13 @@ log "=== $GEN: champion $CHAMP_NAME ==="
 
 # ── 1. self-play ─────────────────────────────────────────────────────────────
 if [[ ! -f "$SP/.selfplay_done" ]]; then
-  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL"
+  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS"
   selfplay() {
     uv run python scripts/selfplay_rust.py --model "$CHAMP" --out "$SP" \
       --games 1000000 --max-hours "$SELFPLAY_HOURS" --parallel-games "$PARALLEL" \
       --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total "$CAP_TOTAL" \
-      --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --seed "$G" "$@"
+      --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
+      --seed "$G" "$@"
   }
   # The bot's search; should it crash, the older engine finishes the generation (it
   # resumes the games file, but restarts the hour budget).
@@ -181,6 +187,10 @@ if [[ "$PROMOTED" != no ]]; then
   fi
 else
   log "not promoted: $CHAMP_NAME stays champion"
+  if [[ "$KATAGO_ON_FAIL" == 1 && ! -f "$RL/forced_playouts" ]]; then
+    echo 2 > "$RL/forced_playouts"
+    log "self-play gets KataGo forced playouts (k=2) from the next generation on"
+  fi
 fi
 
 POS="$(uv run python -c "import numpy as np, glob, sys; print(sum(len(np.load(f)['z']) for f in glob.glob(sys.argv[1] + '/positions_*.npz')))" "$SP")"
