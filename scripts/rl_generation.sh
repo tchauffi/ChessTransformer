@@ -130,9 +130,15 @@ if [[ ! -f "$SP/.selfplay_done" ]]; then
       --seed "$G" "$@"
   }
   # The bot's search; should it crash, the older engine finishes the generation (it
-  # resumes the games file, but restarts the hour budget).
-  selfplay || { log "self-play failed -- rerunning on the legacy engine"; selfplay --legacy-engine; } \
-    || { log "self-play failed"; exit 1; }
+  # resumes the games file, but restarts the hour budget) -- except with forced playouts,
+  # which the older engine lacks: its games would be plain-MCTS data.
+  if ! selfplay; then
+    if awk -v k="$FORCED_PLAYOUTS" 'BEGIN { exit !(k > 0) }'; then
+      log "self-play failed (no legacy fallback: it has no forced playouts)"; exit 1
+    fi
+    log "self-play failed -- rerunning on the legacy engine"
+    selfplay --legacy-engine || { log "self-play failed"; exit 1; }
+  fi
   touch "$SP/.selfplay_done"
 fi
 
