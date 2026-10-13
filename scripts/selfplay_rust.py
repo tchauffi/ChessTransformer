@@ -269,6 +269,9 @@ def main():
                    help="budgets that count the reused tree's warm visits (the root's total "
                         "visits) instead of fresh sims: none, fast moves only, or all moves; "
                         "not --legacy-engine, which has no tree reuse")
+    p.add_argument("--forced-playouts", type=float, default=0.0,
+                   help="KataGo forced playouts + policy target pruning on full searches: k "
+                        "(2 in KataGo; 0 = off). Not --legacy-engine")
     p.add_argument("--dirichlet-alpha", type=float, default=0.0,
                    help="root noise on full searches (AlphaZero chess: 0.3); 0 = off")
     p.add_argument("--dirichlet-eps", type=float, default=0.25)
@@ -333,6 +336,7 @@ def main():
         "cap_total_fast": args.cap_total in ("fast", "all"),
         "dirichlet_alpha": args.dirichlet_alpha,
         "dirichlet_eps": args.dirichlet_eps,
+        "forced_playouts": args.forced_playouts,
     }
     openings = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] + list(OPENINGS)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
@@ -343,6 +347,8 @@ def main():
     done_games, n_positions = 0, 0
     log = open(games_log, "a")
     if args.legacy_engine:
+        if args.forced_playouts > 0:
+            print("WARNING: --legacy-engine has no forced playouts; searching without them", flush=True)
         engines = [selfplay_core.Engine(json.dumps(cfg), openings, args.seed + id_offset, args.games)]
     else:
         cfg["tt_cap"] = min(args.tt_cap, 200_000)  # per game here, one shared TT in Engine
