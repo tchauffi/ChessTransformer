@@ -216,3 +216,31 @@ def test_converter_adds_a_free_clock(tmp_path):
                    env={"PYTHONPATH": str(ROOT / "src"), "PATH": "/usr/bin:/bin"}, capture_output=True)
     cfg = json.loads((dst / "model_config.json").read_text())
     assert cfg["rule_state"] is True and cfg["rule50_free"] == 60
+
+
+@pytest.mark.parametrize("free", [None, 60])
+def test_converter_drops_the_rule_state(tmp_path, free):
+    """--drop-rule-state: a plain network that plays as the source fed clock 0, no repetition."""
+    import subprocess
+    from grpo_puzzles import load_model
+    torch.manual_seed(0)
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    cfg = dict(CFG, rule_state=True, **({} if free is None else {"rule50_free": free}))
+    m = Pos2MoveV2(**cfg).eval()
+    with torch.no_grad():
+        m.rule50_embedding.weight.normal_(0.0, 0.5)
+        m.repetition_embedding.weight.normal_(0.0, 0.5)
+    save_file(m.state_dict(), str(src / "model.safetensors"))
+    (src / "model_config.json").write_text(json.dumps(cfg))
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "convert_attn_bias.py"), "--src", str(src),
+                    "--dst", str(dst), "--drop-rule-state"], check=True,
+                   env={"PYTHONPATH": str(ROOT / "src"), "PATH": "/usr/bin:/bin"}, capture_output=True)
+    assert json.loads((dst / "model_config.json").read_text()) == CFG
+    new = load_model(dst, "cpu").eval()
+    zeros = torch.zeros(6, dtype=torch.long)
+    with torch.no_grad():
+        (lo, vo), (ln, vn) = m(*_inputs(), rule50=zeros, repetition=zeros), new(*_inputs())
+        _, v_clock = m(*_inputs(), **_rules())
+    assert torch.allclose(lo, ln, atol=1e-5) and torch.allclose(vo, vn, atol=1e-5)
+    assert not torch.allclose(vo, v_clock)  # the source does read its rule state
