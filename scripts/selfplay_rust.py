@@ -223,6 +223,11 @@ class ShardWriter:
     """npz shards with the selfplay_value_games.py columns + CSR visit dists."""
 
     SCALAR_COLS = ("player", "castling", "ep", "halfmove", "z", "root_v", "full")
+    # The root's search over every legal move (SelfPlayEngine only), for completed-Q
+    # (Gumbel) policy targets: CSR like the visits, plus the network's raw root value.
+    # A shard keeps them when every game has them.
+    LEGAL_COLS = {"legal_idx": np.uint16, "legal_prior": np.float16, "legal_n": np.uint16,
+                  "legal_q": np.float16}
     # Recorded by SelfPlayEngine only; a shard keeps them when every game has them.
     RULE_COLS = ("rule50", "repetition")
 
@@ -237,6 +242,8 @@ class ShardWriter:
         self.boards, self.game_id = [], []
         self.visit_idx, self.visit_cnt = [], []
         self.visit_lens = []
+        self.legal = {c: [] for c in self.LEGAL_COLS}
+        self.legal_lens, self.root_net_v = [], []
         self.n = 0
 
     def add_game(self, g: dict, game_id: int):
@@ -252,6 +259,11 @@ class ShardWriter:
         self.visit_cnt.append(np.asarray(g["visit_cnt"], dtype=np.uint16))
         ptr = np.asarray(g["visit_ptr"], dtype=np.int64)
         self.visit_lens.append(np.diff(ptr))
+        if "legal_ptr" in g:
+            for c, t in self.LEGAL_COLS.items():
+                self.legal[c].append(np.asarray(g[c]).astype(t))
+            self.legal_lens.append(np.diff(np.asarray(g["legal_ptr"], dtype=np.int64)))
+            self.root_net_v.append(np.asarray(g["root_net_v"], dtype=np.float32))
         self.n += p
         if self.n >= self.flush_positions:
             self.flush()
@@ -273,6 +285,13 @@ class ShardWriter:
                  "halfmove": np.uint16, "z": np.float32, "root_v": np.float32, "full": np.uint8}
         for c in self.SCALAR_COLS:
             arrays[c] = np.concatenate(self.cols[c]).astype(casts[c])
+        if len(self.legal_lens) == len(self.game_id):
+            for c in self.LEGAL_COLS:
+                arrays[c] = np.concatenate(self.legal[c])
+            legal_lens = np.concatenate(self.legal_lens)
+            arrays["legal_ptr"] = np.zeros(len(legal_lens) + 1, dtype=np.int64)
+            np.cumsum(legal_lens, out=arrays["legal_ptr"][1:])
+            arrays["root_net_v"] = np.concatenate(self.root_net_v)
         for c in self.RULE_COLS:
             if len(self.cols[c]) == len(self.game_id):
                 arrays[c] = np.concatenate(self.cols[c]).astype(np.uint8)
