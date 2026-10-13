@@ -81,6 +81,9 @@ struct Config {
     /// The network reads the rule state: cache its evaluations per rule state.
     #[serde(default)]
     rule_state: bool,
+    /// KataGo forced playouts + policy target pruning on full searches (k; 0 = off).
+    #[serde(default)]
+    forced_playouts: f64,
 }
 fn d_games() -> usize { 128 }
 fn d_batch() -> usize { 16 }
@@ -172,7 +175,7 @@ impl SelfPlayEngine {
             no_resign_frac: c.no_resign_frac, max_plies: c.max_plies, sim_batch: c.sim_batch,
             c_puct: c.c_puct, fpu: c.fpu, prior_temp: c.prior_temp, tt_cap: c.tt_cap,
             cap_total_full: c.cap_total_full, cap_total_fast: c.cap_total_fast,
-            rule_state: c.rule_state,
+            rule_state: c.rule_state, forced_playouts: c.forced_playouts,
         };
         let mut e = SelfPlayEngine {
             rules,

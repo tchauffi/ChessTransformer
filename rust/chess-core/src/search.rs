@@ -25,7 +25,7 @@ use crate::encoding::{
     search_terminal_value, zobrist,
     NUM_PLANES,
 };
-use crate::tree::{backup_vl, puct_select, softmax_priors, Node};
+use crate::tree::{backup_vl, forced_select, prune_forced, puct_select, softmax_priors, Node};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use shakmaty::{Chess, Move, Position};
@@ -218,12 +218,21 @@ pub struct Job {
     stage: Stage,
     stopped: bool,
     noise: Option<RootNoise>,
+    /// KataGo forced playouts at the root (`tree::forced_select`); 0 = off.
+    forced_k: f64,
 }
 
 impl Job {
     /// End the search after the wave in progress (go()'s stop flag / deadline).
     pub fn stop(&mut self) {
         self.stopped = true;
+    }
+
+    /// Give every visited root child at least `sqrt(k * P * N)` visits (KataGo forced
+    /// playouts, self-play only; pair with `Search::pruned_root_visits`). The bot never
+    /// sets it.
+    pub fn force_playouts(&mut self, k: f64) {
+        self.forced_k = k;
     }
 
     pub fn is_done(&self) -> bool {
@@ -389,6 +398,7 @@ impl<E: Evaluator> Search<E> {
             stage: Stage::Root,
             stopped: false,
             noise: None,
+            forced_k: 0.0,
         };
         match self.root_tablebase() {
             RootTb::Play(best) => {
@@ -514,6 +524,16 @@ impl<E: Evaluator> Search<E> {
 
     /// The move and stats of a finished (or stopped) search.
     pub fn finish(&mut self, job: Job) -> SearchResult {
+        self.finish_on(job, None)
+    }
+
+    /// `finish`, the move chosen from `visits` (one per root move, in `root_moves`
+    /// order) instead of the root's own counts: self-play's pruned policy targets.
+    pub fn finish_with_visits(&mut self, job: Job, visits: &[u32]) -> SearchResult {
+        self.finish_on(job, Some(visits))
+    }
+
+    fn finish_on(&mut self, job: Job, visits: Option<&[u32]>) -> SearchResult {
         if let Some(best) = job.tb_move {
             return SearchResult {
                 best,
@@ -526,18 +546,18 @@ impl<E: Evaluator> Search<E> {
             };
         }
         let root = &self.tree[0];
+        let counts = visits.unwrap_or(&root.n);
         let best_idx = if self.params.move_temp > 0.0
             && halfmove(&self.pos) < self.params.move_temp_plies
         {
-            let weights: Vec<f64> = root
-                .n
+            let weights: Vec<f64> = counts
                 .iter()
                 .map(|&n| (n as f64).powf(1.0 / self.params.move_temp))
                 .collect();
             let total: f64 = weights.iter().sum();
             if total > 0.0 {
                 let mut r = self.rng.gen::<f64>() * total;
-                let mut pick = root.n.len() - 1;
+                let mut pick = counts.len() - 1;
                 for (i, w) in weights.iter().enumerate() {
                     if r < *w {
                         pick = i;
@@ -550,7 +570,7 @@ impl<E: Evaluator> Search<E> {
                 0
             }
         } else {
-            (0..root.n.len()).max_by_key(|&i| root.n[i]).unwrap_or(0)
+            (0..counts.len()).max_by_key(|&i| counts[i]).unwrap_or(0)
         };
         let value = if root.n[best_idx] > 0 {
             (-root.w[best_idx] / root.n[best_idx] as f64) as f32
@@ -662,7 +682,7 @@ impl<E: Evaluator> Search<E> {
         let mut batch_index: HashMap<u64, usize> = HashMap::new();
 
         for _ in 0..wave {
-            let (node_idx, path, pos, path_keys) = self.descend();
+            let (node_idx, path, pos, path_keys) = self.descend(job.forced_k);
             let key = zobrist(&pos);
             let mut all_keys = self.history.clone();
             all_keys.extend_from_slice(&path_keys);
@@ -787,8 +807,9 @@ impl<E: Evaluator> Search<E> {
     }
 
     /// Virtual-loss descent to an unexpanded node; returns (leaf node index,
-    /// path edges, leaf position, zobrist keys pushed en route).
-    fn descend(&mut self) -> (usize, Vec<(usize, usize)>, Chess, Vec<u64>) {
+    /// path edges, leaf position, zobrist keys pushed en route). `forced_k` > 0 forces
+    /// root playouts (`Job::force_playouts`).
+    fn descend(&mut self, forced_k: f64) -> (usize, Vec<(usize, usize)>, Chess, Vec<u64>) {
         let mut node_idx = 0usize;
         let mut pos = self.pos.clone();
         let mut path = Vec::new();
@@ -797,7 +818,8 @@ impl<E: Evaluator> Search<E> {
             if !self.tree[node_idx].expanded {
                 return (node_idx, path, pos, keys);
             }
-            let idx = puct_select(&self.tree[node_idx], self.params.c_puct, self.params.fpu);
+            let forced = if node_idx == 0 && forced_k > 0.0 { forced_select(&self.tree[0], forced_k) } else { None };
+            let idx = forced.unwrap_or_else(|| puct_select(&self.tree[node_idx], self.params.c_puct, self.params.fpu));
             {
                 let node = &mut self.tree[node_idx];
                 node.n[idx] += 1; // virtual loss
@@ -817,6 +839,17 @@ impl<E: Evaluator> Search<E> {
                 new_idx
             };
         }
+    }
+
+    /// The root's moves, in the order of its visit counts and `finish_with_visits`.
+    pub fn root_moves(&self) -> &[Move] {
+        &self.tree[0].moves
+    }
+
+    /// The root's visit counts after KataGo policy target pruning
+    /// (`tree::prune_forced`), in `root_moves` order.
+    pub fn pruned_root_visits(&self, forced_k: f64) -> Vec<u32> {
+        prune_forced(&self.tree[0], self.params.c_puct, forced_k)
     }
 
     /// Root children as (move, visits, Q from the root side-to-move POV, prior),
