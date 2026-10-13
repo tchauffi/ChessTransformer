@@ -20,7 +20,8 @@
 #    to the champion, 20% human replay. gen01's single pass (4k steps) ended with the policy
 #    loss still falling, hence 2; the val line after each epoch shows whether the value head
 #    starts to overfit. The final weights are exported: val loss does not pick checkpoints
-#    (exit2 had the best val loss and the worst gate).
+#    (exit2 had the best val loss and the worst gate). Compiled: 2.2x the eager speed, and a
+#    smolgen champion does not fit eager at batch 512 (>15.4 GiB; compiled 9.4).
 # 3. Gate. Candidate vs champion over GATE_GAMES games; promoted on a score >= 50%. A worse
 #    candidate rarely clears that (a -30 Elo net passes ~1% of the time at 400 games) and an
 #    equal one is a free reshuffle, as AlphaZero always promoted. With V21_GAMES > 0 a new
@@ -136,7 +137,7 @@ if [[ ! -f "$CAND/model.safetensors" ]]; then
   log "training $CAND from $CHAMP_NAME on ${DATA[*]}, $EPOCHS epochs"
   uv run python scripts/train_expert_iter.py --data "${DATA[@]}" --base "$CHAMP" --out "$CAND" \
     --epochs "$EPOCHS" --batch-size 512 --lr 1e-4 --kl-coef 0.1 --soft-mix 0.5 --value-weight 1.0 \
-    --human-shards "$HUMAN_SHARDS" --human-frac 0.2 --select last \
+    --human-shards "$HUMAN_SHARDS" --human-frac 0.2 --select last --compile \
     || { log "training failed"; exit 1; }
   uv run --with onnxscript python scripts/export_onnx.py "$CAND" -o "$CAND/model.onnx" \
     || { log "export failed"; exit 1; }
