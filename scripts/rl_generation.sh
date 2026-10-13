@@ -24,7 +24,9 @@
 #    smolgen champion does not fit eager at batch 512 (>15.4 GiB; compiled 9.4).
 # 3. Gate. Candidate vs champion over GATE_GAMES games; promoted on a score >= 50%. A worse
 #    candidate rarely clears that (a -30 Elo net passes ~1% of the time at 400 games) and an
-#    equal one is a free reshuffle, as AlphaZero always promoted. With V21_GAMES > 0 a new
+#    equal one is a free reshuffle, as AlphaZero always promoted. FORCE_PROMOTE=1 promotes
+#    it whatever the score (history reads "forced"): an architecture change taken on its
+#    ceiling, not on its first gate. With V21_GAMES > 0 a new
 #    champion then also plays prod v2.1 (off by default). Matches run on scripts/gpu_match.py: every
 #    side plays the deployed lichess bot's own search code (chess_core::search) and move
 #    flow (tree reuse, 4000 sims/move clipped by warm visits, 2000-sim ponder), with every
@@ -48,6 +50,7 @@ WINDOW="${WINDOW:-2}"
 EPOCHS="${EPOCHS:-2}"
 GATE_GAMES="${GATE_GAMES:-400}"
 V21_GAMES="${V21_GAMES:-0}"
+FORCE_PROMOTE="${FORCE_PROMOTE:-0}"
 MATCH_SIMS="${MATCH_SIMS:-4000}"
 PONDER_SIMS="${PONDER_SIMS:-2000}"
 V21=data/models/pos2move_v2.1
@@ -160,11 +163,15 @@ PROMOTED=no
 V21_SCORE="-"
 if awk -v s="$CSCORE" 'BEGIN { exit !(s >= 0.5) }'; then
   PROMOTED=yes
+elif [[ "$FORCE_PROMOTE" == 1 ]]; then
+  PROMOTED=forced
+fi
+if [[ "$PROMOTED" != no ]]; then
   NEW="$RL/models/$GEN"
   rm -rf "$NEW"
   cp -r "$CAND" "$NEW"
   ln -sfn "models/$GEN" "$RL/champion"
-  log "promoted: champion is now $GEN"
+  log "promoted ($PROMOTED): champion is now $GEN"
   if ((V21_GAMES > 0)); then
     VGATE="$RL/gates/${GEN}_vs_v2.1.jsonl"
     log "matching $GEN vs v2.1, $V21_GAMES games"
