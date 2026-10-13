@@ -55,7 +55,9 @@ def _visit_sums(g):
 
 def test_same_records_as_the_legacy_engine():
     new, old = _run(dict(num_sims=16))[0], _run(dict(num_sims=16), cls=selfplay_core.Engine)[0]
-    assert set(new) == set(old)
+    # The legacy engine predates the rule state and the root search over every legal move.
+    assert set(new) == set(old) | {"rule50", "repetition", "legal_idx", "legal_prior", "legal_n",
+                                   "legal_q", "legal_ptr", "root_net_v"}
     for k in ("boards", "player", "castling", "ep", "halfmove", "root_v", "full", "z",
               "visit_idx", "visit_cnt", "visit_ptr"):
         assert new[k].dtype == old[k].dtype, k
@@ -132,3 +134,22 @@ def test_forced_playouts_prune_full_search_targets_only():
     assert (sums[~full] >= 16).all()
     assert (sums[full] < 48).any(), "pruning never took a full search under its fresh budget"
     assert [g["visit_cnt"].tolist() for g in a] != [g["visit_cnt"].tolist() for g in plain]
+
+
+def test_records_keep_the_root_search_over_every_legal_move():
+    """Full and fast searches alike: every legal move's clean prior, raw visits and Q, and
+    the network's raw value -- for completed-Q (Gumbel) policy targets."""
+    cfg = dict(num_sims=48, fast_sims=16, full_frac=0.3, dirichlet_alpha=0.3, move_temp=0.0,
+               forced_playouts=2.0)
+    for g in _run(cfg, seed=4):
+        ptr, vptr = g["legal_ptr"], g["visit_ptr"]
+        assert len(ptr) == len(g["z"]) + 1 == len(g["root_net_v"]) + 1
+        assert np.isfinite(g["root_net_v"]).all()
+        for i in range(len(g["z"])):
+            idx, n = g["legal_idx"][ptr[i]:ptr[i + 1]], g["legal_n"][ptr[i]:ptr[i + 1]]
+            prior, q = g["legal_prior"][ptr[i]:ptr[i + 1]], g["legal_q"][ptr[i]:ptr[i + 1]]
+            assert abs(prior.sum() - 1) < 1e-4 and (prior > 0).all()
+            assert ((q == 0) | (n > 0)).all() and (np.abs(q) <= 1).all()
+            raw = dict(zip(idx.tolist(), n.tolist()))
+            for k, c in zip(g["visit_idx"][vptr[i]:vptr[i + 1]], g["visit_cnt"][vptr[i]:vptr[i + 1]]):
+                assert c <= raw[int(k)]  # the target is the raw visits, pruned

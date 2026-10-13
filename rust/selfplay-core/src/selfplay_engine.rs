@@ -355,6 +355,8 @@ impl SelfPlayEngine {
             let (mut rule50, mut repetition) = (Vec::new(), Vec::new());
             let (mut visit_idx, mut visit_cnt) = (Vec::new(), Vec::new());
             let mut visit_ptr = vec![0i64];
+            let (mut legal_idx, mut legal_prior, mut legal_n, mut legal_q) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut legal_ptr, mut root_net_v) = (vec![0i64], Vec::new());
             for r in recs {
                 boards.extend_from_slice(&r.tokens);
                 player.push(r.player);
@@ -369,6 +371,12 @@ impl SelfPlayEngine {
                 visit_idx.extend_from_slice(&r.visit_idx);
                 visit_cnt.extend_from_slice(&r.visit_cnt);
                 visit_ptr.push(visit_idx.len() as i64);
+                legal_idx.extend_from_slice(&r.legal_idx);
+                legal_prior.extend_from_slice(&r.legal_prior);
+                legal_n.extend_from_slice(&r.legal_n);
+                legal_q.extend_from_slice(&r.legal_q);
+                legal_ptr.push(legal_idx.len() as i64);
+                root_net_v.push(r.root_net_v);
             }
             let d = PyDict::new(py);
             d.set_item("boards", PyArray1::from_vec(py, boards).reshape([p, 64]).expect("reshape"))?;
@@ -384,6 +392,12 @@ impl SelfPlayEngine {
             d.set_item("visit_idx", visit_idx.into_pyarray(py))?;
             d.set_item("visit_cnt", visit_cnt.into_pyarray(py))?;
             d.set_item("visit_ptr", visit_ptr.into_pyarray(py))?;
+            d.set_item("legal_idx", legal_idx.into_pyarray(py))?;
+            d.set_item("legal_prior", legal_prior.into_pyarray(py))?;
+            d.set_item("legal_n", legal_n.into_pyarray(py))?;
+            d.set_item("legal_q", legal_q.into_pyarray(py))?;
+            d.set_item("legal_ptr", legal_ptr.into_pyarray(py))?;
+            d.set_item("root_net_v", root_net_v.into_pyarray(py))?;
             d.set_item("moves", g.moves_uci().to_vec())?;
             d.set_item("fen", &self.opening_fens[g.opening])?;
             d.set_item("z_white", z_white)?;
