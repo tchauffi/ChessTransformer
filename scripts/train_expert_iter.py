@@ -7,7 +7,10 @@ produced by `scripts/selfplay_rust.py`:
   * policy: cross-entropy against the **MCTS visit distribution** (CSR
     visit_idx/visit_cnt/visit_ptr, indices = from_square * 73 + action_plane),
     on full searches only when the data was generated with playout cap
-    randomization (the `full` column; fast searches are too shallow to teach),
+    randomization (the `full` column; fast searches are too shallow to teach);
+    or, with `--policy-target gumbel`, against Gumbel MuZero's completed-Q
+    improved policy over every legal move (`completed_q_targets`), which
+    `--gumbel-fast` also takes from the fast searches,
   * value : the game outcome z (stm-POV) on every position, optionally mixed
     KataGo-style toward the search's root_v -- MSE for a scalar head,
     cross-entropy for a WDL head,
@@ -79,6 +82,45 @@ ACTION_SPACE = 64 * NUM_ACTION_PLANES  # 4672
 GAME_ID_STRIDE = 1 << 32
 
 
+def completed_q_targets(prior, n, q, ptr, net_v, fallback_v, c_visit=50.0, c_scale=0.1,
+                        rescale=False):
+    """Gumbel MuZero's improved policy (Danihelka et al., "Policy improvement by planning
+    with Gumbel", ICLR 2022) for each position's legal moves, CSR on `ptr`:
+
+        softmax(log prior + (c_visit + max visits) * c_scale * q_hat)
+
+    q_hat is the completed Q: a visited move's Q, an unvisited one the mixed value
+    v_mix = (v + N * sum_visited(prior * Q) / sum_visited(prior)) / (1 + N), with v the
+    network's own value (`fallback_v` where it is NaN) and N the root's visits -- mapped to
+    [0, 1] by (Q + 1) / 2, since chess values are bounded, or min-max per position with
+    `rescale` (mctx's default, which turns any Q gap into the full scale). Unvisited moves
+    keep their prior ratios; a visited move gains with its Q, whatever its visit count.
+    Values are from the side to move's POV, as recorded.
+    """
+    lens = np.diff(ptr)
+    if (lens <= 0).any():
+        raise ValueError("a position without legal moves")
+    P, starts = len(lens), ptr[:-1]
+    seg = np.repeat(np.arange(P), lens)
+    prior, n, q = (np.asarray(a, dtype=np.float64) for a in (prior, n, q))
+    vis = n > 0
+    N = np.bincount(seg, weights=n, minlength=P)
+    sum_p = np.bincount(seg, weights=prior * vis, minlength=P)
+    sum_pq = np.bincount(seg, weights=prior * q * vis, minlength=P)
+    v = np.where(np.isfinite(net_v), net_v, fallback_v).astype(np.float64)
+    v_mix = (v + N * np.divide(sum_pq, sum_p, out=np.zeros(P), where=sum_p > 0)) / (1 + N)
+    cq = np.where(vis, q, v_mix[seg])
+    if rescale:
+        lo, hi = np.minimum.reduceat(cq, starts), np.maximum.reduceat(cq, starts)
+        q_hat = (cq - lo[seg]) / np.maximum(hi - lo, 1e-8)[seg]
+    else:
+        q_hat = (cq + 1.0) / 2.0
+    logit = np.log(np.maximum(prior, 1e-12)) + (c_visit + np.maximum.reduceat(n, starts)[seg]) * c_scale * q_hat
+    logit -= np.maximum.reduceat(logit, starts)[seg]
+    e = np.exp(logit)
+    return (e / np.bincount(seg, weights=e, minlength=P)[seg]).astype(np.float32)
+
+
 # ── Dataset ────────────────────────────────────────────────────────────────
 class SelfplayDataset(Dataset):
     """All shards with visit distributions, concatenated in RAM.
@@ -88,7 +130,8 @@ class SelfplayDataset(Dataset):
     dense policy target so only (B, 4672) is ever materialised.
     """
 
-    def __init__(self, data_dirs: list[Path]):
+    def __init__(self, data_dirs: list[Path], policy_target: str = "visits", gumbel: dict | None = None,
+                 gumbel_fast: bool = False):
         boards, player, castling, ep, halfmove, z, root_v, game_id, full = ([] for _ in range(9))
         v_idx, v_cnt, v_len = [], [], []
         rule50, repetition = [], []
@@ -109,9 +152,19 @@ class SelfplayDataset(Dataset):
                 game_id.append(d["game_id"].astype(np.int64) + di * GAME_ID_STRIDE)
                 # Data from before playout cap randomization: every search was full.
                 full.append(d["full"] if "full" in d else np.ones(len(d["z"]), dtype=np.uint8))
-                v_idx.append(d["visit_idx"])
-                v_cnt.append(d["visit_cnt"])
-                v_len.append(np.diff(d["visit_ptr"]))  # per-position support length
+                if policy_target == "gumbel":
+                    if "legal_ptr" not in d:
+                        raise ValueError(f"{s}: no root search columns (legal_*), which "
+                                         "--policy-target gumbel needs")
+                    v_idx.append(d["legal_idx"])
+                    v_cnt.append(completed_q_targets(d["legal_prior"], d["legal_n"], d["legal_q"],
+                                                     d["legal_ptr"], d["root_net_v"], d["root_v"],
+                                                     **(gumbel or {})))
+                    v_len.append(np.diff(d["legal_ptr"]))
+                else:
+                    v_idx.append(d["visit_idx"])
+                    v_cnt.append(d["visit_cnt"])
+                    v_len.append(np.diff(d["visit_ptr"]))  # per-position support length
                 # Rule state: recorded by SelfPlayEngine, or backfilled next to the shard
                 # (scripts/backfill_rule_state.py) for data generated before it existed.
                 side = s.with_name(s.name.replace("positions_", "rule_state_"))
@@ -142,6 +195,8 @@ class SelfplayDataset(Dataset):
         self.root_v = np.concatenate(root_v).astype(np.float32)
         self.game_id = np.concatenate(game_id)
         self.full = np.concatenate(full).astype(np.float32)
+        if policy_target == "gumbel" and gumbel_fast:
+            self.full[:] = 1.0  # the policy mask: every search teaches
         n = len(self.z)
         self.rule50 = np.concatenate(rule50) if self.has_rule_state else np.zeros(n, np.uint8)
         self.repetition = np.concatenate(repetition) if self.has_rule_state else np.zeros(n, np.uint8)
@@ -363,6 +418,15 @@ def main():
     p.add_argument("--ema-decay", type=float, default=0.999)
     p.add_argument("--patience", type=int, default=3,
                    help="early-stop epochs without val improvement (--select val only)")
+    p.add_argument("--policy-target", choices=["visits", "gumbel"], default="visits",
+                   help="policy target: the visit distribution, or Gumbel MuZero's completed-Q "
+                        "improved policy (needs self-play with the root search columns)")
+    p.add_argument("--gumbel-c-visit", type=float, default=50.0)
+    p.add_argument("--gumbel-c-scale", type=float, default=0.1)
+    p.add_argument("--gumbel-rescale", action="store_true",
+                   help="min-max the completed Q per position (mctx) instead of (Q + 1) / 2")
+    p.add_argument("--gumbel-fast", action="store_true",
+                   help="with --policy-target gumbel, fast searches are policy targets too")
     p.add_argument("--select", choices=["last", "val"], default="last",
                    help="export the final EMA weights (default) or the best val-loss epoch")
     p.add_argument("--human-shards", default=None, help="flat shard dir for human replay")
@@ -378,7 +442,10 @@ def main():
     device = args.device
 
     # ── Data + game-level split ──────────────────────────────────────────
-    ds = SelfplayDataset([Path(d) for d in args.data])
+    ds = SelfplayDataset([Path(d) for d in args.data], policy_target=args.policy_target,
+                         gumbel=dict(c_visit=args.gumbel_c_visit, c_scale=args.gumbel_c_scale,
+                                     rescale=args.gumbel_rescale),
+                         gumbel_fast=args.gumbel_fast)
     games = np.unique(ds.game_id)
     rng = np.random.default_rng(args.seed)
     rng.shuffle(games)
@@ -386,7 +453,7 @@ def main():
     is_val = np.isin(ds.game_id, games[:n_val])
     train_idx = np.nonzero(~is_val)[0]
     val_idx = np.nonzero(is_val)[0]
-    print(f"Positions: {len(ds):,} over {len(games):,} games ({ds.full.mean():.0%} full searches) | "
+    print(f"Positions: {len(ds):,} over {len(games):,} games ({ds.full.mean():.0%} policy targets, {args.policy_target}) | "
           f"train {len(train_idx):,} / val {len(val_idx):,} ({n_val} games)")
 
     human_iter, human_bs = None, 0
