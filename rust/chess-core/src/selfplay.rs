@@ -14,6 +14,10 @@
 //!   the reused tree's warm visits count toward it and only the rest is
 //!   searched (none when the tree already holds the budget);
 //! * root Dirichlet noise on full searches (`search::RootNoise`);
+//! * KataGo forced playouts on full searches (`forced_playouts` = k, 0 = off): every
+//!   visited root move gets at least `sqrt(k * P * N)` visits, and the record keeps
+//!   the visits left after policy target pruning (`tree::prune_forced`), which also
+//!   choose the move;
 //! * move temperature for the first `temp_plies` half-moves (the bot's own
 //!   sampler, seeded);
 //! * resignation once the root value stays past `resign_threshold` for
@@ -55,6 +59,9 @@ pub struct SelfPlayRules {
     pub cap_total_fast: bool,
     /// The network reads the rule state (`SearchParams::rule_state`).
     pub rule_state: bool,
+    /// KataGo forced playouts + policy target pruning on full searches: k (2 in
+    /// KataGo), 0 = off.
+    pub forced_playouts: f64,
 }
 
 pub struct Record {
@@ -193,27 +200,42 @@ impl SelfPlayGame {
                     seed: self.rng.gen(),
                 });
                 self.full = full;
-                self.job = Some(self.search.start_with_noise(sims, noise));
+                let mut job = self.search.start_with_noise(sims, noise);
+                if full && rules.forced_playouts > 0.0 {
+                    job.force_playouts(rules.forced_playouts);
+                }
+                self.job = Some(job);
             }
             match self.search.step(self.job.as_mut().unwrap()) {
                 Step::Eval(reqs) => self.out = Some(reqs),
                 Step::Wave => {}
                 Step::Done => {
                     let job = self.job.take().unwrap();
-                    let result = self.search.finish(job);
-                    self.record(result.value);
+                    let pruned = (self.full && rules.forced_playouts > 0.0)
+                        .then(|| self.search.pruned_root_visits(rules.forced_playouts));
+                    let result = match &pruned {
+                        Some(visits) => self.search.finish_with_visits(job, visits),
+                        None => self.search.finish(job),
+                    };
+                    self.record(result.value, pruned.as_deref());
                     self.play(result.best, result.value, rules);
                 }
             }
         }
     }
 
-    fn record(&mut self, root_v: f32) {
+    /// `visits`: the root's counts to keep, in `Search::root_moves` order (pruned);
+    /// `None`, its own.
+    fn record(&mut self, root_v: f32, visits: Option<&[u32]>) {
         let (tokens, player, castling, ep) = encode_position(&self.pos);
         let (key, prior) = self.history.split_last().expect("history holds the current position");
         let (rule50, repetition) = rule_state(&self.pos, prior, *key);
         let (mut visit_idx, mut visit_cnt) = (Vec::new(), Vec::new());
-        for (mv, n, _, _) in self.search.root_stats() {
+        let counts: Vec<(Move, u32)> = match visits {
+            Some(v) => self.search.root_moves().iter().cloned().zip(v.iter().copied()).collect(),
+            None => self.search.root_stats().into_iter().map(|(mv, n, _, _)| (mv, n)).collect(),
+        };
+        for (mv, n) in counts {
             if n > 0 {
                 let (f, t, p) = move_coords(&mv);
                 visit_idx.push((f * NUM_PLANES + action_plane(f, t, p)) as u16);
@@ -306,7 +328,7 @@ mod tests {
             move_temp: 1.0, temp_plies: 10, resign_threshold: 2.0, resign_plies: 6,
             no_resign_frac: 0.1, max_plies: 40, sim_batch: 16, c_puct: 1.0, fpu: 0.2,
             prior_temp: 1.0, tt_cap: 2_000_000, cap_total_full: false, cap_total_fast: false,
-            rule_state: false,
+            rule_state: false, forced_playouts: 0.0,
         }
     }
 
@@ -398,6 +420,71 @@ mod tests {
         assert!(g.records().iter().zip(&sums).any(|(rec, &n)| n > if rec.full == 1 { r.num_sims }
                                                                      else { r.fast_sims }),
                 "tree reuse never carried a warm visit");
+    }
+
+    /// A search of `sims` from `start` + `moves` with forced playouts `k`, driven one
+    /// wave at a time: (root priors, root visits, pruned visits).
+    fn forced_search(moves: &[&str], sims: u32, k: f64) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+        let mut s = Search::new(HashEval, SearchParams::default());
+        let mut pos = start();
+        let played: Vec<Move> = moves.iter().map(|u| {
+            let m = u.parse::<shakmaty::uci::UciMove>().unwrap().to_move(&pos).unwrap();
+            pos.play_unchecked(&m);
+            m
+        }).collect();
+        s.set_position(start(), &played);
+        let mut job = s.start_with_noise(sims, None);
+        job.force_playouts(k);
+        loop {
+            match s.step(&mut job) {
+                Step::Eval(reqs) => s.resolve(&mut job, reqs.iter().map(hash_out).collect()),
+                Step::Wave => {}
+                Step::Done => break,
+            }
+        }
+        let stats = s.root_stats();
+        let priors = s.root_moves().iter().map(|m| stats.iter().find(|x| &x.0 == m).unwrap().3).collect();
+        let n = s.root_moves().iter().map(|m| stats.iter().find(|x| &x.0 == m).unwrap().1).collect();
+        (priors, n, s.pruned_root_visits(k))
+    }
+
+    #[test]
+    fn forced_playouts_fill_quotas_and_pruning_takes_some_back() {
+        let lines: [&[&str]; 4] = [&[], &["e2e4"], &["e2e4", "e7e5", "g1f3"], &["d2d4", "g8f6", "c2c4", "e7e6"]];
+        let (mut cut, mut dropped) = (0, 0);
+        for line in lines {
+            let (_, plain, _) = forced_search(line, 400, 0.0);
+            let (priors, n, pruned) = forced_search(line, 400, 2.0);
+            let total: u32 = n.iter().sum();
+            for i in 0..n.len() {
+                // Every visited child got its quota, up to the last wave's growth of it.
+                let quota = (2.0 * priors[i] as f64 * (total - 16) as f64).sqrt();
+                assert!(n[i] == 0 || n[i] as f64 >= quota.floor(), "{line:?} child {i}: {} < {quota:.1}", n[i]);
+                assert!(pruned[i] <= n[i]);
+                dropped += (n[i] > 0 && pruned[i] == 0) as u32;
+            }
+            cut += total - pruned.iter().sum::<u32>();
+            let best = |v: &[u32]| (0..v.len()).max_by_key(|&i| v[i]).unwrap();
+            assert_eq!(best(&pruned), best(&n), "pruning never changes the most visited move");
+            // Forcing widens: at least as many moves visited as by the plain search.
+            assert!(n.iter().filter(|&&x| x > 0).count() >= plain.iter().filter(|&&x| x > 0).count());
+        }
+        assert!(cut > 40 && dropped > 3, "pruning cut {cut} visits, dropped {dropped} moves");
+    }
+
+    #[test]
+    fn forced_playouts_change_full_searches_only_and_follow_the_seed() {
+        let plain = SelfPlayRules { move_temp: 0.0, dirichlet_alpha: 0.3, ..rules() };
+        let forced = SelfPlayRules { forced_playouts: 2.0, ..plain };
+        let a = batched(&forced, 5);
+        assert_eq!(a.moves_uci(), batched(&forced, 5).moves_uci());
+        let b = batched(&plain, 5);
+        let first_full = a.records().iter().position(|r| r.full == 1).unwrap();
+        assert_eq!(a.moves_uci()[..first_full], b.moves_uci()[..first_full]);
+        assert_ne!(a.records()[first_full].visit_cnt, b.records()[first_full].visit_cnt);
+        for r in a.records().iter().filter(|r| r.full == 0) {
+            assert!(r.visit_cnt.iter().all(|&c| c > 0));
+        }
     }
 
     #[test]

@@ -117,3 +117,18 @@ def test_gathered_logits_play_the_same_games():
     a, b = _run(cfg, seed=2), _run(cfg, seed=2, gathered=False)
     assert [g["moves"] for g in a] == [g["moves"] for g in b]
     assert all((x["visit_cnt"] == y["visit_cnt"]).all() for x, y in zip(a, b))
+
+
+def test_forced_playouts_prune_full_search_targets_only():
+    """KataGo forced playouts + policy target pruning: full searches record pruned visits
+    (possibly under the budget), fast ones keep every visit; seeded like the rest."""
+    cfg = dict(num_sims=48, fast_sims=16, full_frac=0.3, dirichlet_alpha=0.3, move_temp=0.0)
+    forced = {**cfg, "forced_playouts": 2.0}
+    a, b = _run(forced, seed=3), _run(forced, seed=3)
+    assert [g["moves"] for g in a] == [g["moves"] for g in b]
+    plain = _run(cfg, seed=3)
+    full = np.concatenate([g["full"] for g in a]).astype(bool)
+    sums = np.concatenate([_visit_sums(g) for g in a])
+    assert (sums[~full] >= 16).all()
+    assert (sums[full] < 48).any(), "pruning never took a full search under its fresh budget"
+    assert [g["visit_cnt"].tolist() for g in a] != [g["visit_cnt"].tolist() for g in plain]
