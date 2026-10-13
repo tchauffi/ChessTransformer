@@ -13,6 +13,9 @@
 # and match it on BASE too: a setting that helps both networks is a bot gain, not an
 # argument for the new one.
 #
+# Arguments replace the settings list ("tag:flags", tags name the games files), e.g.
+#   MODEL=data/rl/models/gen00 scripts/queue_search_sweep.sh "g00_cpuct1.5:--c-puct-a 1.5"
+#
 # Waits for any running match first; stops at 22:00 (no GPU at night). A setting whose
 # games file holds a finished match is skipped, so a relaunch resumes.
 set -uo pipefail
@@ -32,6 +35,7 @@ SETTINGS=(
   "cpuct1.5:--c-puct-a 1.5"
   "fpu0.3:--fpu-a 0.3"
 )
+(($#)) && SETTINGS=("$@")
 log() { echo "[$(date '+%F %T')] $*"; }
 
 while pgrep -f "python[^ ]* .*gpu_match\.py" >/dev/null; do sleep 60; done
