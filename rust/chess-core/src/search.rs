@@ -751,6 +751,19 @@ impl<E: Evaluator> Search<E> {
         &self.tree[0].moves
     }
 
+    /// The root node: moves, (noised) priors, visits and values, in `root_moves` order.
+    pub fn root(&self) -> &Node {
+        &self.tree[0]
+    }
+
+    /// The network's output for the root as cached -- clean priors (before root noise,
+    /// in `root_moves` order) and raw value -- or `None` once the cache has dropped it.
+    pub fn root_eval(&self) -> Option<(Vec<f32>, f32)> {
+        let pos_key = *self.history.last()?;
+        let (rule50, repetition) = rule_state(&self.pos, &self.history[..self.history.len() - 1], pos_key);
+        self.tt.get(&self.eval_key(pos_key, rule50, repetition)).cloned()
+    }
+
     /// The root's visit counts after KataGo policy target pruning
     /// (`tree::prune_forced`), in `root_moves` order.
     pub fn pruned_root_visits(&self, forced_k: f64) -> Vec<u32> {

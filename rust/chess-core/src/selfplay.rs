@@ -25,7 +25,9 @@
 //!
 //! A record is the position before the move, the search's root value and the
 //! root visit counts -- warm visits from the reused tree included, as Lc0
-//! trains on them.
+//! trains on them -- plus the root's search over every legal move (clean prior,
+//! raw visits, Q) and the network's raw value: what a completed-Q (Gumbel) policy
+//! target needs, for fast searches as well as full ones.
 
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -77,6 +79,15 @@ pub struct Record {
     pub full: u8,
     pub visit_idx: Vec<u16>, // from_sq * 73 + plane
     pub visit_cnt: Vec<u16>,
+    /// Every legal root move, in the search's order: flat index, the network's prior
+    /// before root noise, visits before any pruning, and Q from the side to move's
+    /// POV (0 when unvisited).
+    pub legal_idx: Vec<u16>,
+    pub legal_prior: Vec<f32>,
+    pub legal_n: Vec<u16>,
+    pub legal_q: Vec<f32>,
+    /// The network's raw value of the root (NaN once the cache has dropped it).
+    pub root_net_v: f32,
 }
 
 pub struct SelfPlayGame {
@@ -242,6 +253,18 @@ impl SelfPlayGame {
                 visit_cnt.push(n.min(u16::MAX as u32) as u16);
             }
         }
+        let root = self.search.root();
+        let (legal_prior, root_net_v) = match self.search.root_eval() {
+            Some((priors, v)) if priors.len() == root.moves.len() => (priors, v),
+            _ => (root.priors.clone(), f32::NAN),
+        };
+        let legal_idx = root.moves.iter()
+            .map(|m| { let (f, t, p) = move_coords(m); (f * NUM_PLANES + action_plane(f, t, p)) as u16 })
+            .collect();
+        let legal_n = root.n.iter().map(|&n| n.min(u16::MAX as u32) as u16).collect();
+        let legal_q = (0..root.n.len())
+            .map(|i| if root.n[i] > 0 { (-root.w[i] / root.n[i] as f64) as f32 } else { 0.0 })
+            .collect();
         self.records.push(Record {
             tokens,
             player,
@@ -254,6 +277,11 @@ impl SelfPlayGame {
             full: self.full as u8,
             visit_idx,
             visit_cnt,
+            legal_idx,
+            legal_prior,
+            legal_n,
+            legal_q,
+            root_net_v,
         });
     }
 
@@ -484,6 +512,41 @@ mod tests {
         assert_ne!(a.records()[first_full].visit_cnt, b.records()[first_full].visit_cnt);
         for r in a.records().iter().filter(|r| r.full == 0) {
             assert!(r.visit_cnt.iter().all(|&c| c > 0));
+        }
+    }
+
+    #[test]
+    fn records_keep_the_root_search_for_completed_q_targets() {
+        for forced in [0.0, 2.0] {
+            let r = SelfPlayRules { move_temp: 0.0, dirichlet_alpha: 0.3, forced_playouts: forced, ..rules() };
+            let g = batched(&r, 7);
+            assert!(g.records().iter().any(|x| x.full == 0) && g.records().iter().any(|x| x.full == 1));
+            for rec in g.records() {
+                let req = EvalRequest { tokens: rec.tokens, player: rec.player, castling: rec.castling, ep: rec.ep,
+                                        rule50: rec.rule50, repetition: rec.repetition, legal: Vec::new() };
+                let out = hash_out(&req);
+                // The network's own prior and value, not the noised root.
+                let mut prior: Vec<f32> = rec.legal_idx.iter().map(|&i| out.logits[i as usize]).collect();
+                crate::tree::softmax_priors(&mut prior, 1.0);
+                for (a, b) in prior.iter().zip(&rec.legal_prior) {
+                    assert!((a - b).abs() < 1e-6, "prior {a} vs recorded {b}");
+                }
+                assert_eq!(rec.root_net_v, out.value);
+                assert_eq!(rec.legal_n.len(), rec.legal_idx.len());
+                assert_eq!(rec.legal_q.len(), rec.legal_idx.len());
+                // The target is the raw visits (pruned, with forced playouts).
+                for (&i, &c) in rec.visit_idx.iter().zip(&rec.visit_cnt) {
+                    let k = rec.legal_idx.iter().position(|&x| x == i).expect("target move is legal");
+                    assert!(c <= rec.legal_n[k]);
+                    if forced == 0.0 {
+                        assert_eq!(c, rec.legal_n[k]);
+                    }
+                }
+                let visited = rec.legal_n.iter().filter(|&&n| n > 0).count();
+                assert!(visited >= rec.visit_idx.len());
+                assert!(rec.legal_q.iter().zip(&rec.legal_n).all(|(&q, &n)| n > 0 || q == 0.0));
+                assert!(rec.legal_q.iter().all(|q| (-1.0..=1.0).contains(q)));
+            }
         }
     }
 
