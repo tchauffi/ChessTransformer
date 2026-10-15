@@ -23,8 +23,15 @@ produced by `scripts/selfplay_rust.py`:
 `--data` takes several directories: a replay window over the last generations.
 
 Validation splits by game id (consecutive positions of a game are near
-duplicates and would leak). The frozen base net's val loss is reported as the
-baseline before training. Output is a standard model dir loadable by every bot.
+duplicates and would leak), on a **permanent held-out set**: the first training
+that reads a directory draws `--val-frac` of its games and stores them in
+`heldout_games.json` next to the shards, and every later training reads them
+back. A replay window holds the champion's own training data, so a fresh random
+split each generation scored the base net on games it had trained on (92% of
+gen03's half of cand04's val split): a flattered baseline. With the stored set,
+neither the base net nor the candidate has trained on any val game. The frozen
+base net's val loss is reported as the baseline before training, per directory
+and overall. Output is a standard model dir loadable by every bot.
 
 **Checkpoint selection.** exit2 had the best held-out loss of any run and the
 worst gate (doc/selfplay_rl.md): val loss anti-correlates with playing
@@ -80,6 +87,37 @@ ACTION_SPACE = 64 * NUM_ACTION_PLANES  # 4672
 # Game ids restart at 0 in every self-play directory; offset them per directory
 # so the game-level val split stays a split across a replay window.
 GAME_ID_STRIDE = 1 << 32
+HELDOUT_FILE = "heldout_games.json"
+
+
+def heldout_games(data_dir: Path, game_ids: np.ndarray, frac: float, seed: int) -> np.ndarray:
+    """A directory's permanent held-out game ids: read from HELDOUT_FILE, or drawn and stored.
+
+    The loop first trains on a generation right after its self-play, before any network
+    has seen its games, so a set drawn then stays unseen by every later candidate too.
+    """
+    path = Path(data_dir) / HELDOUT_FILE
+    if path.exists():
+        return np.asarray(json.loads(path.read_text())["games"], dtype=np.int64)
+    games = np.unique(game_ids)
+    pick = np.sort(np.random.default_rng(seed).choice(games, max(1, int(frac * len(games))), replace=False))
+    path.write_text(json.dumps({"frac": frac, "seed": seed, "games": pick.tolist()}))
+    print(f"  drew {len(pick)} held-out games for {data_dir} -> {path}")
+    return pick
+
+
+def heldout_split(game_id: np.ndarray, data_dirs: list[Path], frac: float, seed: int) -> dict[str, np.ndarray]:
+    """Dataset indices of each directory's held-out games, keyed by directory name."""
+    src = game_id // GAME_ID_STRIDE
+    names = [Path(d).name for d in data_dirs]
+    if len(set(names)) < len(names):
+        names = [str(d) for d in data_dirs]
+    parts = {}
+    for di, (d, name) in enumerate(zip(data_dirs, names)):
+        idx = np.nonzero(src == di)[0]
+        local = game_id[idx] - di * GAME_ID_STRIDE
+        parts[name] = idx[np.isin(local, heldout_games(Path(d), local, frac, seed))]
+    return parts
 
 
 def completed_q_targets(prior, n, q, ptr, net_v, fallback_v, c_visit=50.0, c_scale=0.1,
@@ -350,6 +388,20 @@ def evaluate(model, loader, device, args, ref_logits_fn=None):
     return {k: v / n for k, v in tot.items()}
 
 
+def evaluate_parts(model, loaders, device, args):
+    """evaluate() on each directory's held-out games, plus their position-weighted mean as "all"."""
+    res = {name: evaluate(model, dl, device, args) for name, dl in loaders.items()}
+    n = {name: len(dl.dataset) for name, dl in loaders.items()}
+    res["all"] = {k: sum(res[name][k] * n[name] for name in n) / sum(n.values())
+                  for k in ("policy", "value", "sign_acc")}
+    return res
+
+
+def format_parts(res):
+    return " | ".join(f"{name} policy={r['policy']:.4f} value={r['value']:.4f}"
+                      for name, r in res.items() if name != "all")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", required=True, nargs="+",
@@ -379,7 +431,8 @@ def main():
     p.add_argument("--kl-coef", type=float, default=0.1, help="KL anchor strength to frozen base policy")
     p.add_argument("--soft-mix", type=float, default=0.0, help="value target = (1-x)*z + x*root_v")
     p.add_argument("--ramp-halfmoves", type=float, default=40.0)
-    p.add_argument("--val-frac", type=float, default=0.05, help="fraction of games held out")
+    p.add_argument("--val-frac", type=float, default=0.05,
+                   help=f"fraction of a directory's games held out when its {HELDOUT_FILE} is first drawn")
     p.add_argument("--ema-decay", type=float, default=0.999)
     p.add_argument("--patience", type=int, default=3,
                    help="early-stop epochs without val improvement (--select val only)")
@@ -412,14 +465,16 @@ def main():
                                      rescale=args.gumbel_rescale),
                          gumbel_fast=args.gumbel_fast)
     games = np.unique(ds.game_id)
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(games)
-    n_val = max(1, int(args.val_frac * len(games)))
-    is_val = np.isin(ds.game_id, games[:n_val])
+    val_parts = {name: idx for name, idx in heldout_split(ds.game_id, args.data, args.val_frac, args.seed).items()
+                 if len(idx)}
+    is_val = np.zeros(len(ds), dtype=bool)
+    for idx in val_parts.values():
+        is_val[idx] = True
     train_idx = np.nonzero(~is_val)[0]
-    val_idx = np.nonzero(is_val)[0]
+    n_val = len(np.unique(ds.game_id[is_val]))
     print(f"Positions: {len(ds):,} over {len(games):,} games ({ds.full.mean():.0%} policy targets, {args.policy_target}) | "
-          f"train {len(train_idx):,} / val {len(val_idx):,} ({n_val} games)")
+          f"train {len(train_idx):,} / val {is_val.sum():,} ({n_val} held-out games: "
+          + ", ".join(f"{name} {len(np.unique(ds.game_id[idx]))}" for name, idx in val_parts.items()) + ")")
 
     human_iter, human_bs = None, 0
     if args.human_shards and args.human_frac > 0:
@@ -433,8 +488,9 @@ def main():
     train_loader = DataLoader(torch.utils.data.Subset(ds, train_idx), batch_size=args.batch_size,
                               shuffle=True, num_workers=args.num_workers, collate_fn=collate,
                               drop_last=True, persistent_workers=args.num_workers > 0)
-    val_loader = DataLoader(torch.utils.data.Subset(ds, val_idx), batch_size=args.batch_size,
-                            shuffle=False, num_workers=args.num_workers, collate_fn=collate)
+    val_loaders = {name: DataLoader(torch.utils.data.Subset(ds, idx), batch_size=args.batch_size,
+                                    shuffle=False, num_workers=args.num_workers, collate_fn=collate)
+                   for name, idx in val_parts.items()}
 
     # ── Model + frozen reference ─────────────────────────────────────────
     model = load_model(Path(args.base), device)
@@ -456,9 +512,11 @@ def main():
     print(f"Model parameters: {sum(t.numel() for t in model.parameters()):,}")
 
     # ── Baseline: frozen base net on the val split ───────────────────────
-    base_val = evaluate(model, val_loader, device, args)
+    base_parts = evaluate_parts(model, val_loaders, device, args)
+    base_val = base_parts["all"]
     print(f"Baseline (frozen base): val policy_ce={base_val['policy']:.4f} | "
           f"value_mse={base_val['value']:.4f} | sign_acc={base_val['sign_acc']:.4f}")
+    print(f"  held out: {format_parts(base_parts)}")
 
     # ── Optimizer + warmup→linear-decay schedule ─────────────────────────
     # Attention-bias parameters added by scripts/convert_attn_bias.py start from zero (smolgen)
@@ -549,12 +607,14 @@ def main():
 
         # Validate with EMA weights.
         swap_ema(model, ema)
-        val = evaluate(model, val_loader, device, args)
+        val_parts_res = evaluate_parts(model, val_loaders, device, args)
+        val = val_parts_res["all"]
         val_loss = val["policy"] + args.value_weight * val["value"]
         print(f"Epoch {epoch}/{args.epochs} ({time.time()-t0:.0f}s) | "
               f"train policy={tr['policy']:.4f} value={tr['value']:.4f} kl={tr['kl']:.4f}"
               + (f" human={tr['human']:.4f}" if "human" in tr else "") + " | "
               f"val policy={val['policy']:.4f} value={val['value']:.4f} sign_acc={val['sign_acc']:.4f}")
+        print(f"  held out: {format_parts(val_parts_res)}")
 
         if val_loss < best_val - 1e-4:
             best_val = val_loss
@@ -574,6 +634,9 @@ def main():
     if best_state is None:  # --select last, or never improved: export the final EMA
         swap_ema(model, ema)
         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    print("Held-out change, last epoch - base (below 0 = better): " + " | ".join(
+        f"{name} policy {val_parts_res[name]['policy'] - r['policy']:+.4f} "
+        f"value {val_parts_res[name]['value'] - r['value']:+.4f}" for name, r in base_parts.items()))
 
     # ── Export a standard model dir ──────────────────────────────────────
     out = Path(args.out)
@@ -586,7 +649,10 @@ def main():
             "new_lr_mult": args.new_lr_mult, "human_elo_gap": args.human_elo_gap,
             "train_dropout": args.train_dropout, "compile": args.compile,
             "human_shards": args.human_shards, "human_frac": args.human_frac if args.human_shards else 0.0,
-            "baseline_val": base_val, "last_val": val, "best_val_loss": best_val}
+            "baseline_val": base_val, "last_val": val, "best_val_loss": best_val,
+            "heldout_games": {name: int(len(np.unique(ds.game_id[idx]))) for name, idx in val_parts.items()},
+            "baseline_val_by_dir": {k: v for k, v in base_parts.items() if k != "all"},
+            "last_val_by_dir": {k: v for k, v in val_parts_res.items() if k != "all"}}
     (out / "expert_iter_meta.json").write_text(json.dumps(meta, indent=2))
     print(f"\nSaved to {out}. Gate vs base with scripts/engine_match.py before promoting.")
 

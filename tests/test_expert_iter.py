@@ -206,3 +206,31 @@ def test_dataset_takes_gumbel_targets_from_the_root_search_columns(tmp_path):
     np.savez(tmp_path / "positions_0000.npz", **shard)
     with pytest.raises(ValueError, match="root search columns"):
         SelfplayDataset([tmp_path], policy_target="gumbel")
+
+
+def _shard(game_ids):
+    P = len(game_ids)
+    return dict(boards=np.zeros((P, 64), np.uint8), player=np.ones(P, np.uint8), castling=np.zeros(P, np.uint8),
+                ep=np.zeros(P, np.uint8), halfmove=np.zeros(P, np.uint16), z=np.zeros(P, np.float32),
+                root_v=np.zeros(P, np.float32), full=np.ones(P, np.uint8), game_id=np.asarray(game_ids, np.uint32),
+                visit_idx=np.zeros(P, np.uint16), visit_cnt=np.ones(P, np.uint16), visit_ptr=np.arange(P + 1))
+
+
+def test_heldout_games_are_drawn_once_and_stay_out_as_the_window_slides(tmp_path):
+    from train_expert_iter import HELDOUT_FILE, SelfplayDataset, heldout_split
+    old, new = tmp_path / "gen04", tmp_path / "gen05"
+    for d in (old, new):
+        d.mkdir()
+        np.savez(d / "positions_0000.npz", **_shard(np.repeat(np.arange(20), 3)))  # 20 games, 3 positions each
+    ds = SelfplayDataset([old])
+    first = heldout_split(ds.game_id, [old], 0.25, seed=0)
+    stored = json.loads((old / HELDOUT_FILE).read_text())["games"]
+    assert len(stored) == 5 and sorted(set(ds.game_id[first["gen04"]].tolist())) == stored
+    assert len(first["gen04"]) == 15  # every position of each held-out game
+    # The next generation's window: the old directory keeps its games, whatever the seed;
+    # the new one draws its own, in its own id range.
+    ds2 = SelfplayDataset([old, new])
+    second = heldout_split(ds2.game_id, [old, new], 0.25, seed=1)
+    np.testing.assert_array_equal(second["gen04"], first["gen04"])
+    assert (new / HELDOUT_FILE).exists() and len(second["gen05"]) == 15
+    assert (second["gen05"] >= len(ds)).all()
