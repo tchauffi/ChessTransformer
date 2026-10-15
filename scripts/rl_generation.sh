@@ -21,8 +21,11 @@
 #    of self-play: policy on the visit distributions, WDL value on the outcome mixed 50/50
 #    with the root Q (less label variance -- the value head overfit last time), KL-anchored
 #    to the champion, 20% human replay. gen01's single pass (4k steps) ended with the policy
-#    loss still falling, hence 2; the val line after each epoch shows whether the value head
-#    starts to overfit. The final weights are exported: val loss does not pick checkpoints
+#    loss still falling, hence 2 up to cand05. But the second pass memorises: cand04's train
+#    loss dropped at the epoch boundary without the val loss following, and on unseen gen04
+#    games its value loss was no better than gen03's (a game's positions share one outcome),
+#    so 1 from cand06. The held-out line after each epoch shows what a pass buys. The final
+#    weights are exported: val loss does not pick checkpoints
 #    (exit2 had the best val loss and the worst gate). Compiled: 2.2x the eager speed, and a
 #    smolgen champion does not fit eager at batch 512 (>15.4 GiB; compiled 9.4).
 #    POLICY_TARGET=gumbel trains the policy on Gumbel completed-Q targets instead of the
@@ -52,7 +55,7 @@ FULL_FRAC="${FULL_FRAC:-0.25}"
 CAP_TOTAL="${CAP_TOTAL:-all}"
 PARALLEL="${PARALLEL:-128}"
 WINDOW="${WINDOW:-2}"
-EPOCHS="${EPOCHS:-2}"
+EPOCHS="${EPOCHS:-1}"
 GATE_GAMES="${GATE_GAMES:-400}"
 V21_GAMES="${V21_GAMES:-0}"
 FORCE_PROMOTE="${FORCE_PROMOTE:-0}"
