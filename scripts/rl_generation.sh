@@ -24,8 +24,12 @@
 #    loss still falling, hence 2 up to cand05. But the second pass memorises: cand04's train
 #    loss dropped at the epoch boundary without the val loss following, and on unseen gen04
 #    games its value loss was no better than gen03's (a game's positions share one outcome),
-#    so 1 from cand06. The held-out line after each epoch shows what a pass buys. The final
-#    weights are exported: val loss does not pick checkpoints
+#    so 1 from cand06. A generation the champion already trained on is a second pass too:
+#    every candidate that retrained on one tied or lost (cand04 +9, cand05 -44, cand07 -6),
+#    those on unseen games only won (cand03 +45, cand06 +46), so FRESH_ONLY=1 (from cand09)
+#    skips the generations up to the champion's own: one generation after a promotion,
+#    WINDOW after a rejection. The held-out line after each epoch shows what a pass buys.
+#    The final weights are exported: val loss does not pick checkpoints
 #    (exit2 had the best val loss and the worst gate). Compiled: 2.2x the eager speed, and a
 #    smolgen champion does not fit eager at batch 512 (>15.4 GiB; compiled 9.4).
 #    POLICY_TARGET=gumbel trains the policy on Gumbel completed-Q targets instead of the
@@ -56,6 +60,7 @@ CAP_TOTAL="${CAP_TOTAL:-all}"
 PARALLEL="${PARALLEL:-128}"
 WINDOW="${WINDOW:-2}"
 EPOCHS="${EPOCHS:-1}"
+FRESH_ONLY="${FRESH_ONLY:-1}"
 GATE_GAMES="${GATE_GAMES:-400}"
 V21_GAMES="${V21_GAMES:-0}"
 FORCE_PROMOTE="${FORCE_PROMOTE:-0}"
@@ -150,10 +155,13 @@ fi
 
 # ── 2. train ─────────────────────────────────────────────────────────────────
 if [[ ! -f "$CAND/model.safetensors" ]]; then
+  # Champion genNN was trained on generations up to NN (candNN's window ends at its own).
+  SEEN=0
+  [[ "$FRESH_ONLY" == 1 && "$CHAMP_NAME" =~ ^gen([0-9]+)$ ]] && SEEN=$((10#${BASH_REMATCH[1]}))
   DATA=()
   for ((k = G - WINDOW + 1; k <= G; k++)); do
     d="$RL/selfplay/gen$(printf %02d $k)"
-    ((k >= 1)) && [[ -f "$d/.selfplay_done" ]] && DATA+=("$d")
+    ((k >= 1 && k > SEEN)) && [[ -f "$d/.selfplay_done" ]] && DATA+=("$d")
   done
   log "training $CAND from $CHAMP_NAME on ${DATA[*]}, $EPOCHS epochs, $POLICY_TARGET policy targets"
   uv run python scripts/train_expert_iter.py --data "${DATA[@]}" --base "$CHAMP" --out "$CAND" \
