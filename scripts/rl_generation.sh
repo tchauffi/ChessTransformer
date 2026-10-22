@@ -5,7 +5,11 @@
 #   setsid nohup scripts/rl_generation.sh >> logs/rl_generation.log 2>&1 &
 #
 # 1. Self-play, on the deployed bot's search (selfplay-core SelfPlayEngine: the tree reused
-#    move to move, 16-leaf waves). The champion plays itself with playout cap randomization: FULL_FRAC of
+#    move to move, 16-leaf waves), for SELFPLAY_HOURS of running time; unset, it is read from
+#    $RL/selfplay_hours (default 8). The GPU is saturated, so more games per candidate means
+#    longer generations: cand11, trained on one 8 h generation, got worse on held-out games and
+#    lost (-31), while cand10 and cand12, on two, improved and tied.
+#    The champion plays itself with playout cap randomization: FULL_FRAC of
 #    moves are full SIMS searches with root Dirichlet noise -- the policy targets -- and
 #    the rest fast FAST_SIMS moves that only move the game on. Every position keeps the
 #    game outcome, so fast moves buy more independent value labels per GPU hour. The
@@ -52,7 +56,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 RL="${RL:-data/rl}"
-SELFPLAY_HOURS="${SELFPLAY_HOURS:-8}"
+SELFPLAY_HOURS="${SELFPLAY_HOURS:-$(cat "$RL/selfplay_hours" 2>/dev/null || echo 8)}"
 SIMS="${SIMS:-800}"
 FAST_SIMS="${FAST_SIMS:-160}"
 FULL_FRAC="${FULL_FRAC:-0.25}"
