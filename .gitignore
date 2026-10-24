@@ -251,6 +251,8 @@ rust/graphify-out/
 rust/target-cuda/
 # Dev build tree: builds go here so they never relink the deployed bot's target/release/ct-bot
 rust/target-dev/
+# The self-play wheel's build tree (make engine), for the same reason
+rust/target-wheel/
 
 # Experiment run directories: ablations, value-head sweeps, RL runs.
 # The shipped checkpoints (data/models/pos2move_v2*/, V2_model/) stay tracked.
