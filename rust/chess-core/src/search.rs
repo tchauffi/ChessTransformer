@@ -292,6 +292,13 @@ impl<E: Evaluator> Search<E> {
         &self.pos
     }
 
+    /// Forget the search tree, not the evaluation cache: the next `set_position`
+    /// starts from a fresh root instead of re-rooting the previous tree.
+    pub fn drop_tree(&mut self) {
+        self.tree = vec![Node::default()];
+        self.prev_start = None;
+    }
+
     /// Visits already on the root (warm visits from tree reuse / pondering).
     pub fn root_visits(&self) -> u32 {
         if !self.tree[0].expanded {

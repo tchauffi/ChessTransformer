@@ -379,6 +379,9 @@ def main():
     p.add_argument("--forced-playouts", type=float, default=0.0,
                    help="KataGo forced playouts + policy target pruning on full searches: k "
                         "(2 in KataGo; 0 = off). Not --legacy-engine")
+    p.add_argument("--fresh-full", action="store_true",
+                   help="full searches start from a fresh tree instead of the reused one, whose "
+                        "warm visits got no root noise or forced playouts. Not --legacy-engine")
     p.add_argument("--dirichlet-alpha", type=float, default=0.0,
                    help="root noise on full searches (AlphaZero chess: 0.3); 0 = off")
     p.add_argument("--dirichlet-eps", type=float, default=0.25)
@@ -461,6 +464,7 @@ def main():
         "dirichlet_alpha": args.dirichlet_alpha,
         "dirichlet_eps": args.dirichlet_eps,
         "forced_playouts": args.forced_playouts,
+        "fresh_full": args.fresh_full,
     }
     openings = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] + list(OPENINGS)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
@@ -474,6 +478,8 @@ def main():
     if args.legacy_engine:
         if args.forced_playouts > 0:
             print("WARNING: --legacy-engine has no forced playouts; searching without them", flush=True)
+        if args.fresh_full:
+            print("WARNING: --legacy-engine has no tree reuse; --fresh-full changes nothing", flush=True)
         engines = [selfplay_core.Engine(json.dumps(cfg), openings, seed + id_offset, n_games)]
     else:
         cfg["tt_cap"] = min(args.tt_cap, 200_000)  # per game here, one shared TT in Engine

@@ -64,6 +64,10 @@ pub struct SelfPlayRules {
     /// KataGo forced playouts + policy target pruning on full searches: k (2 in
     /// KataGo), 0 = off.
     pub forced_playouts: f64,
+    /// Full searches start from a fresh tree. A reused subtree's warm visits were
+    /// spent at depth 1, without root noise or forced playouts, and were a third of
+    /// the policy target on average in gen14.
+    pub fresh_full: bool,
 }
 
 pub struct Record {
@@ -201,8 +205,13 @@ impl SelfPlayGame {
     pub fn advance(&mut self, rules: &SelfPlayRules) {
         while self.end.is_none() && self.out.is_none() {
             if self.job.is_none() {
-                self.search.set_position(self.start.clone(), &self.moves);
+                // The budget draw only uses the game's rng, so drawing it first keeps every
+                // game the same when fresh_full is off.
                 let (budget, full) = self.draw_budget(rules);
+                if full && rules.fresh_full {
+                    self.search.drop_tree();
+                }
+                self.search.set_position(self.start.clone(), &self.moves);
                 let cap_total = if full { rules.cap_total_full } else { rules.cap_total_fast };
                 let sims = if cap_total { budget.saturating_sub(self.search.root_visits()) } else { budget };
                 let noise = (full && rules.dirichlet_alpha > 0.0).then(|| RootNoise {
@@ -356,7 +365,7 @@ mod tests {
             move_temp: 1.0, temp_plies: 10, resign_threshold: 2.0, resign_plies: 6,
             no_resign_frac: 0.1, max_plies: 40, sim_batch: 16, c_puct: 1.0, fpu: 0.2,
             prior_temp: 1.0, tt_cap: 2_000_000, cap_total_full: false, cap_total_fast: false,
-            rule_state: false, forced_playouts: 0.0,
+            rule_state: false, forced_playouts: 0.0, fresh_full: false,
         }
     }
 
@@ -431,6 +440,23 @@ mod tests {
             if warm >= budget { skipped += 1 } else if warm > 0 { topped_up += 1 }
         }
         assert!(topped_up > 0 && skipped > 0, "topped up {topped_up}, skipped {skipped}");
+    }
+
+    #[test]
+    fn fresh_full_searches_start_from_an_empty_tree() {
+        let reused = SelfPlayRules { move_temp: 0.0, ..rules() };
+        let fresh = SelfPlayRules { fresh_full: true, ..reused };
+        let total = |g: &SelfPlayGame, full: u8| -> Vec<u32> {
+            g.records().iter().filter(|r| r.full == full)
+                .map(|r| r.visit_cnt.iter().map(|&c| c as u32).sum()).collect()
+        };
+        let (a, b) = (batched(&reused, 7), batched(&fresh, 7));
+        // Fresh sims are counted (no cap): a full search on a fresh tree holds the budget
+        // exactly, one on a reused tree holds more.
+        assert!(total(&b, 1).iter().all(|&n| n == fresh.num_sims), "{:?}", total(&b, 1));
+        assert!(total(&a, 1).iter().any(|&n| n > reused.num_sims), "{:?}", total(&a, 1));
+        // Fast searches still reuse the tree.
+        assert!(total(&b, 0).iter().any(|&n| n > fresh.fast_sims), "{:?}", total(&b, 0));
     }
 
     #[test]

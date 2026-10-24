@@ -25,6 +25,9 @@
 #    FORCED_PLAYOUTS=k adds KataGo forced playouts + policy target pruning to the full
 #    searches (k=2 in KataGo); unset, k is read from $RL/forced_playouts, which
 #    KATAGO_ON_FAIL=1 writes (k=2) the first time a candidate fails its gate.
+#    FRESH_FULL=1 ($RL/fresh_full) gives full searches a fresh tree: a reused subtree's warm
+#    visits, spent at depth 1 without root noise or forced playouts, were a third of gen14's
+#    policy targets on average.
 # 2. Train. A candidate from the champion, EPOCHS passes over the last WINDOW generations
 #    of self-play: policy on the visit distributions, WDL value on the outcome mixed 50/50
 #    with the root Q (less label variance -- the value head overfit last time), KL-anchored
@@ -90,6 +93,7 @@ HUMAN_SHARDS="${HUMAN_SHARDS:-data/shards/elite_k32_v2}"
 FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(cat "$RL/forced_playouts" 2>/dev/null || echo 0)}"
 KATAGO_ON_FAIL="${KATAGO_ON_FAIL:-0}"
 POLICY_TARGET="${POLICY_TARGET:-$(cat "$RL/policy_target" 2>/dev/null || echo visits)}"
+FRESH_FULL="${FRESH_FULL:-$(cat "$RL/fresh_full" 2>/dev/null || echo 0)}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
@@ -152,14 +156,15 @@ log "=== $GEN: champion $CHAMP_NAME ==="
 
 # ── 1. self-play ─────────────────────────────────────────────────────────────
 if [[ ! -f "$SP/.selfplay_done" ]]; then
-  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
+  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
   selfplay() {
     uv run python scripts/selfplay_rust.py --model "$CHAMP" --out "$SP" \
       --games 1000000 --max-hours "$SELFPLAY_HOURS" --parallel-games "$PARALLEL" \
       --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total "$CAP_TOTAL" \
       --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
       --seed "$G" --workers "$SELFPLAY_WORKERS" --threads "$SELFPLAY_THREADS" \
-      ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} "$@"
+      ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} \
+      $([[ "$FRESH_FULL" == 1 ]] && echo --fresh-full) "$@"
   }
   # The bot's search; should it crash, the older engine finishes the generation (it
   # resumes the games file, but restarts the hour budget) -- except with forced playouts,
