@@ -48,6 +48,9 @@
 #    flow (tree reuse, 4000 sims/move clipped by warm visits, 2000-sim ponder), with every
 #    game's waves batched into one GPU forward per network. They stop early once the SPRT
 #    decides; promotion still reads the score over the games played.
+# 4. Back up. scripts/hf_sync.py uploads the champions and the finished generations' games
+#    to the private Hugging Face repos, in the background so the next generation does not
+#    wait on the network; a failed upload is caught up by the next run (HF_SYNC=0: off).
 #
 # Every stage leaves a marker, so rerunning after a crash resumes the same generation.
 # State lives in data/rl/: champion (symlink), models/genNN, models/candNN,
@@ -68,6 +71,7 @@ FRESH_ONLY="${FRESH_ONLY:-1}"
 GATE_GAMES="${GATE_GAMES:-400}"
 V21_GAMES="${V21_GAMES:-0}"
 FORCE_PROMOTE="${FORCE_PROMOTE:-0}"
+HF_SYNC="${HF_SYNC:-1}"
 MATCH_SIMS="${MATCH_SIMS:-4000}"
 PONDER_SIMS="${PONDER_SIMS:-2000}"
 V21=data/models/pos2move_v2.1
@@ -223,3 +227,10 @@ NGAMES="$(wc -l < "$SP/games.jsonl")"
 printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$GEN" "$POS" "$NGAMES" "$CSCORE" "$PROMOTED" "$V21_SCORE" >> "$RL/history.tsv"
 touch "$SP/.generation_done"
 log "=== $GEN done ==="
+
+# ── 4. back up to Hugging Face ────────────────────────────────────────────────
+if [[ "$HF_SYNC" == 1 ]]; then
+  HF_HUB_DISABLE_PROGRESS_BARS=1 setsid nohup uv run python scripts/hf_sync.py \
+    >> logs/hf_sync.log 2>&1 < /dev/null &
+  log "backing up to Hugging Face in the background (logs/hf_sync.log)"
+fi
