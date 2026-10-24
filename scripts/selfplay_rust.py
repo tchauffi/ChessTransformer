@@ -65,11 +65,15 @@ class Forward:
             self.model = torch.compile(self.model, mode="reduce-overhead")
         self.bufs = {}
         self.slots = {}  # async staging buffers, one set per in-flight batch
-        for b in buckets:  # warm up every bucket so CUDA-graph capture is up front
-            self._buffers(b)
-            bt, pl, ca, ep = self.bufs[b]
-            for _ in range(3):
-                self.model(bt, pl, ca, ep)
+        # Warm up every bucket so CUDA-graph capture is up front -- under no_grad, as every
+        # later call runs: in grad mode the warm-up kept every activation (7.5 GB on CPU at
+        # batch 256) and compiled graphs that the no_grad calls then compiled again.
+        with torch.no_grad():
+            for b in buckets:
+                self._buffers(b)
+                bt, pl, ca, ep = self.bufs[b]
+                for _ in range(3):
+                    self.model(bt, pl, ca, ep)
         if device == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()  # the eager warm-up runs' blocks, not the graphs' pool
