@@ -360,6 +360,26 @@ def run_workers(args: argparse.Namespace, id_offset: int) -> None:
           f"{minutes:.1f} min ({sum(int(x[6]) for x in done)} games/h)")
 
 
+def selfplay_openings(args) -> list[str]:
+    """The start positions games draw from, uniformly: the shallow built-in openings (the
+    start position first), and with --book that book's openings past --book-skip, the
+    shallow list repeated so that --book-share of the games start from the book."""
+    shallow = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] + list(OPENINGS)
+    if args.book is None or args.book_share == 0.0:
+        return shallow
+    book = [o["fen"] for o in json.loads(Path(args.book).read_text())["openings"]][args.book_skip:]
+    if not book:
+        raise SystemExit(f"{args.book}: no openings past the first {args.book_skip}")
+    if args.book_share == 1.0:
+        return book
+    reps = max(1, round((1.0 - args.book_share) / args.book_share * len(book) / len(shallow)))
+    if args.worker in (None, 0):
+        print(f"Openings: {len(book)} from {args.book} (#{args.book_skip} on) on "
+              f"{len(book) / (len(book) + reps * len(shallow)):.0%} of games, "
+              f"{len(shallow)} shallow ones on the rest", flush=True)
+    return shallow * reps + book
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="data/models/pos2move_v2.1")
@@ -382,6 +402,15 @@ def main():
     p.add_argument("--fresh-full", action="store_true",
                    help="full searches start from a fresh tree instead of the reused one, whose "
                         "warm visits got no root noise or forced playouts. Not --legacy-engine")
+    p.add_argument("--book", default=None,
+                   help="also start games from this book's openings (gpu_match's format, e.g. "
+                        "data/openings/book2k.json), mixed with the shallow built-in ones")
+    p.add_argument("--book-skip", type=int, default=500,
+                   help="leave the book's first N openings out: the gates and anchor matches "
+                        "play openings 0..N-1, which self-play should not train on")
+    p.add_argument("--book-share", type=float, default=0.75,
+                   help="share of games started from the book; the rest start from the shallow "
+                        "openings (the start position included), so the first moves keep data")
     p.add_argument("--dirichlet-alpha", type=float, default=0.0,
                    help="root noise on full searches (AlphaZero chess: 0.3); 0 = off")
     p.add_argument("--dirichlet-eps", type=float, default=0.25)
@@ -420,6 +449,8 @@ def main():
     p.add_argument("--worker", type=int, default=None, help=argparse.SUPPRESS)  # set by run_workers
     p.add_argument("--id-offset", type=int, default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
+    if not 0.0 <= args.book_share <= 1.0:
+        p.error("--book-share must be in [0, 1]")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -466,7 +497,7 @@ def main():
         "forced_playouts": args.forced_playouts,
         "fresh_full": args.fresh_full,
     }
-    openings = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] + list(OPENINGS)
+    openings = selfplay_openings(args)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
     forward.verify_every = args.verify_every
     writer = ShardWriter(out_dir, flush_positions=args.flush_positions,

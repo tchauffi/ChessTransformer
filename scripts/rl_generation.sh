@@ -25,9 +25,12 @@
 #    FORCED_PLAYOUTS=k adds KataGo forced playouts + policy target pruning to the full
 #    searches (k=2 in KataGo); unset, k is read from $RL/forced_playouts, which
 #    KATAGO_ON_FAIL=1 writes (k=2) the first time a candidate fails its gate.
-#    FRESH_FULL=1 ($RL/fresh_full) gives full searches a fresh tree: a reused subtree's warm
-#    visits, spent at depth 1 without root noise or forced playouts, were a third of gen14's
-#    policy targets on average.
+#    Games start from BOOK's openings (book2k: 2000 positions 8 plies deep) on BOOK_SHARE of
+#    them, past the first BOOK_SKIP that the gates and anchor matches play, and from the 82
+#    shallow built-in openings on the rest, so the first moves keep self-play data; up to
+#    gen14 every game started from those 82. FRESH_FULL=1 ($RL/fresh_full) gives full
+#    searches a fresh tree: a reused subtree's warm visits, spent at depth 1 without root
+#    noise or forced playouts, were a third of gen14's policy targets on average.
 # 2. Train. A candidate from the champion, EPOCHS passes over the last WINDOW generations
 #    of self-play: policy on the visit distributions, WDL value on the outcome mixed 50/50
 #    with the root Q (less label variance -- the value head overfit last time), KL-anchored
@@ -94,6 +97,15 @@ FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(cat "$RL/forced_playouts" 2>/dev/null || e
 KATAGO_ON_FAIL="${KATAGO_ON_FAIL:-0}"
 POLICY_TARGET="${POLICY_TARGET:-$(cat "$RL/policy_target" 2>/dev/null || echo visits)}"
 FRESH_FULL="${FRESH_FULL:-$(cat "$RL/fresh_full" 2>/dev/null || echo 0)}"
+# Self-play openings: BOOK's past its first BOOK_SKIP (the gates' and anchors'), on BOOK_SHARE
+# of the games; BOOK= (empty) keeps the shallow built-in ones only.
+BOOK="${BOOK-data/openings/book2k.json}"
+BOOK_SKIP="${BOOK_SKIP:-500}"
+BOOK_SHARE="${BOOK_SHARE:-0.75}"
+if [[ -n "$BOOK" ]] && (( GATE_GAMES > 2 * BOOK_SKIP )); then
+  echo "GATE_GAMES above 2 x BOOK_SKIP ($BOOK_SKIP) would gate on openings self-play trains on"
+  exit 1
+fi
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
@@ -156,7 +168,7 @@ log "=== $GEN: champion $CHAMP_NAME ==="
 
 # ── 1. self-play ─────────────────────────────────────────────────────────────
 if [[ ! -f "$SP/.selfplay_done" ]]; then
-  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
+  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, book ${BOOK:-none}, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
   selfplay() {
     uv run python scripts/selfplay_rust.py --model "$CHAMP" --out "$SP" \
       --games 1000000 --max-hours "$SELFPLAY_HOURS" --parallel-games "$PARALLEL" \
@@ -164,6 +176,7 @@ if [[ ! -f "$SP/.selfplay_done" ]]; then
       --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
       --seed "$G" --workers "$SELFPLAY_WORKERS" --threads "$SELFPLAY_THREADS" \
       ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} \
+      ${BOOK:+--book "$BOOK" --book-skip "$BOOK_SKIP" --book-share "$BOOK_SHARE"} \
       $([[ "$FRESH_FULL" == 1 ]] && echo --fresh-full) "$@"
   }
   # The bot's search; should it crash, the older engine finishes the generation (it
