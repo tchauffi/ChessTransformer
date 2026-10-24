@@ -437,9 +437,11 @@ impl SelfPlayEngine {
         self.completed >= self.target
     }
 
-    /// (games started, games completed, positions recorded, TT entries)
-    fn stats(&self) -> (usize, usize, usize, usize) {
+    /// (games started, games completed, positions recorded, TT entries, positions searched):
+    /// the last counts the games in flight too, a throughput that needs no game to finish.
+    fn stats(&self) -> (usize, usize, usize, usize, usize) {
         let tt = self.games.iter().map(|g| g.tt_len()).sum();
-        (self.started, self.completed, self.positions_recorded, tt)
+        let in_flight: usize = self.games.iter().map(|g| g.records().len()).sum();
+        (self.started, self.completed, self.positions_recorded, tt, self.positions_recorded + in_flight)
     }
 }

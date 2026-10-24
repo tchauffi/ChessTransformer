@@ -434,6 +434,10 @@ def main():
     p.add_argument("--engines", type=int, default=2,
                    help="engine halves taking turns on the GPU (2 = the CPU searches one while "
                         "the GPU evaluates the other); 1 = no overlap")
+    p.add_argument("--report-every", type=float, default=0.0,
+                   help="every this many seconds, print the positions searched so far, games in "
+                        "flight included: a throughput that needs no game to finish (benchmarks; "
+                        "0 = off). Not --legacy-engine")
     p.add_argument("--verify-every", type=int, default=50,
                    help="recompute every N-th async batch synchronously and compare (0 = never)")
     p.add_argument("--leaves-per-wave", type=int, default=4, help="--legacy-engine only")
@@ -562,6 +566,7 @@ def main():
     budget = args.max_hours * 3600 if args.max_hours > 0 else float("inf")
     active, last = 0.0, time.monotonic()
     inflight = [None] * len(engines)
+    next_report = args.report_every
     while not (all(e.done() for e in engines) and all(h is None for h in inflight)):
         now = time.monotonic()
         if now - last < 600:
@@ -570,6 +575,10 @@ def main():
         if active >= budget:
             print(f"time budget of {args.max_hours} h reached", flush=True)
             break
+        if 0 < next_report <= active and not args.legacy_engine:
+            searched = sum(e.stats()[4] for e in engines)
+            print(f"searched {searched} positions in {active:.0f} s", flush=True)
+            next_report += args.report_every
         for k, eng in enumerate(engines):
             if args.legacy_engine:  # synchronous, full logits
                 boards, player, castling, ep = eng.collect()
