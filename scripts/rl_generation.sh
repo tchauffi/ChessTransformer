@@ -9,6 +9,10 @@
 #    $RL/selfplay_hours (default 8). The GPU is saturated, so more games per candidate means
 #    longer generations: cand11, trained on one 8 h generation, got worse on held-out games and
 #    lost (-31), while cand10 and cand12, on two, improved and tied.
+#    A datacenter GPU outruns one Python driver, so SELFPLAY_WORKERS processes (read from
+#    $RL/selfplay_workers, default 1) share the generation, spread over SELFPLAY_GPUS
+#    ($RL/selfplay_gpus, e.g. "0,1") when set, with PARALLEL games in flight between them
+#    ($RL/selfplay_parallel, default 128).
 #    The champion plays itself with playout cap randomization: FULL_FRAC of
 #    moves are full SIMS searches with root Dirichlet noise -- the policy targets -- and
 #    the rest fast FAST_SIMS moves that only move the game on. Every position keeps the
@@ -64,7 +68,9 @@ SIMS="${SIMS:-800}"
 FAST_SIMS="${FAST_SIMS:-160}"
 FULL_FRAC="${FULL_FRAC:-0.25}"
 CAP_TOTAL="${CAP_TOTAL:-all}"
-PARALLEL="${PARALLEL:-128}"
+PARALLEL="${PARALLEL:-$(cat "$RL/selfplay_parallel" 2>/dev/null || echo 128)}"
+SELFPLAY_WORKERS="${SELFPLAY_WORKERS:-$(cat "$RL/selfplay_workers" 2>/dev/null || echo 1)}"
+SELFPLAY_GPUS="${SELFPLAY_GPUS:-$(cat "$RL/selfplay_gpus" 2>/dev/null)}"
 WINDOW="${WINDOW:-2}"
 EPOCHS="${EPOCHS:-1}"
 FRESH_ONLY="${FRESH_ONLY:-1}"
@@ -140,13 +146,13 @@ log "=== $GEN: champion $CHAMP_NAME ==="
 
 # ── 1. self-play ─────────────────────────────────────────────────────────────
 if [[ ! -f "$SP/.selfplay_done" ]]; then
-  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS"
+  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
   selfplay() {
     uv run python scripts/selfplay_rust.py --model "$CHAMP" --out "$SP" \
       --games 1000000 --max-hours "$SELFPLAY_HOURS" --parallel-games "$PARALLEL" \
       --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total "$CAP_TOTAL" \
       --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
-      --seed "$G" "$@"
+      --seed "$G" --workers "$SELFPLAY_WORKERS" ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} "$@"
   }
   # The bot's search; should it crash, the older engine finishes the generation (it
   # resumes the games file, but restarts the hour budget) -- except with forced playouts,
