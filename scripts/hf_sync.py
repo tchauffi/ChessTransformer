@@ -63,6 +63,7 @@ import time
 from pathlib import Path
 
 from huggingface_hub import CommitOperationAdd, HfApi
+from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rl_status import LOG, RL, ROOT, history, ladder, signed, verdict  # noqa: E402
@@ -86,6 +87,18 @@ def private_repo(api: HfApi, repo: str, repo_type: str, public_ok: bool = False)
     if not public_ok and not api.repo_info(repo, repo_type=repo_type).private:
         sys.exit(f"{repo} is public: refusing to upload there")
     return set(api.list_repo_files(repo, repo_type=repo_type))
+
+
+def hub_ahead(api: HfApi) -> list[str]:
+    """The lines of the hub's history.tsv that this machine's lacks: when there are any,
+    another machine runs the loop, and this one's state and index would overwrite its own."""
+    try:
+        hub = api.hf_hub_download(GAMES_REPO, "history.tsv", repo_type="dataset")
+    except (EntryNotFoundError, RepositoryNotFoundError):
+        return []
+    path = RL / "history.tsv"
+    ours = set(path.read_text().splitlines()) if path.exists() else set()
+    return [line for line in Path(hub).read_text().splitlines() if line not in ours]
 
 
 # ── champions ─────────────────────────────────────────────────────────────────
@@ -425,6 +438,10 @@ def main() -> None:
     if args.only == "inputs":
         sync_inputs(api, args.dry_run)
         return
+    if ahead := hub_ahead(api):
+        gens = ", ".join(line.split("\t")[0] for line in ahead)
+        sys.exit(f"the hub has {gens}, which this machine's history.tsv lacks: another machine "
+                 "runs the loop, so this one does not overwrite its backup")
     if args.only != "games":
         sync_champions(api, rows, args.dry_run)
     if args.only != "champions":
