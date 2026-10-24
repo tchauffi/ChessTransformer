@@ -138,17 +138,31 @@ impl SelfPlayEngine {
         }
     }
 
+    /// Run `f` over every game on `threads` threads, which pull small chunks as they finish:
+    /// a game's wave costs very different time (a move boundary records the move and re-roots
+    /// the tree), and with one fixed slice per thread the wave waited for the slowest slice.
     fn par_games<F>(&mut self, f: F)
     where
         F: Fn(usize, &mut SelfPlayGame) + Sync,
     {
-        let chunk = self.games.len().div_ceil(self.threads.max(1)).max(1);
+        const GRAIN: usize = 2;
+        let n = self.games.len();
+        let threads = self.threads.max(1).min(n.div_ceil(GRAIN)).max(1);
+        if threads == 1 {
+            for (i, g) in self.games.iter_mut().enumerate() {
+                f(i, g);
+            }
+            return;
+        }
+        let work = std::sync::Mutex::new(self.games.chunks_mut(GRAIN).enumerate());
         std::thread::scope(|scope| {
-            for (ci, games) in self.games.chunks_mut(chunk).enumerate() {
-                let f = &f;
-                scope.spawn(move || {
+            for _ in 0..threads {
+                let (f, work) = (&f, &work);
+                scope.spawn(move || loop {
+                    let next = work.lock().unwrap().next();
+                    let Some((ci, games)) = next else { break };
                     for (j, g) in games.iter_mut().enumerate() {
-                        f(ci * chunk + j, g);
+                        f(ci * GRAIN + j, g);
                     }
                 });
             }
