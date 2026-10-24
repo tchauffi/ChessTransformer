@@ -9,9 +9,15 @@ names the current one. Rejected candidates stay local.
 
 Games, to the dataset repo tchauffi/chesstransformer-rl-selfplay: every finished
 generation's self-play as selfplay/genNN/ (games.jsonl, the positions_*.npz training
-shards, heldout_games.json, generation_config.json) and every finished match as
-gates/*.jsonl. The generation in progress and a gate still being played are left for the
-next run.
+shards, heldout_games.json, generation_config.json), every finished match as
+gates/*.jsonl, and at the root the loop's state (history.tsv, selfplay_hours,
+forced_playouts, policy_target) and logs/rl_generation.log, so the repo mirrors data/rl/
+and `make data` rebuilds a machine from it. The generation in progress and a gate still
+being played are left for the next run.
+
+Inputs (`--only inputs`, once), to the dataset repo tchauffi/chesstransformer-inputs: the
+gates' opening book data/openings/ and the human games every candidate replays,
+data/shards/elite_k32_v2/.
 
 rl_generation.sh starts it in the background after each gate, so the next generation
 never waits on the network; ct-hf-sync.timer (hourly) catches up after a failed upload.
@@ -20,6 +26,7 @@ Runs queue on a lock, and whatever is already on the hub is skipped.
     .venv/bin/python scripts/hf_sync.py                    # champions and games
     .venv/bin/python scripts/hf_sync.py --only games
     .venv/bin/python scripts/hf_sync.py --dry-run          # list what would be uploaded
+    .venv/bin/python scripts/hf_sync.py --only inputs      # the book and the human games
 
 Download:  hf download tchauffi/chesstransformer-rl --include "gen14/*" --local-dir .
            hf download tchauffi/chesstransformer-rl-selfplay --repo-type dataset \\
@@ -56,10 +63,14 @@ from pathlib import Path
 from huggingface_hub import CommitOperationAdd, HfApi
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rl_status import RL, history, ladder, signed, verdict  # noqa: E402
+from rl_status import LOG, RL, ROOT, history, ladder, signed, verdict  # noqa: E402
 
 MODEL_REPO = "tchauffi/chesstransformer-rl"
 GAMES_REPO = "tchauffi/chesstransformer-rl-selfplay"
+INPUTS_REPO = "tchauffi/chesstransformer-inputs"
+# The loop's state; data/rl/selfplay_workers, _gpus and _parallel belong to the machine.
+STATE_FILES = ("history.tsv", "selfplay_hours", "forced_playouts", "policy_target")
+INPUTS = ("openings", "shards/elite_k32_v2")
 CHAMPION_FILES = ("model.safetensors", "model_config.json", "model.onnx", "expert_iter_meta.json",
                   "SOURCE")
 SELFPLAY_FILES = ["games.jsonl", "heldout_games.json", "generation_config.json", "*.npz"]
@@ -277,14 +288,54 @@ def sync_games(api: HfApi, rows: list[dict], dry_run: bool) -> None:
         print(f"matches: {len(matches)} files", flush=True)
         return
     ops = [CommitOperationAdd(f"gates/{f.name}", str(f)) for f in matches]
+    ops += [CommitOperationAdd(f, str(RL / f)) for f in STATE_FILES if (RL / f).exists()]
+    if LOG.exists():
+        ops.append(CommitOperationAdd("rl_generation.log", str(LOG)))
     ops.append(CommitOperationAdd("README.md", games_readme(rows, gens).encode()))
-    api.create_commit(GAMES_REPO, ops, repo_type="dataset", commit_message="Matches and index")
-    print(f"games: {len(gens)} generations and {len(matches)} match files on the hub", flush=True)
+    api.create_commit(GAMES_REPO, ops, repo_type="dataset", commit_message="Matches, state and index")
+    print(f"games: {len(gens)} generations, {len(matches)} match files and the state on the hub",
+          flush=True)
+
+
+INPUTS_README = f"""---
+tags:
+- chess
+pretty_name: ChessTransformer RL inputs
+---
+
+# ChessTransformer RL inputs
+
+What the expert-iteration loop reads besides its own games
+([{GAMES_REPO}](https://huggingface.co/datasets/{GAMES_REPO})); mirrors `data/`.
+
+- `openings/book2k.json`: the gates' opening book (`scripts/gpu_match.py --book`), each
+  opening played twice with colours swapped; `openings/endgame7.json`: endgame starts.
+- `shards/elite_k32_v2/`: the human games every candidate replays (20% of each training
+  step, `scripts/train_expert_iter.py --human-shards`), `shard_NNNN.npy` + `meta.json`.
+"""
+
+
+def sync_inputs(api: HfApi, dry_run: bool) -> None:
+    present = set() if dry_run else private_repo(api, INPUTS_REPO, "dataset")
+    for sub in INPUTS:
+        src = ROOT / "data" / sub
+        files = sorted(f for f in src.iterdir() if f.is_file())
+        if all(f"{sub}/{f.name}" in present for f in files):
+            continue
+        size = sum(f.stat().st_size for f in files) / 1e6
+        print(f"inputs {sub}: uploading {len(files)} files ({size:.0f} MB)", flush=True)
+        if not dry_run:
+            api.upload_folder(repo_id=INPUTS_REPO, repo_type="dataset", folder_path=src,
+                              path_in_repo=sub, commit_message=f"Add {sub}")
+    if not dry_run:
+        api.create_commit(INPUTS_REPO, [CommitOperationAdd("README.md", INPUTS_README.encode())],
+                          repo_type="dataset", commit_message="Index")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--only", choices=("champions", "games"))
+    p.add_argument("--only", choices=("champions", "games", "inputs"),
+                   help="one part; inputs (static) only ever run this way")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -292,6 +343,9 @@ def main() -> None:
     lock = open(RL / ".hf_sync.lock", "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
     api, rows = HfApi(), history()
+    if args.only == "inputs":
+        sync_inputs(api, args.dry_run)
+        return
     if args.only != "games":
         sync_champions(api, rows, args.dry_run)
     if args.only != "champions":
