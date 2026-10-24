@@ -381,21 +381,34 @@ uploaded by `scripts/hf_sync.py --only inputs`.
 """
 
 
+def scrubbed(path: Path) -> bytes:
+    """A JSON input without this machine's paths: those under the repo become relative
+    (meta.json records where its HDF5 and tablebases were), and any other home path stops
+    the upload, since the inputs may be public."""
+    data = path.read_bytes().replace(f"{ROOT}/".encode(), b"")
+    if re.search(rb"/home/|/Users/|" + re.escape(Path.home().name.encode()), data):
+        sys.exit(f"{path} still holds a local path or the user name: not uploading it")
+    return data
+
+
 def sync_inputs(api: HfApi, dry_run: bool) -> None:
     present = set() if dry_run else private_repo(api, INPUTS_REPO, "dataset", public_ok=True)
+    ops = [CommitOperationAdd("README.md", INPUTS_README.encode())]
     for sub in INPUTS:
         src = ROOT / "data" / sub
         files = sorted(f for f in src.iterdir() if f.is_file())
-        if all(f"{sub}/{f.name}" in present for f in files):
-            continue
-        size = sum(f.stat().st_size for f in files) / 1e6
-        print(f"inputs {sub}: uploading {len(files)} files ({size:.0f} MB)", flush=True)
-        if not dry_run:
-            api.upload_folder(repo_id=INPUTS_REPO, repo_type="dataset", folder_path=src,
-                              path_in_repo=sub, commit_message=f"Add {sub}")
+        data = [f for f in files if f.suffix != ".json"]
+        if data and not all(f"{sub}/{f.name}" in present for f in data):
+            size = sum(f.stat().st_size for f in data) / 1e6
+            print(f"inputs {sub}: uploading {len(data)} files ({size:.0f} MB)", flush=True)
+            if not dry_run:
+                api.upload_folder(repo_id=INPUTS_REPO, repo_type="dataset", folder_path=src,
+                                  path_in_repo=sub, ignore_patterns=["*.json"],
+                                  commit_message=f"Add {sub}")
+        # The JSON files (small) go every run, scrubbed; unchanged ones are dropped.
+        ops += [CommitOperationAdd(f"{sub}/{f.name}", scrubbed(f)) for f in files if f.suffix == ".json"]
     if not dry_run:
-        api.create_commit(INPUTS_REPO, [CommitOperationAdd("README.md", INPUTS_README.encode())],
-                          repo_type="dataset", commit_message="Index")
+        api.create_commit(INPUTS_REPO, ops, repo_type="dataset", commit_message="Index and metadata")
 
 
 def main() -> None:
