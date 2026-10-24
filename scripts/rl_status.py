@@ -25,7 +25,7 @@ also at http://<this machine's address>:8765 on the local network:
 
 End times count running time only: self-play's hour budget and the training steps stand
 still while ct-rl-pause.timer has the loop frozen (22:00-08:00), so every estimate skips
-those hours. Strength is chained head to head: each promoted candidate's paired gate Elo
+those hours; `--pause none` is a machine that runs around the clock. Strength is chained head to head: each promoted candidate's paired gate Elo
 against the champion that played its generation, summed from the last network installed
 without a gate (history.tsv "forced"); the band adds up the gates' variances. Gains
 against the loop's own earlier networks overstate what other opponents will see.
@@ -64,6 +64,7 @@ RL = ROOT / "data/rl"
 LOG = ROOT / "logs/rl_generation.log"
 UNIT = "ct-rl-loop.service"
 PAUSE_HOUR, RESUME_HOUR = 22, 8  # ct-rl-pause.timer / ct-rl-resume.timer
+PAUSED_NIGHTLY = True  # --pause none: the loop runs around the clock
 LOG_TAIL = 4 << 20  # bytes; a 24 h generation logs ~250 KB
 CACHE_SECONDS = 15
 GATE_GAMES = 400
@@ -80,7 +81,7 @@ POSITIONS = re.compile(r"^Positions: ([\d,]+) over ([\d,]+) games")
 # ── running time (the loop is frozen 22:00-08:00) ─────────────────────────────
 
 def _paused(t: datetime) -> bool:
-    return t.hour >= PAUSE_HOUR or t.hour < RESUME_HOUR
+    return PAUSED_NIGHTLY and (t.hour >= PAUSE_HOUR or t.hour < RESUME_HOUR)
 
 
 def _next(t: datetime, hour: int) -> datetime:
@@ -91,6 +92,8 @@ def _next(t: datetime, hour: int) -> datetime:
 
 def add_running(t: datetime, seconds: float) -> datetime:
     """Wall-clock time once `seconds` of running time have passed after t."""
+    if not PAUSED_NIGHTLY:
+        return t + timedelta(seconds=seconds)
     while True:
         if _paused(t):
             t = _next(t, RESUME_HOUR)
@@ -103,6 +106,8 @@ def add_running(t: datetime, seconds: float) -> datetime:
 
 def running_between(a: datetime, b: datetime) -> float:
     """Seconds of running time between a and b."""
+    if not PAUSED_NIGHTLY:
+        return max(0.0, (b - a).total_seconds())
     total, t = 0.0, a
     while t < b:
         if _paused(t):
@@ -452,7 +457,7 @@ def render_state(s: dict) -> str:
         cls, text = "paused", ("Paused for the night, resumes at 08:00" if _paused(now)
                                else "Paused (frozen)")
     elif loop["active"] == "active":
-        cls, text = "running", f"Running, pauses at {PAUSE_HOUR}:00"
+        cls, text = "running", f"Running, pauses at {PAUSE_HOUR}:00" if PAUSED_NIGHTLY else "Running"
     else:
         cls, text = "stopped", f"Stopped ({loop['active']})"
     if loop["stop_file"]:
@@ -609,7 +614,8 @@ def render(s: dict) -> str:
         setup.append(f'{s["current"]["hours"]:g} h of self-play per generation, {sp["parallel_games"]} '
                      f'games at once; {sp["sims"]} sims on {sp["full_frac"]:.0%} of moves, '
                      f'{sp["fast_sims"]} on the rest')
-    setup.append(f"GPU work paused {PAUSE_HOUR}:00 to 0{RESUME_HOUR}:00")
+    if PAUSED_NIGHTLY:
+        setup.append(f"GPU work paused {PAUSE_HOUR}:00 to 0{RESUME_HOUR}:00")
     last = esc(s["last_entry"] or "")
     page = (
         f'<main id="page"><header><div><h1>RL training</h1>'
@@ -805,7 +811,14 @@ def main() -> None:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--json", action="store_true", help="print the status once and exit")
+    p.add_argument("--pause", default="22-8",
+                   help="nightly pause the estimates skip, START-END hours, or none (default 22-8)")
     args = p.parse_args()
+    global PAUSED_NIGHTLY, PAUSE_HOUR, RESUME_HOUR
+    if args.pause == "none":
+        PAUSED_NIGHTLY = False
+    else:
+        PAUSE_HOUR, RESUME_HOUR = (int(h) for h in args.pause.split("-"))
     if args.json:
         print(json.dumps(status(), default=str, indent=1))
         return
