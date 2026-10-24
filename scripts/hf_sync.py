@@ -15,9 +15,11 @@ forced_playouts, policy_target) and logs/rl_generation.log, so the repo mirrors 
 and `make data` rebuilds a machine from it. The generation in progress and a gate still
 being played are left for the next run.
 
-Inputs (`--only inputs`, once), to the dataset repo tchauffi/chesstransformer-inputs: the
-gates' opening book data/openings/ and the human games every candidate replays,
-data/shards/elite_k32_v2/.
+Inputs (`--only inputs`, once), to the dataset repo tchauffi/chesstransformer-inputs,
+which may be public: CC0, like the Lichess games they come from. The gates' opening book
+data/openings/ and the human games every candidate replays, data/shards/elite_k32_v2/.
+The champions and the games stay private: their repos are refused if they are ever public.
+The script creates repos private and never changes a repo's visibility.
 
 rl_generation.sh starts it in the background after each gate, so the next generation
 never waits on the network; ct-hf-sync.timer (hourly) catches up after a failed upload.
@@ -77,10 +79,11 @@ SELFPLAY_FILES = ["games.jsonl", "heldout_games.json", "generation_config.json",
 FRESH_SECONDS = 3600  # a match file written to this recently may still be in progress
 
 
-def private_repo(api: HfApi, repo: str, repo_type: str) -> set[str]:
-    """Create the repo if needed, refuse a public one, and list its files."""
+def private_repo(api: HfApi, repo: str, repo_type: str, public_ok: bool = False) -> set[str]:
+    """Create the repo (private) if needed, refuse a public one unless `public_ok`, and list
+    its files."""
     api.create_repo(repo, repo_type=repo_type, private=True, exist_ok=True)
-    if not api.repo_info(repo, repo_type=repo_type).private:
+    if not public_ok and not api.repo_info(repo, repo_type=repo_type).private:
         sys.exit(f"{repo} is public: refusing to upload there")
     return set(api.list_repo_files(repo, repo_type=repo_type))
 
@@ -298,25 +301,88 @@ def sync_games(api: HfApi, rows: list[dict], dry_run: bool) -> None:
 
 
 INPUTS_README = f"""---
+license: cc0-1.0
+pretty_name: ChessTransformer human games and opening book
 tags:
 - chess
-pretty_name: ChessTransformer RL inputs
+- lichess
+size_categories:
+- 10M<n<100M
 ---
 
-# ChessTransformer RL inputs
+# ChessTransformer human games and opening book
 
-What the expert-iteration loop reads besides its own games
-([{GAMES_REPO}](https://huggingface.co/datasets/{GAMES_REPO})); mirrors `data/`.
+The inputs of [ChessTransformer](https://github.com/tchauffi/ChessTransformer)'s self-play
+loop besides its own games: **48.4 million positions from 1.53 million games of strong
+human players**, and the **opening book** its matches start from. Every candidate network
+replays these human positions (20% of each training step) so it keeps what it learned from
+people, and every gate match between two networks plays the book.
 
-- `openings/book2k.json`: the gates' opening book (`scripts/gpu_match.py --book`), each
-  opening played twice with colours swapped; `openings/endgame7.json`: endgame starts.
-- `shards/elite_k32_v2/`: the human games every candidate replays (20% of each training
-  step, `scripts/train_expert_iter.py --human-shards`), `shard_NNNN.npy` + `meta.json`.
+## Source and license
+
+The games come from the [Lichess Elite Database](https://database.nikonoel.fr), a selection
+of games between strong players from the [Lichess open database](https://database.lichess.org),
+which Lichess releases under CC0. This processed version is released under CC0 as well.
+Results of games that reach an endgame the Syzygy tablebases cover are corrected with them.
+
+## Files
+
+### `shards/elite_k32_v2/`: human positions
+
+256 files `shard_NNNN.npy` (10 GB), each a NumPy structured array of 206-byte records that
+loads with `np.load(path, mmap_mode="r")`. Moves use AlphaZero's 73 move planes per
+from-square. 32 positions were drawn from each game,
+middlegame-weighted and without repeats. `meta.json` holds the record layout, the build
+settings and the split: 246 shards for training, 5 for validation, 5 for test.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `position` | uint8[64] | square a1 = 0 ... h8 = 63, not flipped: 0 empty, 1-6 White PNBRQK, 7-12 Black pnbrqk |
+| `legal_idx` | uint16[64] | legal moves as `from_square * 73 + plane`, the move played first, padded with 4672 |
+| `legal_cnt` | uint8 | how many legal moves are stored |
+| `from_square`, `action_plane` | uint8 | the move played |
+| `castling_rights` | uint8 | bits: 1 White kingside, 2 White queenside, 4 Black kingside, 8 Black queenside |
+| `en_passant_file` | uint8 | file of a capturable en-passant square, 8 = none |
+| `is_white` | uint8 | 1 when White is to move |
+| `result` | int8 | the game's result: 0 draw, 1 White won, 2 Black won |
+| `move_number` | uint16 | the position's ply in the game |
+| `elo_gap` | int16 | the side to move's rating minus its opponent's |
+| `result_tb` | int8 | `result` corrected by the tablebases when the game reached a position they cover (same coding) |
+| `value_exact` | uint8 | 1 when `result_tb` is the tablebases' own verdict on this position |
+
+Of the 1.53 million games, 253,822 reached a tablebase position and 26,062 of those ended
+with a result the tables contradict; 782,207 positions were relabelled and 474,425 carry an
+exact value.
+
+### `openings/`: match starts
+
+- `book2k.json`: 2,000 openings for engine matches, 8 plies each from games with both
+  players rated 2200 or more, kept when Stockfish at depth 12 scores them within 80
+  centipawns; each entry has `uci` (the moves), `fen` and `cp`. A match plays every opening
+  twice with colours swapped, so its difficulty cancels out.
+- `endgame7.json`: 400 starts from the same games at their first position with 7 men or
+  fewer, within 600 centipawns.
+
+## Use
+
+```python
+import numpy as np
+from huggingface_hub import hf_hub_download
+
+path = hf_hub_download("{INPUTS_REPO}", "shards/elite_k32_v2/shard_0000.npy", repo_type="dataset")
+rows = np.load(path, mmap_mode="r")
+row = rows[0]
+print(len(rows), row["position"], row["result"], row["elo_gap"])
+```
+
+Built with `scripts/build_db.py`, `scripts/build_shards.py` (`-k 32 --sample-weighting
+middlegame --syzygy`) and `scripts/build_opening_book.py` in the ChessTransformer repo, and
+uploaded by `scripts/hf_sync.py --only inputs`.
 """
 
 
 def sync_inputs(api: HfApi, dry_run: bool) -> None:
-    present = set() if dry_run else private_repo(api, INPUTS_REPO, "dataset")
+    present = set() if dry_run else private_repo(api, INPUTS_REPO, "dataset", public_ok=True)
     for sub in INPUTS:
         src = ROOT / "data" / sub
         files = sorted(f for f in src.iterdir() if f.is_file())
