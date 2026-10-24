@@ -142,6 +142,26 @@ pub struct SearchResult {
     pub elapsed: Duration,
 }
 
+/// One searched move, as `Search::summarize_tree` reports it.
+pub struct TreeSummary {
+    pub mv: Move,
+    pub visits: u32,
+    pub prior: f32,
+    /// Mean backed-up value for the side that plays `mv`.
+    pub q: f32,
+    pub children: Vec<TreeSummary>,
+}
+
+/// How deep the current tree reaches, in plies from the root.
+pub struct DepthStats {
+    /// Mean plies a simulation descended before its leaf.
+    pub mean: f32,
+    /// Longest path any simulation took.
+    pub max: u32,
+    /// Length of the line found by always following the most-visited move.
+    pub main_line: u32,
+}
+
 /// What the tablebases say about the root.
 enum RootTb {
     /// Not covered (or no tables, or a probe failed): search normally.
@@ -537,6 +557,81 @@ impl<E: Evaluator> Search<E> {
         }
     }
 
+    /// The most-visited part of the current tree, for display: at depth `d`
+    /// each node keeps its `widths[d]` most-visited children, dropping any
+    /// with fewer than `min_visits`. Read-only; call it after a search.
+    pub fn summarize_tree(&self, widths: &[usize], min_visits: u32) -> Vec<TreeSummary> {
+        self.summarize_node(0, widths, min_visits)
+    }
+
+    /// Depth reached by the current tree (warm visits from tree reuse included).
+    /// Each simulation adds one visit to every edge on its path, so the summed
+    /// edge visits over the root's visits is the mean simulation depth.
+    pub fn depth_stats(&self) -> DepthStats {
+        let total: u64 = self.tree[0].n.iter().map(|&n| n as u64).sum();
+        let (mut edge_visits, mut max) = (0u64, 0u32);
+        let mut stack = vec![(0usize, 0u32)];
+        while let Some((idx, depth)) = stack.pop() {
+            let nd = &self.tree[idx];
+            if !nd.expanded {
+                continue;
+            }
+            for i in 0..nd.moves.len() {
+                if nd.n[i] == 0 {
+                    continue;
+                }
+                edge_visits += nd.n[i] as u64;
+                max = max.max(depth + 1);
+                if nd.children[i] >= 0 {
+                    stack.push((nd.children[i] as usize, depth + 1));
+                }
+            }
+        }
+        let mut main_line = 0;
+        let mut node = 0usize;
+        loop {
+            let nd = &self.tree[node];
+            let best = if nd.expanded { (0..nd.n.len()).max_by_key(|&i| nd.n[i]) } else { None };
+            let Some(i) = best.filter(|&i| nd.n[i] > 0) else { break };
+            main_line += 1;
+            if nd.children[i] < 0 {
+                break;
+            }
+            node = nd.children[i] as usize;
+        }
+        DepthStats {
+            mean: if total > 0 { (edge_visits as f64 / total as f64) as f32 } else { 0.0 },
+            max,
+            main_line,
+        }
+    }
+
+    fn summarize_node(&self, node: usize, widths: &[usize], min_visits: u32) -> Vec<TreeSummary> {
+        let Some((&width, deeper)) = widths.split_first() else {
+            return Vec::new();
+        };
+        let nd = &self.tree[node];
+        if !nd.expanded {
+            return Vec::new();
+        }
+        let mut order: Vec<usize> = (0..nd.moves.len()).filter(|&i| nd.n[i] >= min_visits.max(1)).collect();
+        order.sort_by(|&a, &b| nd.n[b].cmp(&nd.n[a]));
+        order.truncate(width);
+        order
+            .into_iter()
+            .map(|i| TreeSummary {
+                mv: nd.moves[i].clone(),
+                visits: nd.n[i],
+                prior: nd.priors[i],
+                q: (-nd.w[i] / nd.n[i] as f64) as f32,
+                children: match nd.children[i] {
+                    c if c >= 0 => self.summarize_node(c as usize, deeper, min_visits),
+                    _ => Vec::new(),
+                },
+            })
+            .collect()
+    }
+
     fn expand_root(&mut self, job: &mut Job, moves: Vec<Move>, priors: Vec<f32>) {
         let (moves, priors) = match &job.restrict {
             Some(keep) => restrict_moves(moves, priors, keep),
@@ -887,6 +982,31 @@ mod tests {
             "should find the back-rank mate"
         );
         assert!(r.value > 0.9, "root value should be near +1, got {}", r.value);
+    }
+
+    #[test]
+    fn tree_summary_follows_the_search() {
+        let p = pos("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1");
+        let mut s = Search::new(UniformEval, SearchParams::default());
+        s.set_position(p, &[]);
+        let r = s.go(256, None, &AtomicBool::new(false)).unwrap();
+        let tree = s.summarize_tree(&[3, 2], 2);
+        assert!(!tree.is_empty() && tree.len() <= 3);
+        assert_eq!(tree[0].mv, r.best, "the most-visited branch is the move played");
+        assert!(tree.windows(2).all(|w| w[0].visits >= w[1].visits));
+        assert!(tree[0].q > 0.9, "mate scores for the side that plays it");
+        assert!(tree.iter().all(|t| t.children.len() <= 2 && t.children.iter().all(|c| c.children.is_empty())));
+    }
+
+    #[test]
+    fn depth_stats_measure_the_tree() {
+        let mut s = Search::new(UniformEval, SearchParams::default());
+        s.set_position(pos("4k3/8/8/8/8/8/8/R3K3 w Q - 0 1"), &[]);
+        s.go(512, None, &AtomicBool::new(false)).unwrap();
+        let d = s.depth_stats();
+        assert!(d.mean >= 1.0 && d.mean <= d.max as f32, "mean {} max {}", d.mean, d.max);
+        assert!(d.main_line >= 1 && d.main_line <= d.max);
+        assert!(d.max > 2, "512 sims should reach past two plies, got {}", d.max);
     }
 
     #[test]
