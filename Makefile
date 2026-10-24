@@ -35,6 +35,10 @@ INPUT_DIRS ?= openings shards/elite_k32_v2
 # Self-play size: workers sharing the GPU(s), games in flight between them, GPU ids.
 WORKERS  ?= 4
 PARALLEL ?= 1024
+# Search threads per worker (THREADS), and the gate's games in flight and threads.
+THREADS  ?= 6
+MATCH_PARALLEL ?=
+MATCH_THREADS  ?=
 GPUS     ?=
 HOURS    ?=
 MINUTES  ?= 15
@@ -125,13 +129,16 @@ bench:  ## self-play games/h at WORKERS x PARALLEL for MINUTES, the loop's setti
 	out=/tmp/ct-bench-$(WORKERS)x$(PARALLEL); rm -rf $$out
 	uv run python scripts/selfplay_rust.py --model $(RL)/champion --out $$out --games 1000000 \
 		--max-hours $$(awk 'BEGIN { print $(MINUTES) / 60 }') --parallel-games $(PARALLEL) \
-		--workers $(WORKERS) $(if $(GPUS),--gpus $(GPUS)) --seed 999 $(SELFPLAY_ARGS) \
+		--workers $(WORKERS) --threads $(THREADS) $(if $(GPUS),--gpus $(GPUS)) --seed 999 $(SELFPLAY_ARGS) \
 		| awk '/ games \| / { if (++n % 25 == 0) print; next } !/wrote positions/'
 	nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader
 
-tune:  ## write WORKERS, PARALLEL, GPUS (and HOURS per generation, if given) for the loop
+tune:  ## write WORKERS, PARALLEL, THREADS, GPUS (MATCH_PARALLEL, MATCH_THREADS, HOURS if given)
 	echo $(WORKERS) > $(RL)/selfplay_workers
 	echo $(PARALLEL) > $(RL)/selfplay_parallel
+	echo $(THREADS) > $(RL)/selfplay_threads
+	$(if $(MATCH_PARALLEL),echo $(MATCH_PARALLEL) > $(RL)/match_parallel)
+	$(if $(MATCH_THREADS),echo $(MATCH_THREADS) > $(RL)/match_threads)
 	$(if $(GPUS),echo $(GPUS) > $(RL)/selfplay_gpus,rm -f $(RL)/selfplay_gpus)
 	$(if $(HOURS),echo $(HOURS) > $(RL)/selfplay_hours)
 	echo "self-play: $(WORKERS) workers, $(PARALLEL) games in flight$(if $(GPUS), on GPUs $(GPUS)), $$(cat $(RL)/selfplay_hours 2>/dev/null || echo 8) h per generation"

@@ -71,6 +71,11 @@ CAP_TOTAL="${CAP_TOTAL:-all}"
 PARALLEL="${PARALLEL:-$(cat "$RL/selfplay_parallel" 2>/dev/null || echo 128)}"
 SELFPLAY_WORKERS="${SELFPLAY_WORKERS:-$(cat "$RL/selfplay_workers" 2>/dev/null || echo 1)}"
 SELFPLAY_GPUS="${SELFPLAY_GPUS:-$(cat "$RL/selfplay_gpus" 2>/dev/null)}"
+# Search threads per self-play worker, and the gate's games in flight and threads: the home
+# box keeps 6 / 128 / 4 (the lichess bot shares its CPU); a big machine wants more of each.
+SELFPLAY_THREADS="${SELFPLAY_THREADS:-$(cat "$RL/selfplay_threads" 2>/dev/null || echo 6)}"
+MATCH_PARALLEL="${MATCH_PARALLEL:-$(cat "$RL/match_parallel" 2>/dev/null || echo 128)}"
+MATCH_THREADS="${MATCH_THREADS:-$(cat "$RL/match_threads" 2>/dev/null || echo 4)}"
 WINDOW="${WINDOW:-2}"
 EPOCHS="${EPOCHS:-1}"
 FRESH_ONLY="${FRESH_ONLY:-1}"
@@ -112,7 +117,8 @@ gate() {
     rm -f "$5"
     uv run python scripts/gpu_match.py --model-a "$1" --model-b "$2" --label-a "$3" \
       --label-b "$4" --openings $(($6 / 2)) --max-sims "$MATCH_SIMS" \
-      --ponder-max-sims "$PONDER_SIMS" --sprt --games-out "$5" $extra | tail -14 && return 0
+      --ponder-max-sims "$PONDER_SIMS" --parallel-games "$MATCH_PARALLEL" --threads "$MATCH_THREADS" \
+      --sprt --games-out "$5" $extra | tail -14 && return 0
     log "match failed${extra:+ ($extra)}"
   done
   return 1
@@ -152,7 +158,8 @@ if [[ ! -f "$SP/.selfplay_done" ]]; then
       --games 1000000 --max-hours "$SELFPLAY_HOURS" --parallel-games "$PARALLEL" \
       --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total "$CAP_TOTAL" \
       --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
-      --seed "$G" --workers "$SELFPLAY_WORKERS" ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} "$@"
+      --seed "$G" --workers "$SELFPLAY_WORKERS" --threads "$SELFPLAY_THREADS" \
+      ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} "$@"
   }
   # The bot's search; should it crash, the older engine finishes the generation (it
   # resumes the games file, but restarts the hour budget) -- except with forced playouts,
