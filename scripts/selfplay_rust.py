@@ -10,8 +10,17 @@ all of them; Python only runs the batched NN forward. Games are searched with
 the deployed bot's own search (``SelfPlayEngine`` on ``chess_core::search``:
 16-leaf waves, deferred TT hits, the tree reused from move to move), so the
 teacher is the search the network is judged and deployed with;
-``--legacy-engine`` selects the older self-play search (``Engine``). Build the
-core with:
+``--legacy-engine`` selects the older self-play search (``Engine``).
+
+One process drives one GPU from a single Python thread, which a datacenter GPU outruns:
+``--workers N`` starts N copies of this script on the same output directory (spread over
+``--gpus`` round-robin, or all on the visible GPU; with several per GPU, run NVIDIA MPS so
+their kernels overlap) and merges their progress into the usual lines. ``--games`` and
+``--parallel-games`` are totals, split between the workers. Every worker plays its own
+seed, appends to the shared games.jsonl with interleaved game ids (worker k of N owns the
+ids = k mod N above the directory's existing ones) and writes its own
+positions_w<k>_NNNN.npz shards; one worker writes positions_NNNN.npz as before. A rerun
+resumes, as a single process does. Build the core with:
 
     uvx maturin build --release -m rust/selfplay-core/Cargo.toml -o dist
     uv pip install --force-reinstall dist/selfplay_core-*.whl
@@ -27,7 +36,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import queue
+import re
+import signal
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -211,10 +226,11 @@ class ShardWriter:
     LEGAL_COLS = {"legal_idx": np.uint16, "legal_prior": np.float16, "legal_n": np.uint16,
                   "legal_q": np.float16}
 
-    def __init__(self, out_dir: Path, flush_positions: int = 10_000):
+    def __init__(self, out_dir: Path, flush_positions: int = 10_000, prefix: str = "positions_"):
         self.out_dir = out_dir
         self.flush_positions = flush_positions
-        self.shard_idx = len(list(out_dir.glob("positions_*.npz")))
+        self.prefix = prefix  # "positions_w<k>_" for a worker of a --workers run
+        self.shard_idx = len(list(out_dir.glob(f"{prefix}[0-9]*.npz")))
         self._reset()
 
     def _reset(self):
@@ -269,11 +285,79 @@ class ShardWriter:
             arrays["legal_ptr"] = np.zeros(len(legal_lens) + 1, dtype=np.int64)
             np.cumsum(legal_lens, out=arrays["legal_ptr"][1:])
             arrays["root_net_v"] = np.concatenate(self.root_net_v)
-        path = self.out_dir / f"positions_{self.shard_idx:04d}.npz"
+        path = self.out_dir / f"{self.prefix}{self.shard_idx:04d}.npz"
         np.savez_compressed(path, **arrays)
         print(f"  wrote {path.name} ({self.n} positions)", flush=True)
         self.shard_idx += 1
         self._reset()
+
+
+def append_line(fd: int, line: str) -> None:
+    """One write() per line: with O_APPEND, workers sharing games.jsonl keep lines whole."""
+    data = line.encode()
+    while data:
+        data = data[os.write(fd, data):]
+
+
+PROGRESS = re.compile(r"^(\d+)/\d+ games \| (\d+) pos \| (\d+) games/h \| tt=(\d+)")
+DONE = re.compile(r"^Done: (\d+) games, (\d+) positions \| W (\d+) / D (\d+) / B (\d+) \| "
+                  r"([\d.]+) min \((\d+) games/h\)")
+
+
+def run_workers(args: argparse.Namespace, id_offset: int) -> None:
+    """Run args.workers copies of this script on args.out and print their progress as one
+    run does: a combined games / positions / rate line on every worker update, other lines
+    tagged [w<k>]. A failing worker stops the others, so a rerun resumes them together."""
+    gpus = [g for g in args.gpus.split(",") if g] or [None]
+    argv = sys.argv[1:] + ["--id-offset", str(id_offset)]
+    procs = []
+    for k in range(args.workers):
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        if gpus[k % len(gpus)] is not None:
+            env["CUDA_VISIBLE_DEVICES"] = gpus[k % len(gpus)]
+        procs.append(subprocess.Popen([sys.executable, __file__, *argv, "--worker", str(k)], env=env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
+    lines: queue.Queue = queue.Queue()
+
+    def pump(k: int, proc: subprocess.Popen):
+        for line in proc.stdout:
+            lines.put((k, line.rstrip("\n")))
+        lines.put((k, None))
+
+    for k, proc in enumerate(procs):
+        threading.Thread(target=pump, args=(k, proc), daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    progress = [(0, 0, 0, 0)] * args.workers
+    done = [None] * args.workers
+    running = args.workers
+    try:
+        while running:
+            k, line = lines.get()
+            if line is None:
+                running -= 1
+                if procs[k].wait() != 0:
+                    print(f"[w{k}] exited with code {procs[k].returncode}; stopping the other workers",
+                          flush=True)
+                    sys.exit(1)
+            elif m := PROGRESS.match(line):
+                progress[k] = tuple(map(int, m.groups()))
+                g, pos, rate, tt = (sum(c) for c in zip(*progress))
+                print(f"{g}/{args.games} games | {pos} pos | {rate} games/h | tt={tt}", flush=True)
+            elif m := DONE.match(line):
+                done[k] = m.groups()
+            elif line.strip():
+                print(f"[w{k}] {line}", flush=True)
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in procs:
+            proc.wait()
+    done = [d for d in done if d]
+    g, pos, w, d, b = (sum(int(x[i]) for x in done) for i in range(5))
+    minutes = max((float(x[5]) for x in done), default=0.0)
+    print(f"\nDone: {g} games, {pos} positions | W {w} / D {d} / B {b} | "
+          f"{minutes:.1f} min ({sum(int(x[6]) for x in done)} games/h)")
 
 
 def main():
@@ -326,21 +410,38 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--workers", type=int, default=1,
+                   help="processes on the same --out, each feeding the GPU from its own thread")
+    p.add_argument("--gpus", default="",
+                   help="comma-separated GPU ids the workers take round-robin (default: the visible one)")
+    p.add_argument("--worker", type=int, default=None, help=argparse.SUPPRESS)  # set by run_workers
+    p.add_argument("--id-offset", type=int, default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     games_log = out_dir / "games.jsonl"
-    # Ids of a run are interleaved across engines, so resume after the largest one.
-    id_offset = (max((json.loads(line)["id"] for line in open(games_log)), default=-1) + 1
-                 if games_log.exists() else 0)
-    if id_offset:
-        print(f"Resuming after {id_offset} existing games in {out_dir}")
-    (out_dir / "generation_config.json").write_text(json.dumps(vars(args), indent=2))
+    if args.id_offset is None:
+        # Ids of a run are interleaved across engines and workers, so resume after the largest.
+        id_offset = (max((json.loads(line)["id"] for line in open(games_log)), default=-1) + 1
+                     if games_log.exists() else 0)
+        if id_offset:
+            print(f"Resuming after {id_offset} existing games in {out_dir}")
+        (out_dir / "generation_config.json").write_text(json.dumps(vars(args), indent=2))
+    else:
+        id_offset = args.id_offset
+    if args.workers > 1 and args.worker is None:
+        run_workers(args, id_offset)
+        return
+    # This process's share: worker w of n_w plays its own seed and the ids = w (mod n_w).
+    n_w, w = (args.workers, args.worker) if args.worker is not None else (1, 0)
+    seed = args.seed + 104_729 * w
+    n_games = args.games // n_w + (w < args.games % n_w)
+    parallel = max(1, args.parallel_games // n_w)
 
     cfg = {
         "num_sims": args.sims,
-        "num_parallel_games": args.parallel_games,
+        "num_parallel_games": parallel,
         "leaves_per_wave": args.leaves_per_wave,
         "sim_batch": args.sim_batch,
         "threads": args.threads,
@@ -364,38 +465,38 @@ def main():
     openings = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] + list(OPENINGS)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
     forward.verify_every = args.verify_every
-    writer = ShardWriter(out_dir, flush_positions=args.flush_positions)
+    writer = ShardWriter(out_dir, flush_positions=args.flush_positions,
+                         prefix="positions_" if n_w == 1 else f"positions_w{w}_")
 
     counts = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
     done_games, n_positions = 0, 0
-    log = open(games_log, "a")
+    log = os.open(games_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
     if args.legacy_engine:
         if args.forced_playouts > 0:
             print("WARNING: --legacy-engine has no forced playouts; searching without them", flush=True)
-        engines = [selfplay_core.Engine(json.dumps(cfg), openings, args.seed + id_offset, args.games)]
+        engines = [selfplay_core.Engine(json.dumps(cfg), openings, seed + id_offset, n_games)]
     else:
         cfg["tt_cap"] = min(args.tt_cap, 200_000)  # per game here, one shared TT in Engine
         k_eng = max(1, args.engines)
-        cfg["num_parallel_games"] = max(1, args.parallel_games // k_eng)
+        cfg["num_parallel_games"] = max(1, parallel // k_eng)
         engines = [selfplay_core.SelfPlayEngine(
-            json.dumps(cfg), openings, args.seed + id_offset + 1_000_003 * k,
-            args.games // k_eng + (k < args.games % k_eng)) for k in range(k_eng)]
+            json.dumps(cfg), openings, seed + id_offset + 1_000_003 * k,
+            n_games // k_eng + (k < n_games % k_eng)) for k in range(k_eng)]
 
     def record(games: list, k: int):
         nonlocal done_games, n_positions
         for g in games:
-            gid = id_offset + g["id"] * len(engines) + k
+            gid = id_offset + (g["id"] * len(engines) + k) * n_w + w
             z = g["z_white"]
             result = "1-0" if z > 0 else "0-1" if z < 0 else "1/2-1/2"
             counts[result] += 1
             n_positions += len(g["z"])
             writer.add_game(g, gid)
-            log.write(json.dumps({
+            append_line(log, json.dumps({
                 "id": gid, "fen": g["fen"], "moves": g["moves"], "result": result,
                 "end": g["end"], "plies": len(g["moves"]),
                 "resign_allowed": g["resign_allowed"],
             }) + "\n")
-            log.flush()
             done_games += 1
             if done_games % 20 == 0:
                 el = max(active, 1e-9)
@@ -440,7 +541,7 @@ def main():
                 raise RuntimeError("engine returned an empty batch with games left")
 
     writer.flush()
-    log.close()
+    os.close(log)
     el = max(active, 1e-9)
     print(f"\nDone: {done_games} games, {n_positions} positions | "
           f"W {counts['1-0']} / D {counts['1/2-1/2']} / B {counts['0-1']} | "
