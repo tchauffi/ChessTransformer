@@ -174,6 +174,10 @@ struct ServeArgs {
     /// Syzygy tablebase directories, ':'-separated
     #[arg(long, default_value = "", env = "SYZYGY_PATH")]
     syzygy_path: String,
+    /// Also serve the web frontend's static build (Next.js `out/`) from this
+    /// directory, so one process hosts the whole demo (Hugging Face Space).
+    #[arg(long, env = "STATIC_DIR")]
+    static_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]

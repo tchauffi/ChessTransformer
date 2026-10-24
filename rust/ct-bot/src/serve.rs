@@ -19,7 +19,7 @@ use shakmaty::{fen::Fen, CastlingMode, Chess, Color, EnPassantMode, Move, Positi
 use tokio::sync::Mutex;
 
 use crate::nn::OnnxEvaluator;
-use crate::search::{Search, SearchParams};
+use crate::search::{Search, SearchParams, TreeSummary};
 use crate::ServeArgs;
 
 struct Session {
@@ -53,6 +53,25 @@ fn result_str(pos: &Chess) -> Option<String> {
         Some(shakmaty::Outcome::Decisive { winner: Color::Black }) => "0-1".into(),
         _ => "1/2-1/2".into(),
     })
+}
+
+/// Branching kept per depth when reporting the search to the frontend: the
+/// root's top candidates, a couple of replies each, then the main line.
+const TREE_WIDTHS: [usize; 8] = [5, 3, 2, 2, 1, 1, 1, 1];
+
+fn tree_json(nodes: &[TreeSummary]) -> Value {
+    nodes
+        .iter()
+        .map(|t| {
+            json!({
+                "move": t.mv.to_uci(CastlingMode::Standard).to_string(),
+                "visits": t.visits,
+                "prior": t.prior,
+                "q": t.q,
+                "children": tree_json(&t.children),
+            })
+        })
+        .collect()
 }
 
 fn parse_fen(fen: &str) -> Result<Chess, (StatusCode, String)> {
@@ -133,6 +152,9 @@ async fn bot_move(State(app): State<Arc<App>>, Json(req): Json<FenReq>) -> Resp 
             .search
             .go(sims, None, &std::sync::atomic::AtomicBool::new(false))
             .map_err(|e| e.to_string())?;
+        let root_visits = session.search.root_visits();
+        let tree = session.search.summarize_tree(&TREE_WIDTHS, (root_visits / 100).max(2));
+        let depth = session.search.depth_stats();
         session.push(r.best.clone());
         let pos = session.pos.clone();
         Ok::<_, String>(json!({
@@ -142,6 +164,14 @@ async fn bot_move(State(app): State<Arc<App>>, Json(req): Json<FenReq>) -> Resp 
             "game_over": game_over(&pos),
             "result": result_str(&pos),
             "value": r.value,
+            "search": {
+                "sims": r.sims,
+                "visits": root_visits,
+                "nn_evals": r.nn_evals,
+                "elapsed_ms": r.elapsed.as_millis() as u64,
+                "depth": { "mean": depth.mean, "max": depth.max, "main_line": depth.main_line },
+                "tree": tree_json(&tree),
+            },
         }))
     })
     .await
@@ -223,12 +253,16 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         approx_elo: args.approx_elo,
     });
 
-    let router = axum::Router::new()
+    let mut router = axum::Router::new()
         .route("/api/health", get(health))
         .route("/api/move", post(bot_move))
         .route("/api/new-game", post(new_game))
         .route("/api/validate-move", post(validate_move))
-        .route("/api/evaluate", post(evaluate))
+        .route("/api/evaluate", post(evaluate));
+    if let Some(dir) = &args.static_dir {
+        router = router.fallback_service(tower_http::services::ServeDir::new(dir));
+    }
+    let router = router
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(app);
 
