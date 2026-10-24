@@ -5,13 +5,15 @@ promoted candidate (history.tsv "yes") and every network installed without a gat
 ("forced"), each in its own folder genNN/ with its weights, config, ONNX graph, training
 metadata and champion.json (its gate, what it trained on, its strength chained through
 the gates, as on the status page). The README lists them and champion.json at the root
-names the current one. Rejected candidates stay local.
+names the current one. Rejected candidates stay local. The anchors the gates hold
+candidates to (data/rl/anchors/<label>/, e.g. v2.1) go to anchors/<label>/.
 
 Games, to the dataset repo tchauffi/chesstransformer-rl-selfplay: every finished
 generation's self-play as selfplay/genNN/ (games.jsonl, the positions_*.npz training
 shards, heldout_games.json, generation_config.json), every finished match as
-gates/*.jsonl, and at the root the loop's state (history.tsv, selfplay_hours,
-forced_playouts, policy_target) and logs/rl_generation.log, so the repo mirrors data/rl/
+gates/*.jsonl, and at the root the loop's state (history.tsv, anchors.tsv, selfplay_hours,
+forced_playouts, policy_target, policy_temp, fresh_full) and logs/rl_generation.log, so the
+repo mirrors data/rl/
 and `make data` rebuilds a machine from it. The generation in progress and a gate still
 being played are left for the next run.
 
@@ -72,7 +74,8 @@ MODEL_REPO = "tchauffi/chesstransformer-rl"
 GAMES_REPO = "tchauffi/chesstransformer-rl-selfplay"
 INPUTS_REPO = "tchauffi/chesstransformer-inputs"
 # The loop's state; data/rl/selfplay_workers, _gpus and _parallel belong to the machine.
-STATE_FILES = ("history.tsv", "selfplay_hours", "forced_playouts", "policy_target")
+STATE_FILES = ("history.tsv", "anchors.tsv", "selfplay_hours", "forced_playouts", "policy_target",
+               "policy_temp", "fresh_full")
 INPUTS = ("openings", "shards/elite_k32_v2")
 CHAMPION_FILES = ("model.safetensors", "model_config.json", "model.onnx", "expert_iter_meta.json",
                   "SOURCE")
@@ -204,6 +207,20 @@ def sync_champions(api: HfApi, rows: list[dict], dry_run: bool) -> None:
         ops.append(CommitOperationAdd(f"{c['gen']}/champion.json",
                                       json.dumps(card(c), indent=1).encode()))
         api.create_commit(MODEL_REPO, ops, commit_message=f"Add {c['gen']} ({card(c)['how']})")
+    # The anchors the gates hold candidates to (data/rl/anchors/<label>, e.g. v2.1), so a new
+    # machine's `make data` has them.
+    for src in sorted(p for p in (RL / "anchors").glob("*") if p.is_dir()):
+        if f"anchors/{src.name}/model.safetensors" in present:
+            continue
+        files = [f for f in ("model.safetensors", "model_config.json") if (src / f).exists()]
+        if len(files) < 2:
+            print(f"anchor {src.name}: no model.safetensors + model_config.json in {src}, skipped",
+                  flush=True)
+            continue
+        print(f"anchor {src.name}: uploading {', '.join(files)}", flush=True)
+        if not dry_run:
+            api.create_commit(MODEL_REPO, [CommitOperationAdd(f"anchors/{src.name}/{f}", str(src / f))
+                                           for f in files], commit_message=f"Add anchor {src.name}")
     if dry_run:
         return
     index = {"champion": current, "generations": [c["gen"] for c in champs]}

@@ -50,16 +50,21 @@
 #    visit counts; unset, it is read from $RL/policy_target (default visits). POLICY_TEMP=T
 #    ($RL/policy_temp, default 1) trains on visits^(1/T): pruned 800-sim targets carry 0.91
 #    nats against gen14's own 1.34, and T=1.25 brings them to 1.12.
-# 3. Gate. Candidate vs champion over GATE_GAMES games; promoted on a score >= 50%. A worse
-#    candidate rarely clears that (a -30 Elo net passes ~1% of the time at 400 games) and an
-#    equal one is a free reshuffle, as AlphaZero always promoted. FORCE_PROMOTE=1 promotes
-#    it whatever the score (history reads "forced"): an architecture change taken on its
-#    ceiling, not on its first gate. With V21_GAMES > 0 a new
-#    champion then also plays prod v2.1 (off by default). Matches run on scripts/gpu_match.py: every
-#    side plays the deployed lichess bot's own search code (chess_core::search) and move
+# 3. Gate. Candidate vs champion, up to GATE_GAMES games ($RL/gate_games, default 400), with
+#    an SPRT of H0 +0 vs H1 +GATE_ELO1 Elo (15) that stops the match once it decides. The
+#    candidate passes only when the SPRT accepts H1 (PROMOTE_RULE=score restores the rule up to
+#    gen14, a score >= 50%): that rule promoted noise -- gen04 at +9 (not significant), gen10
+#    at +2, gen12 at a paired -9 -- and nine such steps chained to +168 over gen00 while gen14
+#    beat gen00 by +38 head to head. A candidate that passes then plays every anchor in
+#    ANCHORS ("label=model_dir", default v2.1=$RL/anchors/v2.1), ANCHOR_GAMES games each
+#    ($RL/anchor_games, default 400), and is promoted only if its Elo against each is within
+#    ANCHOR_MARGIN/2 (10) of the champion's ($RL/anchors.tsv; measured first when missing):
+#    beating its parent, gen14 had lost 60 Elo against v2.1 relative to gen00 (-117 vs -58).
+#    FORCE_PROMOTE=1 promotes whatever the result (history reads "forced"): an architecture
+#    change taken on its ceiling, not on its first gate. Matches run on scripts/gpu_match.py:
+#    every side plays the deployed lichess bot's own search code (chess_core::search) and move
 #    flow (tree reuse, 4000 sims/move clipped by warm visits, 2000-sim ponder), with every
-#    game's waves batched into one GPU forward per network. They stop early once the SPRT
-#    decides; promotion still reads the score over the games played.
+#    game's waves batched into one GPU forward per network, on the book's first openings.
 # 4. Back up. scripts/hf_sync.py uploads the champions and the finished generations' games
 #    to the private Hugging Face repos, in the background so the next generation does not
 #    wait on the network; a failed upload is caught up by the next run (HF_SYNC=0: off).
@@ -69,6 +74,8 @@
 # selfplay/genNN, gates/*.jsonl and history.tsv.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
+# awk prints numbers in the locale's format: -77,5 under fr_FR, which the scripts it feeds reject.
+export LC_ALL=C
 
 RL="${RL:-data/rl}"
 SELFPLAY_HOURS="${SELFPLAY_HOURS:-$(cat "$RL/selfplay_hours" 2>/dev/null || echo 8)}"
@@ -87,13 +94,17 @@ MATCH_THREADS="${MATCH_THREADS:-$(cat "$RL/match_threads" 2>/dev/null || echo 4)
 WINDOW="${WINDOW:-2}"
 EPOCHS="${EPOCHS:-1}"
 FRESH_ONLY="${FRESH_ONLY:-1}"
-GATE_GAMES="${GATE_GAMES:-400}"
-V21_GAMES="${V21_GAMES:-0}"
+GATE_GAMES="${GATE_GAMES:-$(cat "$RL/gate_games" 2>/dev/null || echo 400)}"
+GATE_ELO1="${GATE_ELO1:-15}"
+PROMOTE_RULE="${PROMOTE_RULE:-sprt}"
+# Anchors, "label=model_dir" each (empty: none), and their matches' games and margin.
+ANCHORS="${ANCHORS-v2.1=$RL/anchors/v2.1}"
+ANCHOR_GAMES="${ANCHOR_GAMES:-$(cat "$RL/anchor_games" 2>/dev/null || echo 400)}"
+ANCHOR_MARGIN="${ANCHOR_MARGIN:-20}"
 FORCE_PROMOTE="${FORCE_PROMOTE:-0}"
 HF_SYNC="${HF_SYNC:-1}"
 MATCH_SIMS="${MATCH_SIMS:-4000}"
 PONDER_SIMS="${PONDER_SIMS:-2000}"
-V21=data/models/pos2move_v2.1
 HUMAN_SHARDS="${HUMAN_SHARDS:-data/shards/elite_k32_v2}"
 FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(cat "$RL/forced_playouts" 2>/dev/null || echo 0)}"
 KATAGO_ON_FAIL="${KATAGO_ON_FAIL:-0}"
@@ -105,42 +116,49 @@ FRESH_FULL="${FRESH_FULL:-$(cat "$RL/fresh_full" 2>/dev/null || echo 0)}"
 BOOK="${BOOK-data/openings/book2k.json}"
 BOOK_SKIP="${BOOK_SKIP:-500}"
 BOOK_SHARE="${BOOK_SHARE:-0.75}"
-if [[ -n "$BOOK" ]] && (( GATE_GAMES > 2 * BOOK_SKIP )); then
-  echo "GATE_GAMES above 2 x BOOK_SKIP ($BOOK_SKIP) would gate on openings self-play trains on"
+if [[ -n "$BOOK" ]] && (( GATE_GAMES > 2 * BOOK_SKIP || ANCHOR_GAMES > 2 * BOOK_SKIP )); then
+  echo "GATE_GAMES / ANCHOR_GAMES above 2 x BOOK_SKIP ($BOOK_SKIP) would match on openings self-play trains on"
   exit 1
 fi
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
-score() {  # per-game score of side A in a games jsonl, plus the report
-  uv run python - "$1" <<'EOF'
-import json, sys
-sys.path.insert(0, "src")
-from chesstransformer.evaluation.sprt import format_report, pair_up, sprt_llr, summarize
-rows = [json.loads(l) for l in open(sys.argv[1])]
-res = {(r["idx"], r["a_white"]): r["score_a"] for r in rows}
-pairs = pair_up(res)
-print(format_report(summarize(pairs, [res[k] for k in res if (k[0], not k[1]) in res]),
-                    "A", "B", llr=sprt_llr(pairs)), file=sys.stderr)
-print(f"{sum(r['score_a'] for r in rows) / max(1, len(rows)):.4f} {len(rows)}")
-EOF
+# verdict <games jsonl> <elo0> <elo1>: "score games pairs elo lo hi llr decision" for side A
+# (scripts/match_verdict.py; the report goes to the log).
+verdict() {
+  uv run python scripts/match_verdict.py "$1" --elo0="$2" --elo1="$3"
 }
 
-# gate <model A> <model B> <label A> <label B> <games out> <games>
-# Up to <games>, stopping as soon as the SPRT (H0 +0 / H1 +15 Elo) decides. Retried once
-# uncompiled with one engine half, in case two compiled nets do not fit the GPU or the
+# match <model A> <model B> <label A> <label B> <games out> <games> [gpu_match args...]
+# Book openings 0..games/2-1, both colours; <games out>.done marks a finished match. Retried
+# once uncompiled with one engine half, in case two compiled nets do not fit the GPU or the
 # overlapped path fails its run-time check.
-gate() {
-  local extra
+match() {
+  local a=$1 b=$2 la=$3 lb=$4 out=$5 n=$6 extra
+  shift 6
   for extra in "" "--no-compile --engines 1"; do
-    rm -f "$5"
-    uv run python scripts/gpu_match.py --model-a "$1" --model-b "$2" --label-a "$3" \
-      --label-b "$4" --openings $(($6 / 2)) --max-sims "$MATCH_SIMS" \
+    rm -f "$out" "$out.done"
+    uv run python scripts/gpu_match.py --model-a "$a" --model-b "$b" --label-a "$la" \
+      --label-b "$lb" --openings $((n / 2)) --max-sims "$MATCH_SIMS" \
       --ponder-max-sims "$PONDER_SIMS" --parallel-games "$MATCH_PARALLEL" --threads "$MATCH_THREADS" \
-      --sprt --games-out "$5" $extra | tail -14 && return 0
+      --games-out "$out" "$@" $extra | tail -14 && { touch "$out.done"; return 0; }
     log "match failed${extra:+ ($extra)}"
   done
   return 1
+}
+
+# anchors.tsv: a network's paired Elo against each anchor (gen anchor elo lo hi games pairs).
+anchor_elo() {  # <gen> <anchor>: its Elo, or nothing
+  awk -F'\t' -v g="$1" -v a="$2" '$1 == g && $2 == a { e = $3 } END { if (e != "") print e }' \
+    "$RL/anchors.tsv" 2>/dev/null
+}
+record_anchor() {  # <gen> <anchor> <games jsonl>
+  local score games pairs elo lo hi _
+  read -r score games pairs elo lo hi _ < <(verdict "$3" 0 15 2>/dev/null)
+  [[ -f "$RL/anchors.tsv" ]] || printf "gen\tanchor\telo\tlo\thi\tgames\tpairs\n" > "$RL/anchors.tsv"
+  awk -F'\t' -v g="$1" -v a="$2" '!($1 == g && $2 == a)' "$RL/anchors.tsv" > "$RL/anchors.tsv.tmp"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$elo" "$lo" "$hi" "$games" "$pairs" >> "$RL/anchors.tsv.tmp"
+  mv "$RL/anchors.tsv.tmp" "$RL/anchors.tsv"
 }
 
 if [[ "${1:-}" == "--seed" ]]; then
@@ -217,37 +235,76 @@ if [[ ! -f "$CAND/model.safetensors" ]]; then
     || { log "ONNX parity failed -- not gating a graph that disagrees with torch"; exit 1; }
 fi
 
-# ── 3. gate vs champion, promote (match vs v2.1 if V21_GAMES > 0) ───────────
-GATE="$RL/gates/cand$(printf %02d $G)_vs_${CHAMP_NAME}.jsonl"
+# ── 3. gate vs champion, then the anchors; promote ──────────────────────────
+CANDN="cand$(printf %02d $G)"
+GATE="$RL/gates/${CANDN}_vs_${CHAMP_NAME}.jsonl"
 if [[ ! -f "$SP/.gate_done" ]]; then
-  log "gating $CAND vs $CHAMP_NAME, $GATE_GAMES games"
-  gate "$CAND" "$CHAMP" "cand$(printf %02d $G)" "$CHAMP_NAME" "$GATE" "$GATE_GAMES" \
-    || { log "gate failed"; exit 1; }
+  log "gating $CAND vs $CHAMP_NAME, up to $GATE_GAMES games (SPRT +0 / +$GATE_ELO1 Elo)"
+  match "$CAND" "$CHAMP" "$CANDN" "$CHAMP_NAME" "$GATE" "$GATE_GAMES" \
+    --sprt --elo0 0 --elo1 "$GATE_ELO1" || { log "gate failed"; exit 1; }
   touch "$SP/.gate_done"
 fi
-read -r CSCORE CGAMES < <(score "$GATE")
-log "cand vs champion: $CSCORE over $CGAMES games"
+read -r CSCORE CGAMES _ CELO CLO CHI _ CDEC < <(verdict "$GATE" 0 "$GATE_ELO1")
+log "cand vs champion: $CSCORE over $CGAMES games, $CELO Elo [$CLO, $CHI], SPRT $CDEC"
 
 PROMOTED=no
-V21_SCORE="-"
-if awk -v s="$CSCORE" 'BEGIN { exit !(s >= 0.5) }'; then
-  PROMOTED=yes
-elif [[ "$FORCE_PROMOTE" == 1 ]]; then
-  PROMOTED=forced
+case "$PROMOTE_RULE" in
+  sprt) [[ "$CDEC" == H1 ]] && PROMOTED=yes ;;
+  score) awk -v s="$CSCORE" 'BEGIN { exit !(s >= 0.5) }' && PROMOTED=yes ;;
+  *) log "PROMOTE_RULE must be sprt or score, not $PROMOTE_RULE"; exit 1 ;;
+esac
+[[ "$PROMOTED" == no ]] && log "gate: not better than $CHAMP_NAME ($PROMOTE_RULE rule)"
+
+# A candidate that beat its parent must also hold its ground against every anchor: its Elo
+# against the anchor no further below the champion's than ANCHOR_MARGIN/2 (the SPRT's LLR for
+# H1 = the champion's Elo vs H0 = ANCHOR_MARGIN below it is positive). Anchor matches play a
+# fixed ANCHOR_GAMES, so the Elo they record is the next comparison's reference; a champion
+# without one (gen14 when the anchors came in, a forced promotion) is measured first.
+ANCHOR_SCORE="-"
+if [[ "$PROMOTED" == yes && -n "$ANCHORS" ]]; then
+  for entry in $ANCHORS; do
+    label="${entry%%=*}" path="${entry#*=}"
+    [[ -f "$path/model.safetensors" ]] || { log "anchor $label: no network at $path"; exit 1; }
+    if [[ -z "$(anchor_elo "$CHAMP_NAME" "$label")" ]]; then
+      f="$RL/gates/${CHAMP_NAME}_vs_${label}.jsonl"
+      if [[ ! -f "$f.done" ]]; then
+        log "anchor $label: measuring $CHAMP_NAME first, $ANCHOR_GAMES games"
+        match "$CHAMP" "$path" "$CHAMP_NAME" "$label" "$f" "$ANCHOR_GAMES" \
+          || { log "anchor match failed"; exit 1; }
+      fi
+      record_anchor "$CHAMP_NAME" "$label" "$f"
+    fi
+    REF="$(anchor_elo "$CHAMP_NAME" "$label")"
+    f="$RL/gates/${CANDN}_vs_${label}.jsonl"
+    if [[ ! -f "$f.done" ]]; then
+      log "anchor $label: $CANDN, $ANCHOR_GAMES games ($CHAMP_NAME: $REF Elo)"
+      match "$CAND" "$path" "$CANDN" "$label" "$f" "$ANCHOR_GAMES" || { log "anchor match failed"; exit 1; }
+    fi
+    record_anchor "$CANDN" "$label" "$f"
+    FLOOR="$(awk -v r="$REF" -v m="$ANCHOR_MARGIN" 'BEGIN { print r - m }')"
+    read -r ASCORE _ _ AELO ALO AHI ALLR _ < <(verdict "$f" "$FLOOR" "$REF")
+    [[ "$ANCHOR_SCORE" == "-" ]] && ANCHOR_SCORE="$ASCORE"
+    if awk -v l="$ALLR" 'BEGIN { exit !(l > 0) }'; then
+      log "anchor $label: $CANDN $AELO Elo [$ALO, $AHI] vs $CHAMP_NAME's $REF: holds"
+    else
+      log "anchor $label: $CANDN $AELO Elo [$ALO, $AHI] vs $CHAMP_NAME's $REF: lost ground"
+      PROMOTED=no
+    fi
+  done
 fi
+[[ "$PROMOTED" == no && "$FORCE_PROMOTE" == 1 ]] && PROMOTED=forced
+
 if [[ "$PROMOTED" != no ]]; then
   NEW="$RL/models/$GEN"
   rm -rf "$NEW"
   cp -r "$CAND" "$NEW"
   ln -sfn "models/$GEN" "$RL/champion"
+  # The new champion's anchor Elo is its candidate's (none if it was forced without them).
+  for entry in $ANCHORS; do
+    f="$RL/gates/${CANDN}_vs_${entry%%=*}.jsonl"
+    [[ -f "$f.done" ]] && record_anchor "$GEN" "${entry%%=*}" "$f"
+  done
   log "promoted ($PROMOTED): champion is now $GEN"
-  if ((V21_GAMES > 0)); then
-    VGATE="$RL/gates/${GEN}_vs_v2.1.jsonl"
-    log "matching $GEN vs v2.1, $V21_GAMES games"
-    gate "$NEW" "$V21" "$GEN" v2.1 "$VGATE" "$V21_GAMES" || log "v2.1 match failed (champion kept)"
-    [[ -s "$VGATE" ]] && read -r V21_SCORE _ < <(score "$VGATE")
-    log "$GEN vs v2.1: $V21_SCORE"
-  fi
 else
   log "not promoted: $CHAMP_NAME stays champion"
   if [[ "$KATAGO_ON_FAIL" == 1 && ! -f "$RL/forced_playouts" ]]; then
@@ -258,7 +315,7 @@ fi
 
 POS="$(uv run python -c "import numpy as np, glob, sys; print(sum(len(np.load(f)['z']) for f in glob.glob(sys.argv[1] + '/positions_*.npz')))" "$SP")"
 NGAMES="$(wc -l < "$SP/games.jsonl")"
-printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$GEN" "$POS" "$NGAMES" "$CSCORE" "$PROMOTED" "$V21_SCORE" >> "$RL/history.tsv"
+printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$GEN" "$POS" "$NGAMES" "$CSCORE" "$PROMOTED" "$ANCHOR_SCORE" >> "$RL/history.tsv"
 touch "$SP/.generation_done"
 log "=== $GEN done ==="
 

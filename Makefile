@@ -24,6 +24,8 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
 export PATH := $(HOME)/.local/bin:$(HOME)/.cargo/bin:$(PATH)
+# Numbers awk prints feed other tools: no locale's decimal comma (0,25 under fr_FR).
+export LC_ALL := C
 
 RL       ?= data/rl
 DATA     ?= data
@@ -37,10 +39,13 @@ INPUT_DIRS ?= openings shards/elite_k32_v2
 # Self-play size: workers sharing the GPU(s), games in flight between them, GPU ids.
 WORKERS  ?= 4
 PARALLEL ?= 1024
-# Search threads per worker (THREADS), and the gate's games in flight and threads.
+# Search threads per worker (THREADS), the gate's games in flight and threads, and the most
+# games a gate and an anchor match play (up to 1000: the book's first 500 openings).
 THREADS  ?= 6
 MATCH_PARALLEL ?=
 MATCH_THREADS  ?=
+GATE_GAMES     ?=
+ANCHOR_GAMES   ?=
 GPUS     ?=
 HOURS    ?=
 MINUTES  ?= 15
@@ -51,7 +56,8 @@ PAUSE    ?= none
 WHEEL_TARGET ?= rust/target-wheel
 
 HF := uv run hf
-STATE := README.md history.tsv selfplay_hours forced_playouts policy_target rl_generation.log gates/*
+STATE := README.md history.tsv anchors.tsv selfplay_hours forced_playouts policy_target policy_temp \
+	fresh_full rl_generation.log gates/*
 # The loop's self-play settings (rl_generation.sh), for the benchmark.
 SELFPLAY_ARGS := --sims 800 --fast-sims 160 --full-frac 0.25 --cap-total all \
 	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2
@@ -88,6 +94,8 @@ data:  ## download the champion, the games, the loop's state and the inputs; reb
 	champ=$$(uv run python -c 'import json, sys; print(json.load(open(sys.argv[1]))["champion"])' $(RL)/models/champion.json)
 	echo "champion $$champ: downloading it, then the games and the loop's state, then the inputs"
 	$(HF) download $(MODELS) --include "$$champ/*" --local-dir $(RL)/models --quiet >/dev/null
+	# The anchors the gates hold candidates to (data/rl/anchors/v2.1, ...).
+	$(HF) download $(MODELS) --include "anchors/*" --local-dir $(RL) --quiet >/dev/null
 	$(HF) download $(GAMES) --repo-type dataset --local-dir $(RL) \
 		--include $(foreach f,$(STATE),"$(f)") --quiet >/dev/null
 	gens="$(strip $(GENS))"
@@ -142,12 +150,14 @@ validate:  ## check a generation's games, shards and training targets (GEN=gen15
 	gen=$${GEN:-$$(ls -d $(RL)/selfplay/gen[0-9][0-9]/.selfplay_done | tail -1 | xargs dirname | xargs basename)}
 	CUDA_VISIBLE_DEVICES= uv run python scripts/validate_selfplay.py $(RL)/selfplay/$$gen
 
-tune:  ## write WORKERS, PARALLEL, THREADS, GPUS (MATCH_PARALLEL, MATCH_THREADS, HOURS if given)
+tune:  ## write WORKERS, PARALLEL, THREADS, GPUS (MATCH_*, GATE_GAMES, ANCHOR_GAMES, HOURS if given)
 	echo $(WORKERS) > $(RL)/selfplay_workers
 	echo $(PARALLEL) > $(RL)/selfplay_parallel
 	echo $(THREADS) > $(RL)/selfplay_threads
 	$(if $(MATCH_PARALLEL),echo $(MATCH_PARALLEL) > $(RL)/match_parallel)
 	$(if $(MATCH_THREADS),echo $(MATCH_THREADS) > $(RL)/match_threads)
+	$(if $(GATE_GAMES),echo $(GATE_GAMES) > $(RL)/gate_games)
+	$(if $(ANCHOR_GAMES),echo $(ANCHOR_GAMES) > $(RL)/anchor_games)
 	$(if $(GPUS),echo $(GPUS) > $(RL)/selfplay_gpus,rm -f $(RL)/selfplay_gpus)
 	$(if $(HOURS),echo $(HOURS) > $(RL)/selfplay_hours)
 	echo "self-play: $(WORKERS) workers, $(PARALLEL) games in flight$(if $(GPUS), on GPUs $(GPUS)), $$(cat $(RL)/selfplay_hours 2>/dev/null || echo 8) h per generation"
