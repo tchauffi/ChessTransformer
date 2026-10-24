@@ -91,6 +91,11 @@ struct MatchConfig {
     rule_state_a: bool,
     #[serde(default)]
     rule_state_b: bool,
+    /// Net A / net B searches with the two-fold rule over the game history.
+    #[serde(default)]
+    twofold_history_a: bool,
+    #[serde(default)]
+    twofold_history_b: bool,
 }
 fn d_sims() -> u32 { 4000 }
 fn d_ponder() -> u32 { 2000 }
@@ -200,6 +205,7 @@ impl MatchEngine {
             sim_batch: cfg.sim_batch,
             tt_cap: cfg.tt_cap,
             rule_state: [cfg.rule_state_a, cfg.rule_state_b],
+            twofold_history: [cfg.twofold_history_a, cfg.twofold_history_b],
         };
         let mut m = MatchEngine {
             cfg, rules, params, fens, starts, a_white, games: Vec::new(), started: 0,

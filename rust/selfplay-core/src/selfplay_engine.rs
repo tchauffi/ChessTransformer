@@ -90,6 +90,9 @@ struct Config {
     /// Full searches start from a fresh tree (`SelfPlayRules::fresh_full`).
     #[serde(default)]
     fresh_full: bool,
+    /// The two-fold rule over the game history (`SearchParams::twofold_history`).
+    #[serde(default)]
+    twofold_history: bool,
 }
 fn d_games() -> usize { 128 }
 fn d_batch() -> usize { 16 }
@@ -196,6 +199,7 @@ impl SelfPlayEngine {
             c_puct: c.c_puct, fpu: c.fpu, prior_temp: c.prior_temp, tt_cap: c.tt_cap,
             cap_total_full: c.cap_total_full, cap_total_fast: c.cap_total_fast,
             rule_state: c.rule_state, forced_playouts: c.forced_playouts, fresh_full: c.fresh_full,
+            twofold_history: c.twofold_history,
         };
         let mut e = SelfPlayEngine {
             rules,

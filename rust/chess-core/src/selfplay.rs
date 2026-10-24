@@ -68,6 +68,8 @@ pub struct SelfPlayRules {
     /// spent at depth 1, without root noise or forced playouts, and were a third of
     /// the policy target on average in gen14.
     pub fresh_full: bool,
+    /// The two-fold rule over the game history (`SearchParams::twofold_history`).
+    pub twofold_history: bool,
 }
 
 pub struct Record {
@@ -129,6 +131,7 @@ impl SelfPlayGame {
             tt_cap: rules.tt_cap,
             legal_in_requests: true,
             rule_state: rules.rule_state,
+            twofold_history: rules.twofold_history,
             ..SearchParams::default()
         };
         let mut search = Search::new(NoEval, params);
@@ -365,7 +368,7 @@ mod tests {
             move_temp: 1.0, temp_plies: 10, resign_threshold: 2.0, resign_plies: 6,
             no_resign_frac: 0.1, max_plies: 40, sim_batch: 16, c_puct: 1.0, fpu: 0.2,
             prior_temp: 1.0, tt_cap: 2_000_000, cap_total_full: false, cap_total_fast: false,
-            rule_state: false, forced_playouts: 0.0, fresh_full: false,
+            rule_state: false, forced_playouts: 0.0, fresh_full: false, twofold_history: false,
         }
     }
 

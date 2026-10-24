@@ -108,6 +108,8 @@ def main() -> None:
         p.add_argument(f"--c-puct-{side}", type=float, default=None)
         p.add_argument(f"--fpu-{side}", type=float, default=None)
         p.add_argument(f"--prior-temp-{side}", type=float, default=None)
+        p.add_argument(f"--twofold-history-{side}", action="store_true",
+                       help="this net searches with the two-fold rule over the game history")
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--parallel-games", type=int, default=128, help="games in flight, all halves")
     p.add_argument("--engines", type=int, default=2,
@@ -156,8 +158,10 @@ def main() -> None:
         for key in ("c_puct", "fpu", "prior_temp"):
             v = getattr(args, f"{key}_{side}")
             cfg[f"{key}_{side}"] = v if v is not None else cfg[key]
+        cfg[f"twofold_history_{side}"] = getattr(args, f"twofold_history_{side}")
         search[side] = (f"c_puct {cfg[f'c_puct_{side}']}, fpu {cfg[f'fpu_{side}']}, "
-                        f"prior_temp {cfg[f'prior_temp_{side}']}")
+                        f"prior_temp {cfg[f'prior_temp_{side}']}"
+                        f"{', two-fold over history' if cfg[f'twofold_history_{side}'] else ''}")
     halves = [Half(cfg, lines, list(range(k, args.openings, k_eng))) for k in range(k_eng)]
     # Two compiled networks share the card: capture graphs up to 512 rows only (larger
     # batches are split), half of self-play's set.

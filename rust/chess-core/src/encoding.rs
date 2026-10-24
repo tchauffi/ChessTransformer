@@ -149,7 +149,8 @@ pub fn terminal_value(pos: &Chess, keys: &[u64], current: u64) -> Option<f32> {
 /// have deviated chose to repeat, and can keep repeating. Without this the
 /// search sees perpetuals and repetition draws only once the cycle comes
 /// round a third time, 4+ plies deeper than it needs to. Repetitions that
-/// reach back into the pre-root game history still need the full threefold.
+/// reach back into the pre-root game history still need the full threefold,
+/// unless the caller passes `root_idx` 0 (`SearchParams::twofold_history`).
 pub fn search_terminal_value(pos: &Chess, keys: &[u64], current: u64, root_idx: usize) -> Option<f32> {
     if let Some(t) = terminal_value(pos, keys, current) {
         return Some(t);

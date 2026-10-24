@@ -50,6 +50,11 @@ pub struct SearchParams {
     /// evaluations are cached per (position, rule state) instead of per position.
     /// Requests carry the rule state either way; off, the search is unchanged.
     pub rule_state: bool,
+    /// Lc0's two-fold rule over the game history too: a position inside the tree that
+    /// repeats any earlier one, before the root included, is a draw at its second
+    /// occurrence. Off, a repeat of a pre-root position needs the full threefold, so a
+    /// side ahead can shuffle back into the game's positions as if they were fresh.
+    pub twofold_history: bool,
     /// Syzygy tables. In-tree, positions reached by a capture or pawn move
     /// that the tables cover are scored exactly (WDL) instead of by the value
     /// head. At a covered root, a won position plays the DTZ-optimal move
@@ -70,6 +75,7 @@ impl Default for SearchParams {
             tt_cap: 2_000_000,
             legal_in_requests: false,
             rule_state: false,
+            twofold_history: false,
             syzygy: None,
         }
     }
@@ -693,7 +699,12 @@ impl<E: Evaluator> Search<E> {
             let key = zobrist(&pos);
             let mut all_keys = self.history.clone();
             all_keys.extend_from_slice(&path_keys);
-            let root_idx = self.history.len() - 1;
+            // The root itself is never a two-fold draw: its search picks the move.
+            let root_idx = if self.params.twofold_history && !path_keys.is_empty() {
+                0
+            } else {
+                self.history.len() - 1
+            };
             if let Some(t) = search_terminal_value(&pos, &all_keys, key, root_idx) {
                 backup_vl(&mut self.tree, &path, t);
                 job.sims_done += 1;
@@ -1173,6 +1184,36 @@ mod tests {
         // and the root value must be drawish, not a fantasy win.
         assert!(r.value.abs() < 0.5, "root value should be drawish, got {}", r.value);
         assert_eq!(r.sims, 128);
+    }
+
+    #[test]
+    fn twofold_history_draws_a_return_to_the_game() {
+        // K+R vs K back at the start for the 2nd time: Rh1-g1 returns to a position
+        // the game already had once. Plain, that is a fresh position worth a rook; with
+        // twofold_history it is a draw, every visit 0. The root, itself a repeat, still
+        // searches.
+        let start = pos("8/8/8/4k3/8/8/4K3/7R w - - 0 1");
+        let mut moves = Vec::new();
+        let mut p = start.clone();
+        for u in ["h1g1", "e5d5", "g1h1", "d5e5"] {
+            let m = mv(&p, u);
+            p.play_unchecked(&m);
+            moves.push(m);
+        }
+        let back = mv(&p, "h1g1");
+        let value_of_back = |twofold_history: bool| {
+            let params = SearchParams { twofold_history, ..SearchParams::default() };
+            let mut s = Search::new(CheckingMaterialEval, params);
+            s.set_position(start.clone(), &moves);
+            let r = s.go(400, None, &AtomicBool::new(false)).unwrap();
+            assert_eq!(r.sims, 400);
+            let root = s.root();
+            let i = root.moves.iter().position(|m| *m == back).unwrap();
+            assert!(root.n[i] > 0, "Rg1 should get visits");
+            root.w[i] / f64::from(root.n[i])
+        };
+        assert!(value_of_back(false).abs() > 0.1, "plain: Rg1 keeps the rook's value");
+        assert_eq!(value_of_back(true), 0.0, "twofold_history: Rg1 is a draw");
     }
 
     /// Value = material balance from the side to move's POV; policy = uniform

@@ -402,6 +402,9 @@ def main():
     p.add_argument("--fresh-full", action="store_true",
                    help="full searches start from a fresh tree instead of the reused one, whose "
                         "warm visits got no root noise or forced playouts. Not --legacy-engine")
+    p.add_argument("--twofold-history", action="store_true",
+                   help="Lc0's two-fold rule over the game history too: a search position that "
+                        "repeats any earlier one of the game is a draw. Not --legacy-engine")
     p.add_argument("--book", default=None,
                    help="also start games from this book's openings (gpu_match's format, e.g. "
                         "data/openings/book2k.json), mixed with the shallow built-in ones")
@@ -504,6 +507,7 @@ def main():
         "dirichlet_eps": args.dirichlet_eps,
         "forced_playouts": args.forced_playouts,
         "fresh_full": args.fresh_full,
+        "twofold_history": args.twofold_history,
     }
     openings = selfplay_openings(args)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
@@ -519,6 +523,9 @@ def main():
             print("WARNING: --legacy-engine has no forced playouts; searching without them", flush=True)
         if args.fresh_full:
             print("WARNING: --legacy-engine has no tree reuse; --fresh-full changes nothing", flush=True)
+        if args.twofold_history:
+            print("WARNING: --legacy-engine has no two-fold rule; --twofold-history changes nothing",
+                  flush=True)
         engines = [selfplay_core.Engine(json.dumps(cfg), openings, seed + id_offset, n_games)]
     else:
         cfg["tt_cap"] = min(args.tt_cap, 200_000)  # per game here, one shared TT in Engine
