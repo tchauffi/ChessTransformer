@@ -12,9 +12,8 @@ Games, to the dataset repo tchauffi/chesstransformer-rl-selfplay: every finished
 generation's self-play as selfplay/genNN/ (games.jsonl, the positions_*.npz training
 shards, heldout_games.json, generation_config.json), every finished match as
 gates/*.jsonl, and at the root the loop's state (history.tsv, anchors.tsv, selfplay_hours,
-forced_playouts, policy_target, policy_temp, fresh_full) and logs/rl_generation.log, so the
-repo mirrors data/rl/
-and `make data` rebuilds a machine from it. The generation in progress and a gate still
+forced_playouts, policy_target, policy_temp, fresh_full, full_frac) and logs/rl_generation.log,
+so the repo mirrors data/rl/ and `make data` rebuilds a machine from it. The generation in progress and a gate still
 being played are left for the next run.
 
 Inputs (`--only inputs`, once), to the dataset repo tchauffi/chesstransformer-inputs,
@@ -75,7 +74,7 @@ GAMES_REPO = "tchauffi/chesstransformer-rl-selfplay"
 INPUTS_REPO = "tchauffi/chesstransformer-inputs"
 # The loop's state; data/rl/selfplay_workers, _gpus and _parallel belong to the machine.
 STATE_FILES = ("history.tsv", "anchors.tsv", "selfplay_hours", "forced_playouts", "policy_target",
-               "policy_temp", "fresh_full")
+               "policy_temp", "fresh_full", "full_frac")
 INPUTS = ("openings", "shards/elite_k32_v2")
 CHAMPION_FILES = ("model.safetensors", "model_config.json", "model.onnx", "expert_iter_meta.json",
                   "SOURCE")

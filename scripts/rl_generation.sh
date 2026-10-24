@@ -22,6 +22,9 @@
 #    tree reuse (~800 fresh). CAP_TOTAL=all counts the reused tree's warm visits toward
 #    both budgets (fast: fast moves only; none: fresh sims on top of the reused tree, which
 #    cost 2.7x the old engine's evaluations per position in gen02's first half hour).
+#    Unset, FULL_FRAC is read from $RL/full_frac (default 0.25); 1 drops the fast moves, so
+#    every move is a full search (from gen15: the 160-sim fast moves chose most moves of the
+#    repetition draws that threw a win away, in positions the network called level).
 #    FORCED_PLAYOUTS=k adds KataGo forced playouts + policy target pruning to the full
 #    searches (k=2 in KataGo); unset, k is read from $RL/forced_playouts, which
 #    KATAGO_ON_FAIL=1 writes (k=2) the first time a candidate fails its gate.
@@ -84,7 +87,7 @@ RL="${RL:-data/rl}"
 SELFPLAY_HOURS="${SELFPLAY_HOURS:-$(cat "$RL/selfplay_hours" 2>/dev/null || echo 8)}"
 SIMS="${SIMS:-800}"
 FAST_SIMS="${FAST_SIMS:-160}"
-FULL_FRAC="${FULL_FRAC:-0.25}"
+FULL_FRAC="${FULL_FRAC:-$(cat "$RL/full_frac" 2>/dev/null || echo 0.25)}"
 CAP_TOTAL="${CAP_TOTAL:-all}"
 PARALLEL="${PARALLEL:-$(cat "$RL/selfplay_parallel" 2>/dev/null || echo 128)}"
 SELFPLAY_WORKERS="${SELFPLAY_WORKERS:-$(cat "$RL/selfplay_workers" 2>/dev/null || echo 1)}"
