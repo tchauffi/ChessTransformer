@@ -35,6 +35,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import queue
@@ -66,6 +67,9 @@ class Forward:
     def __init__(self, model_dir: str, device: str, use_ema: bool, compile_model: bool,
                  buckets: tuple[int, ...] = _BUCKETS):
         self.device = device
+        # Any CUDA device ("cuda", "cuda:2"): several Forwards can share one process, each
+        # on its own card (gpu_match --gpus).
+        self.cuda = torch.device(device).type == "cuda"
         self.buckets = buckets
         self.model = load_model(Path(model_dir), device).bfloat16().eval()
         # Search backs up a scalar; a WDL head is reduced to p(win) - p(loss).
@@ -76,22 +80,27 @@ class Forward:
             self.model.load_state_dict(ema, strict=False)
             self.model = self.model.bfloat16()
             print(f"EMA weights loaded ({len(ema)} tensors)")
-        if compile_model and device == "cuda":
+        if compile_model and self.cuda:
             self.model = torch.compile(self.model, mode="reduce-overhead")
         self.bufs = {}
         self.slots = {}  # async staging buffers, one set per in-flight batch
         # Warm up every bucket so CUDA-graph capture is up front -- under no_grad, as every
         # later call runs: in grad mode the warm-up kept every activation (7.5 GB on CPU at
         # batch 256) and compiled graphs that the no_grad calls then compiled again.
-        with torch.no_grad():
+        with torch.no_grad(), self._on():
             for b in buckets:
                 self._buffers(b)
                 bt, pl, ca, ep = self.bufs[b]
                 for _ in range(3):
                     self.model(bt, pl, ca, ep)
-        if device == "cuda":
-            torch.cuda.synchronize()
+        if self.cuda:
+            torch.cuda.synchronize(device)
             torch.cuda.empty_cache()  # the eager warm-up runs' blocks, not the graphs' pool
+
+    def _on(self):
+        """This Forward's card as the current device: CUDA graphs, streams and events
+        belong to the current device."""
+        return torch.cuda.device(self.device) if self.cuda else contextlib.nullcontext()
 
     def _buffers(self, bucket: int):
         if bucket not in self.bufs:
@@ -112,6 +121,10 @@ class Forward:
             l1, v1 = self(boards[:bucket], player[:bucket], castling[:bucket], ep[:bucket])
             l2, v2 = self(boards[bucket:], player[bucket:], castling[bucket:], ep[bucket:])
             return np.concatenate([l1, l2]), np.concatenate([v1, v2])
+        with self._on():
+            return self._call(n, bucket, boards, player, castling, ep)
+
+    def _call(self, n, bucket, boards, player, castling, ep):
         bt, pl, ca, e = self._buffers(bucket)
         bt.zero_(); pl.zero_(); ca.zero_(); e.zero_()
         bt[:n] = torch.from_numpy(boards.astype(np.int64)).to(self.device)
@@ -143,7 +156,7 @@ class Forward:
         if st is None or st["cap"] < n or st["wcap"] < width:
             cap = max(n, st["cap"] if st else 0, 64)
             wcap = max(width, st["wcap"] if st else 0, 64)
-            pin = self.device == "cuda"
+            pin = self.cuda
 
             def host(size, dtype):
                 return torch.zeros(size, dtype=dtype, pin_memory=pin)
@@ -152,7 +165,7 @@ class Forward:
                 return torch.zeros(size, dtype=dtype, device=self.device)
 
             st = {"cap": cap, "wcap": wcap,
-                  "event": torch.cuda.Event() if self.device == "cuda" else None,
+                  "event": torch.cuda.Event() if self.cuda else None,
                   "h_in": [host((cap, 64), torch.uint8)] + [host(cap, torch.uint8) for _ in range(3)],
                   "d_in": [dev((cap, 64), torch.uint8)] + [dev(cap, torch.uint8) for _ in range(3)],
                   "h_legal": host(cap * wcap, torch.int16), "d_legal": dev(cap * wcap, torch.int16),
@@ -165,6 +178,10 @@ class Forward:
                ep: np.ndarray, legal: np.ndarray):
         """Queue a forward; `wait(handle)` returns (legal logits (n, width), values (n,)).
         `legal` holds flat logit indices padded with 4672 (a zero column is appended)."""
+        with self._on():
+            return self._launch(slot, boards, player, castling, ep, legal)
+
+    def _launch(self, slot, boards, player, castling, ep, legal):
         n, width = len(player), legal.shape[1]
         st = self._slot(slot, n, width)
         for h, d, a in zip(st["h_in"], st["d_in"], (boards, player, castling, ep)):

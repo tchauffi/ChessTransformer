@@ -18,6 +18,10 @@ threefold / 50-move / insufficient material, or at --max-plies; no resignation.
 The games file has head_to_head.py's columns (idx, start, a_white, result,
 score_a, plies), so every scorer of gate files reads it unchanged.
 
+``--gpus 0,1,2,3`` deals the engine halves round-robin over those cards (--engines
+halves per card), each card with its own copy of both networks; one Python thread
+drives them all, as the forwards only queue work and wait on events.
+
 Usage
 -----
     uv run python scripts/gpu_match.py --model-a data/rl/models/cand02 \\
@@ -113,8 +117,10 @@ def main() -> None:
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--parallel-games", type=int, default=128, help="games in flight, all halves")
     p.add_argument("--engines", type=int, default=2,
-                   help="engine halves taking turns on the GPU (2 = the CPU searches one while "
+                   help="engine halves taking turns on each GPU (2 = the CPU searches one while "
                         "the GPU evaluates the other); 1 = no overlap")
+    p.add_argument("--gpus", default="",
+                   help="comma-separated GPU ids to spread the halves over (default: --device)")
     p.add_argument("--threads", type=int, default=4,
                    help="CPU threads for the searches (the lichess bot shares the CPU by day)")
     p.add_argument("--tt-cap", type=int, default=150_000,
@@ -140,7 +146,8 @@ def main() -> None:
     lines = [o["fen"] for o in json.loads(args.book.read_text())["openings"]]
     if not 1 <= args.openings <= len(lines):
         p.error(f"--openings must be in 1..{len(lines)}")
-    k_eng = max(1, min(args.engines, args.openings))
+    devices = [f"cuda:{g}" for g in args.gpus.split(",") if g] or [args.device]
+    k_eng = max(1, min(args.engines * len(devices), args.openings))
     cfg = {
         "sims": args.max_sims,
         "ponder_sims": args.ponder_max_sims,
@@ -165,14 +172,16 @@ def main() -> None:
     halves = [Half(cfg, lines, list(range(k, args.openings, k_eng))) for k in range(k_eng)]
     # Two compiled networks share the card: capture graphs up to 512 rows only (larger
     # batches are split), half of self-play's set.
-    forwards = [Forward(m, args.device, False, not args.no_compile, buckets=(64, 128, 256, 512))
-                for m in (args.model_a, args.model_b)]
-    for fwd in forwards:
+    # Half k runs on devices[k % len(devices)]: both colours of an opening stay on one card.
+    forwards = [[Forward(m, d, False, not args.no_compile, buckets=(64, 128, 256, 512))
+                 for m in (args.model_a, args.model_b)] for d in devices]
+    for fwd in (f for pair in forwards for f in pair):
         fwd.verify_every = args.verify_every
     n_games = 2 * args.openings
     print(f"{la}: {args.model_a} ({search['a']})\n{lb}: {args.model_b} ({search['b']})\n"
           f"{args.openings} openings x 2 colours = {n_games} games, {args.max_sims} sims/move "
           f"+ {args.ponder_max_sims} ponder, {min(args.parallel_games, n_games)} at once"
+          f"{f' on {len(devices)} GPUs' if len(devices) > 1 else ''}"
           f"{', SPRT' if args.sprt else ''}\n", flush=True)
 
     games_out = args.games_out.open("a") if args.games_out else None
@@ -211,7 +220,7 @@ def main() -> None:
             if decided is not None:
                 break
             if not half.engine.done():
-                half.launch(forwards, k)
+                half.launch(forwards[k % len(devices)], k)
     if games_out:
         games_out.close()
 

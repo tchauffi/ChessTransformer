@@ -97,6 +97,8 @@ SELFPLAY_GPUS="${SELFPLAY_GPUS:-$(cat "$RL/selfplay_gpus" 2>/dev/null)}"
 SELFPLAY_THREADS="${SELFPLAY_THREADS:-$(cat "$RL/selfplay_threads" 2>/dev/null || echo 6)}"
 MATCH_PARALLEL="${MATCH_PARALLEL:-$(cat "$RL/match_parallel" 2>/dev/null || echo 128)}"
 MATCH_THREADS="${MATCH_THREADS:-$(cat "$RL/match_threads" 2>/dev/null || echo 4)}"
+# The GPUs the matches spread their engine halves over (gpu_match --gpus): self-play's.
+MATCH_GPUS="${MATCH_GPUS-$SELFPLAY_GPUS}"
 WINDOW="${WINDOW:-2}"
 EPOCHS="${EPOCHS:-1}"
 FRESH_ONLY="${FRESH_ONLY:-1}"
@@ -147,7 +149,7 @@ match() {
     uv run python scripts/gpu_match.py --model-a "$a" --model-b "$b" --label-a "$la" \
       --label-b "$lb" --openings $((n / 2)) --max-sims "$MATCH_SIMS" \
       --ponder-max-sims "$PONDER_SIMS" --parallel-games "$MATCH_PARALLEL" --threads "$MATCH_THREADS" \
-      --games-out "$out" "$@" $extra | tail -14 && { touch "$out.done"; return 0; }
+      ${MATCH_GPUS:+--gpus "$MATCH_GPUS"} --games-out "$out" "$@" $extra | tail -14 && { touch "$out.done"; return 0; }
     log "match failed${extra:+ ($extra)}"
   done
   return 1
