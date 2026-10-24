@@ -9,7 +9,7 @@ services:
     ports:
       - "5001:5001"
     environment:
-      - MCTS_SIMS=800
+      - MCTS_SIMS=2000
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5001/api/health"]
