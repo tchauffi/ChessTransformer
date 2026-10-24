@@ -3,7 +3,9 @@
 #   make setup              uv, Rust, the Python env, the self-play engine and the data
 #   make check              GPU and engine, then a short self-play smoke test on the champion
 #   make bench              self-play games/h at WORKERS x PARALLEL (try a few before `make tune`)
+#   make bench-forward      the GPU's evals/s by batch size, the ceiling `make bench` compares to
 #   make tune               this machine's self-play size, written to data/rl/ for the loop
+#   make validate           check a generation's games, shards and training targets
 #   make loop               generations back to back until `make stop` (run it inside tmux)
 #   make status             the live status page (localhost:8765; reach it with ssh -L 8765:localhost:8765)
 #
@@ -54,7 +56,7 @@ STATE := README.md history.tsv selfplay_hours forced_playouts policy_target rl_g
 SELFPLAY_ARGS := --sims 800 --fast-sims 160 --full-frac 0.25 --cap-total all \
 	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2
 
-.PHONY: help setup tools env engine data check bench tune mps loop stop status backup push-inputs
+.PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop stop status backup push-inputs
 
 help:  ## this list
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/:[^#]*## /\t/' | column -t -s $$'\t'
@@ -132,6 +134,13 @@ bench:  ## self-play games/h at WORKERS x PARALLEL for MINUTES, the loop's setti
 		--workers $(WORKERS) --threads $(THREADS) $(if $(GPUS),--gpus $(GPUS)) --seed 999 $(SELFPLAY_ARGS) \
 		| awk '/ games \| / { if (++n % 25 == 0) print; next } !/wrote positions/'
 	nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader
+
+bench-forward:  ## the GPU's evals/s by batch size: self-play's ceiling (TOP=2048 tries a bigger top bucket)
+	uv run python scripts/bench_forward.py --model $(RL)/champion $(if $(TOP),--top $(TOP))
+
+validate:  ## check a generation's games, shards and training targets (GEN=gen15; default: latest done)
+	gen=$${GEN:-$$(ls -d $(RL)/selfplay/gen[0-9][0-9]/.selfplay_done | tail -1 | xargs dirname | xargs basename)}
+	CUDA_VISIBLE_DEVICES= uv run python scripts/validate_selfplay.py $(RL)/selfplay/$$gen
 
 tune:  ## write WORKERS, PARALLEL, THREADS, GPUS (MATCH_PARALLEL, MATCH_THREADS, HOURS if given)
 	echo $(WORKERS) > $(RL)/selfplay_workers
