@@ -419,7 +419,12 @@ def main():
                         "are dropped); 0 = no limit")
     p.add_argument("--parallel-games", type=int, default=64)
     p.add_argument("--sim-batch", type=int, default=16,
-                   help="leaves per search wave (the bot's --sim-batch)")
+                   help="leaves per search wave (the bot's --sim-batch); above 16 needs --wide-batch")
+    p.add_argument("--wide-batch", action="store_true",
+                   help="allow --sim-batch above 16, which weakens the search: at 64 leaves, 46%% "
+                        "of the sims revisit a pending leaf and the best move matches sequential "
+                        "search 83%% of the time (16: 79%% new evals, 85%%); feed the GPU with "
+                        "more games instead")
     p.add_argument("--threads", type=int, default=6, help="CPU threads for the searches")
     p.add_argument("--legacy-engine", action="store_true",
                    help="the older self-play search (immediate TT backups, no tree reuse)")
@@ -449,6 +454,9 @@ def main():
     p.add_argument("--worker", type=int, default=None, help=argparse.SUPPRESS)  # set by run_workers
     p.add_argument("--id-offset", type=int, default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.sim_batch > 16 and not args.wide_batch:
+        p.error("--sim-batch above 16 weakens the search (see --wide-batch); raise "
+                "--parallel-games or --workers to give the GPU bigger batches")
     if not 0.0 <= args.book_share <= 1.0:
         p.error("--book-share must be in [0, 1]")
 
