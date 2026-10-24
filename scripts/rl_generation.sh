@@ -28,9 +28,12 @@
 #    Games start from BOOK's openings (book2k: 2000 positions 8 plies deep) on BOOK_SHARE of
 #    them, past the first BOOK_SKIP that the gates and anchor matches play, and from the 82
 #    shallow built-in openings on the rest, so the first moves keep self-play data; up to
-#    gen14 every game started from those 82. FRESH_FULL=1 ($RL/fresh_full) gives full
-#    searches a fresh tree: a reused subtree's warm visits, spent at depth 1 without root
-#    noise or forced playouts, were a third of gen14's policy targets on average.
+#    gen14 every game started from those 82. Full searches start from a fresh tree (from
+#    gen15; FRESH_FULL=0 or $RL/fresh_full reuses it, as up to gen14): a reused subtree's warm
+#    visits, spent at depth 1 without root noise or forced playouts, were a third of gen14's
+#    policy targets on average. It costs no GPU work -- the positions a fresh tree expands
+#    again are in the game's evaluation cache (192 evaluations per move vs 195) -- only
+#    search time on the CPU, which has plenty to spare.
 # 2. Train. A candidate from the champion, EPOCHS passes over the last WINDOW generations
 #    of self-play: policy on the visit distributions, WDL value on the outcome mixed 50/50
 #    with the root Q (less label variance -- the value head overfit last time), KL-anchored
@@ -110,7 +113,7 @@ FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(cat "$RL/forced_playouts" 2>/dev/null || e
 KATAGO_ON_FAIL="${KATAGO_ON_FAIL:-0}"
 POLICY_TARGET="${POLICY_TARGET:-$(cat "$RL/policy_target" 2>/dev/null || echo visits)}"
 POLICY_TEMP="${POLICY_TEMP:-$(cat "$RL/policy_temp" 2>/dev/null || echo 1.0)}"
-FRESH_FULL="${FRESH_FULL:-$(cat "$RL/fresh_full" 2>/dev/null || echo 0)}"
+FRESH_FULL="${FRESH_FULL:-$(cat "$RL/fresh_full" 2>/dev/null || echo 1)}"
 # Self-play openings: BOOK's past its first BOOK_SKIP (the gates' and anchors'), on BOOK_SHARE
 # of the games; BOOK= (empty) keeps the shallow built-in ones only.
 BOOK="${BOOK-data/openings/book2k.json}"

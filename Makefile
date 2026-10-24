@@ -60,7 +60,8 @@ STATE := README.md history.tsv anchors.tsv selfplay_hours forced_playouts policy
 	fresh_full rl_generation.log gates/*
 # The loop's self-play settings (rl_generation.sh), for the benchmark.
 SELFPLAY_ARGS := --sims 800 --fast-sims 160 --full-frac 0.25 --cap-total all \
-	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2
+	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2 --fresh-full \
+	--book data/openings/book2k.json
 
 .PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop stop status backup push-inputs
 
@@ -128,7 +129,7 @@ check:  ## the GPU and the engine, then 2 self-play workers on the champion for 
 	rm -rf /tmp/ct-smoke
 	uv run python scripts/selfplay_rust.py --model $(RL)/champion --out /tmp/ct-smoke --games 64 \
 		--sims 64 --fast-sims 16 --max-plies 60 --parallel-games 64 --workers 2 --max-hours 0.02 \
-		--forced-playouts 2 --dirichlet-alpha 0.3 | grep -vE "wrote positions"
+		--forced-playouts 2 --dirichlet-alpha 0.3 --fresh-full | grep -vE "wrote positions"
 	# The loop's engine records the root search over every legal move (gen03 onwards).
 	uv run python -c "import glob, numpy as np; \
 		d = np.load(sorted(glob.glob('/tmp/ct-smoke/positions_*.npz'))[0]); \
