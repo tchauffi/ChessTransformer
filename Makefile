@@ -114,8 +114,12 @@ check:  ## the GPU and the engine, then 2 self-play workers on the champion for 
 	rm -rf /tmp/ct-smoke
 	uv run python scripts/selfplay_rust.py --model $(RL)/champion --out /tmp/ct-smoke --games 64 \
 		--sims 64 --fast-sims 16 --max-plies 60 --parallel-games 64 --workers 2 --max-hours 0.02 \
-		| grep -vE "wrote positions"
-	echo "smoke test: $$(wc -l < /tmp/ct-smoke/games.jsonl) games written"
+		--forced-playouts 2 --dirichlet-alpha 0.3 | grep -vE "wrote positions"
+	# The loop's engine records the root search over every legal move (gen03 onwards).
+	uv run python -c "import glob, numpy as np; \
+		d = np.load(sorted(glob.glob('/tmp/ct-smoke/positions_*.npz'))[0]); \
+		assert 'legal_q' in d, 'this engine does not record the root search: not the loop engine'"
+	echo "smoke test: $$(wc -l < /tmp/ct-smoke/games.jsonl) games written, forced playouts on"
 
 bench:  ## self-play games/h at WORKERS x PARALLEL for MINUTES, the loop's settings (data/rl untouched)
 	out=/tmp/ct-bench-$(WORKERS)x$(PARALLEL); rm -rf $$out
