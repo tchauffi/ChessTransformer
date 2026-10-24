@@ -53,6 +53,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from chesstransformer.evaluation.sprt import (  # noqa: E402
+    complete_prefix,
     pair_up,
     sprt_bounds,
     sprt_decision,
@@ -173,9 +174,10 @@ def gate_stats(path: Path) -> dict | None:
             rows.append(json.loads(line))
         except ValueError:
             pass  # a game still being written
-    res = {(r["idx"], r["a_white"]): r["score_a"] for r in rows}
+    # Paired figures on the openings done from the first one on, which the gate's SPRT judges.
+    res = complete_prefix({(r["idx"], r["a_white"]): r["score_a"] for r in rows})
     pairs = pair_up(res)
-    s = summarize(pairs, [res[k] for k in res if (k[0], not k[1]) in res])
+    s = summarize(pairs, list(res.values()))
     llr = sprt_llr(pairs)
     out = {
         "games": len(rows), "pairs": s.n_pairs, "score": s.score, "penta": list(s.counts),

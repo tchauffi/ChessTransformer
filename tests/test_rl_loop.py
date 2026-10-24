@@ -52,6 +52,15 @@ def test_the_command_line_takes_negative_bounds(tmp_path):
     assert (games, pairs, decision.strip()) == ("256", "128", "-") and float(llr) > 0
 
 
+def test_the_verdict_judges_the_openings_done_from_the_first_one_on(tmp_path):
+    f = _games(tmp_path / "g.jsonl", [1, 10, 67, 25, 4])
+    rows = f.read_text().splitlines()
+    first = [r for r in rows if json.loads(r)["idx"] == 0]
+    f.write_text("\n".join(r for r in rows if r not in first[1:]) + "\n")  # opening 0 unfinished
+    v = verdict(f, 0, 15)
+    assert (v["games"], v["pairs"], v["decision"]) == (0, 0, None)
+
+
 def test_selfplay_mixes_book_openings_past_the_gates_ones(tmp_path):
     selfplay_rust = pytest.importorskip("selfplay_rust")
     book = tmp_path / "book.json"

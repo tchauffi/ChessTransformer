@@ -75,6 +75,22 @@ class MatchStats:
         return score_to_elo(lo), score_to_elo(hi)
 
 
+def complete_prefix(results: dict[tuple[int, bool], float]) -> dict[tuple[int, bool], float]:
+    """The results of openings 0..K-1, K the first opening still missing a colour.
+
+    A match plays many games at once and the short ones finish first, so the pairs done at
+    any moment over-sample short games, which score differently: gen14 vs v2.1 at prior
+    temperature 1.3 scored 0.38 in games under 100 plies and 0.57 above, and six gates
+    stopped before opening 0 was done. Openings are dispatched in index order, so a
+    complete prefix samples the book whatever the games' lengths; a sequential test must
+    look at nothing else.
+    """
+    k = 0
+    while (k, True) in results and (k, False) in results:
+        k += 1
+    return {key: s for key, s in results.items() if key[0] < k}
+
+
 def pair_up(results: dict[tuple[int, bool], float]) -> list[float]:
     """Collapse per-game scores into pair scores in [0, 2].
 

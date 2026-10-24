@@ -42,6 +42,7 @@ import selfplay_core  # noqa: E402
 from selfplay_rust import Forward  # noqa: E402
 
 from chesstransformer.evaluation.sprt import (  # noqa: E402
+    complete_prefix,
     format_report,
     pair_up,
     sprt_decision,
@@ -118,7 +119,8 @@ def main() -> None:
                    help="TT entries per search; it only caches evaluations, so it changes the "
                         "GPU work, not the moves")
     p.add_argument("--sprt", action="store_true",
-                   help="stop once the paired SPRT decides H0 vs H1 (games in flight are dropped)")
+                   help="stop once the paired SPRT decides H0 vs H1 on the openings done so far "
+                        "from the first one on (games in flight are dropped)")
     p.add_argument("--elo0", type=float, default=0.0)
     p.add_argument("--elo1", type=float, default=15.0)
     p.add_argument("--alpha", type=float, default=0.05)
@@ -193,7 +195,7 @@ def main() -> None:
                         "score_a": s, "plies": len(g["moves"]), "end": g["end"]}) + "\n")
                     games_out.flush()
                 if args.sprt and decided is None:
-                    pairs = pair_up(results)
+                    pairs = pair_up(complete_prefix(results))
                     llr = sprt_llr(pairs, args.elo0, args.elo1)
                     verdict = sprt_decision(llr, args.alpha, args.beta,
                                             min_pairs_met=len(pairs) >= args.min_pairs)
@@ -201,6 +203,7 @@ def main() -> None:
                         decided = (verdict, llr, len(pairs))
                         print(f"  SPRT decided {verdict} after {len(pairs)} pairs (LLR {llr:+.2f}); "
                               f"games in flight are dropped", flush=True)
+                        break  # the games file ends on the deciding game
             if decided is not None:
                 break
             if not half.engine.done():
@@ -208,6 +211,10 @@ def main() -> None:
     if games_out:
         games_out.close()
 
+    # The report covers the openings the test judged: for a stopped match, the complete
+    # prefix, which leaves out the games that finished early because they were short.
+    if decided:
+        results = complete_prefix(results)
     pairs = pair_up(results)
     scores = list(results.values())
     llr = decided[1] if decided else sprt_llr(pairs, args.elo0, args.elo1)

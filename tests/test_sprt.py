@@ -7,12 +7,14 @@ rates rather than exercising the API.
 
 from __future__ import annotations
 
+import heapq
 import math
 import random
 
 import pytest
 
 from chesstransformer.evaluation.sprt import (
+    complete_prefix,
     elo_to_score,
     format_report,
     pair_up,
@@ -46,6 +48,52 @@ def test_pair_up_drops_half_finished_pairs():
     """An interrupted match must not contribute a one-sided opening."""
     results = {(0, True): 1.0, (0, False): 0.5, (1, True): 1.0}
     assert pair_up(results) == [1.5]
+
+
+def test_complete_prefix_stops_at_the_first_unfinished_opening():
+    results = {(0, True): 1.0, (0, False): 0.5, (1, True): 0.0, (2, True): 1.0, (2, False): 1.0}
+    assert complete_prefix(results) == {(0, True): 1.0, (0, False): 0.5}
+    assert complete_prefix({(1, True): 1.0, (1, False): 1.0}) == {}
+
+
+def _finish_order(rng, openings=200, parallel=128):
+    """A match's games in the order they finish: dispatched by opening, `parallel` at once.
+    Half the games are short (20-100 plies) and score 0.38 for A, half long and score 0.57,
+    as gen14 at prior temperature 1.3 did against v2.1."""
+    games = [(i, w) for i in range(openings) for w in (True, False)]
+    running, order, nxt = [], [], 0
+
+    def start(t):
+        nonlocal nxt
+        short, u = rng.random() < 0.5, rng.random()
+        if short:
+            length, s = rng.uniform(20, 100), 1.0 if u < 0.10 else 0.0 if u < 0.44 else 0.5
+        else:
+            length, s = rng.uniform(100, 200), 1.0 if u < 0.30 else 0.0 if u < 0.46 else 0.5
+        heapq.heappush(running, (t + length, games[nxt], s))
+        nxt += 1
+
+    while nxt < len(games) and len(running) < parallel:
+        start(0.0)
+    while running:
+        t, g, s = heapq.heappop(running)
+        order.append((g, s))
+        if nxt < len(games):
+            start(t)
+    return order
+
+
+def test_a_complete_prefix_is_not_biased_toward_short_games():
+    """Two-thirds into a match, the pairs done so far over-sample short games and read
+    low; the openings done from the first one on read the true 0.475."""
+    rng = random.Random(0)
+    done, prefix = [], []
+    for _ in range(200):
+        res = dict(_finish_order(rng)[:260])
+        for out, pairs in ((done, pair_up(res)), (prefix, pair_up(complete_prefix(res)))):
+            out.append(sum(pairs) / len(pairs) / 2)
+    assert sum(done) / len(done) < 0.475 - 0.007
+    assert sum(prefix) / len(prefix) == pytest.approx(0.475, abs=0.006)
 
 
 # --- Pentanomial bookkeeping --------------------------------------------------

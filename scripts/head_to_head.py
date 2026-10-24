@@ -34,6 +34,7 @@ import chess.engine
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from chesstransformer.evaluation.sprt import (  # noqa: E402
+    complete_prefix,
     format_report,
     pair_up,
     sprt_decision,
@@ -296,7 +297,7 @@ def main() -> None:
                             "score_a": s, "plies": plies, "min_men": min_men}) + "\n")
                         games_out.flush()
                     if args.sprt and not stop.is_set():
-                        pairs = pair_up(results)
+                        pairs = pair_up(complete_prefix(results))
                         llr = sprt_llr(pairs, args.elo0, args.elo1)
                         verdict = sprt_decision(llr, args.alpha, args.beta,
                                                 min_pairs_met=len(pairs) >= args.min_pairs)
