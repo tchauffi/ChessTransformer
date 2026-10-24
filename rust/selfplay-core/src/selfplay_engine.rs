@@ -35,7 +35,10 @@ fn legal_rows<'a>(reqs: impl Iterator<Item = &'a chess_core::search::EvalRequest
     (flat, width, lens)
 }
 
+// Unknown settings are an error: an engine built without a feature would otherwise
+// ignore its setting silently (a build without forced playouts dropped them).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     num_sims: u32,
     #[serde(default = "d_games")]

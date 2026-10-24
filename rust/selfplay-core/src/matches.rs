@@ -43,6 +43,7 @@ fn legal_rows<'a>(reqs: impl Iterator<Item = &'a chess_core::search::EvalRequest
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // as SelfPlayEngine's Config: a setting this build lacks is an error
 struct MatchConfig {
     /// Per-move fresh-sims cap (ct-bot `--max-sims`, 4000 for bullet/blitz).
     #[serde(default = "d_sims")]

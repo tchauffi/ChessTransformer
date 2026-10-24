@@ -477,6 +477,7 @@ def main():
         engines = [selfplay_core.Engine(json.dumps(cfg), openings, seed + id_offset, n_games)]
     else:
         cfg["tt_cap"] = min(args.tt_cap, 200_000)  # per game here, one shared TT in Engine
+        del cfg["leaves_per_wave"]  # the legacy engine's batching; this one rejects unknown keys
         k_eng = max(1, args.engines)
         cfg["num_parallel_games"] = max(1, parallel // k_eng)
         engines = [selfplay_core.SelfPlayEngine(
