@@ -208,6 +208,29 @@ def test_dataset_takes_gumbel_targets_from_the_root_search_columns(tmp_path):
         SelfplayDataset([tmp_path], policy_target="gumbel")
 
 
+def test_policy_temperature_softens_the_visit_target(tmp_path):
+    from train_expert_iter import SelfplayDataset, collate
+    P = 2
+    shard = dict(boards=np.zeros((P, 64), np.uint8), player=np.ones(P, np.uint8), castling=np.zeros(P, np.uint8),
+                 ep=np.zeros(P, np.uint8), halfmove=np.zeros(P, np.uint16), z=np.zeros(P, np.float32),
+                 root_v=np.zeros(P, np.float32), full=np.ones(P, np.uint8), game_id=np.zeros(P, np.uint32),
+                 visit_idx=np.array([3, 9, 40, 5, 6], np.uint16),
+                 visit_cnt=np.array([600, 150, 50, 1, 1], np.uint16), visit_ptr=np.array([0, 3, 5]))
+    np.savez(tmp_path / "positions_0000.npz", **shard)
+
+    def target(t):
+        ds = SelfplayDataset([tmp_path], policy_temp=t)
+        return collate([ds[0], ds[1]])[-1].numpy()
+
+    p1, p2 = target(1.0), target(2.0)
+    np.testing.assert_allclose(p1[0, [3, 9, 40]], [0.75, 0.1875, 0.0625], rtol=1e-6)
+    root = np.sqrt([600, 150, 50])  # visits^(1/2), normalised
+    np.testing.assert_allclose(p2[0, [3, 9, 40]], root / root.sum(), rtol=1e-5)
+    np.testing.assert_allclose(p2[1, [5, 6]], [0.5, 0.5])
+    np.testing.assert_allclose(p2.sum(1), 1.0, rtol=1e-6)
+    assert p2[0].argmax() == p1[0].argmax() == 3
+
+
 def _shard(game_ids):
     P = len(game_ids)
     return dict(boards=np.zeros((P, 64), np.uint8), player=np.ones(P, np.uint8), castling=np.zeros(P, np.uint8),

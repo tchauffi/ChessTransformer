@@ -169,7 +169,7 @@ class SelfplayDataset(Dataset):
     """
 
     def __init__(self, data_dirs: list[Path], policy_target: str = "visits", gumbel: dict | None = None,
-                 gumbel_fast: bool = False):
+                 gumbel_fast: bool = False, policy_temp: float = 1.0):
         boards, player, castling, ep, halfmove, z, root_v, game_id, full = ([] for _ in range(9))
         v_idx, v_cnt, v_len = [], [], []
         skipped = n_shards = 0
@@ -200,7 +200,10 @@ class SelfplayDataset(Dataset):
                     v_len.append(np.diff(d["legal_ptr"]))
                 else:
                     v_idx.append(d["visit_idx"])
-                    v_cnt.append(d["visit_cnt"])
+                    # A target temperature T > 1 softens the visit distribution (visits^(1/T),
+                    # normalised in collate): pruned 800-sim targets are sharper than the net.
+                    v_cnt.append(d["visit_cnt"] if policy_temp == 1.0
+                                 else d["visit_cnt"].astype(np.float32) ** (1.0 / policy_temp))
                     v_len.append(np.diff(d["visit_ptr"]))  # per-position support length
 
         if not boards:
@@ -439,6 +442,8 @@ def main():
     p.add_argument("--policy-target", choices=["visits", "gumbel"], default="visits",
                    help="policy target: the visit distribution, or Gumbel MuZero's completed-Q "
                         "improved policy (needs self-play with the root search columns)")
+    p.add_argument("--policy-temp", type=float, default=1.0,
+                   help="visit-target temperature: train on visits^(1/T), T > 1 softer (visits only)")
     p.add_argument("--gumbel-c-visit", type=float, default=50.0)
     p.add_argument("--gumbel-c-scale", type=float, default=0.1)
     p.add_argument("--gumbel-rescale", action="store_true",
@@ -463,7 +468,7 @@ def main():
     ds = SelfplayDataset([Path(d) for d in args.data], policy_target=args.policy_target,
                          gumbel=dict(c_visit=args.gumbel_c_visit, c_scale=args.gumbel_c_scale,
                                      rescale=args.gumbel_rescale),
-                         gumbel_fast=args.gumbel_fast)
+                         gumbel_fast=args.gumbel_fast, policy_temp=args.policy_temp)
     games = np.unique(ds.game_id)
     val_parts = {name: idx for name, idx in heldout_split(ds.game_id, args.data, args.val_frac, args.seed).items()
                  if len(idx)}
@@ -646,6 +651,7 @@ def main():
     meta = {"base": str(args.base), "data": [str(d) for d in args.data], "epochs": epoch,
             "steps": step, "select": args.select,
             "kl_coef": args.kl_coef, "value_weight": args.value_weight, "soft_mix": args.soft_mix,
+            "policy_target": args.policy_target, "policy_temp": args.policy_temp,
             "new_lr_mult": args.new_lr_mult, "human_elo_gap": args.human_elo_gap,
             "train_dropout": args.train_dropout, "compile": args.compile,
             "human_shards": args.human_shards, "human_frac": args.human_frac if args.human_shards else 0.0,
