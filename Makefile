@@ -11,8 +11,10 @@
 # the champions (MODELS), the games and the loop's state (GAMES) and the inputs (INPUTS). Log in
 # first with `uv run hf auth login`, or export HF_TOKEN. Variables override on the command line:
 #
-#   make data GENS="gen14 gen15"      only those self-play generations (the loop trains on the
-#                                     ones after the champion; older ones are history)
+#   make data GENS="gen14 gen15"      those self-play generations' games, or GENS=all for every one
+#                                     (default: the ones after the champion, all the loop trains
+#                                     on; each generation is hundreds of files, and HF allows
+#                                     1000 requests per 5 minutes)
 #   make bench WORKERS=4 PARALLEL=1024 MINUTES=15
 #   make tune WORKERS=4 PARALLEL=1024 HOURS=6
 
@@ -26,7 +28,8 @@ DATA     ?= data
 MODELS   ?= tchauffi/chesstransformer-rl
 GAMES    ?= tchauffi/chesstransformer-rl-selfplay
 INPUTS   ?= tchauffi/chesstransformer-inputs
-# Self-play generations to download (default: all), and the input folders under data/.
+# Self-play generations to download (default: those after the champion; all), and the input
+# folders under data/.
 GENS       ?=
 INPUT_DIRS ?= openings shards/elite_k32_v2
 # Self-play size: workers sharing the GPU(s), games in flight between them, GPU ids.
@@ -43,7 +46,6 @@ WHEEL_TARGET ?= rust/target-wheel
 
 HF := uv run hf
 STATE := README.md history.tsv selfplay_hours forced_playouts policy_target rl_generation.log gates/*
-GAMES_INCLUDE = $(if $(strip $(GENS)),--include $(foreach f,$(STATE) $(foreach g,$(GENS),selfplay/$(g)/*),"$(f)"))
 # The loop's self-play settings (rl_generation.sh), for the benchmark.
 SELFPLAY_ARGS := --sims 800 --fast-sims 160 --full-frac 0.25 --cap-total all \
 	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2
@@ -80,7 +82,18 @@ data:  ## download the champion, the games, the loop's state and the inputs; reb
 	champ=$$(uv run python -c 'import json, sys; print(json.load(open(sys.argv[1]))["champion"])' $(RL)/models/champion.json)
 	echo "champion $$champ: downloading it, then the games and the loop's state, then the inputs"
 	$(HF) download $(MODELS) --include "$$champ/*" --local-dir $(RL)/models --quiet >/dev/null
-	$(HF) download $(GAMES) --repo-type dataset --local-dir $(RL) $(GAMES_INCLUDE) --quiet >/dev/null
+	$(HF) download $(GAMES) --repo-type dataset --local-dir $(RL) \
+		--include $(foreach f,$(STATE),"$(f)") --quiet >/dev/null
+	gens="$(strip $(GENS))"
+	if [[ -z $$gens ]]; then  # FRESH_ONLY: the loop trains only on the generations after the champion
+		gens=$$(awk -v c=$${champ#gen} 'NR > 1 && substr($$1, 4) + 0 > c + 0 { print $$1 }' $(RL)/history.tsv)
+	fi
+	if [[ $$gens == all ]]; then
+		$(HF) download $(GAMES) --repo-type dataset --local-dir $(RL) --quiet >/dev/null
+	elif [[ -n $$gens ]]; then
+		pats=(); for g in $$gens; do pats+=("selfplay/$$g/*"); done
+		$(HF) download $(GAMES) --repo-type dataset --local-dir $(RL) --include "$${pats[@]}" --quiet >/dev/null
+	fi
 	$(HF) download $(INPUTS) --repo-type dataset --local-dir $(DATA) \
 		--include $(foreach d,$(INPUT_DIRS),"$(d)/*") --quiet >/dev/null
 	# Every generation history.tsv records is finished: mark it so, as the loop left it.
