@@ -1,43 +1,37 @@
 #!/usr/bin/env bash
-# Assemble a self-contained Hugging Face Space in hf_space/space_build/, ready to
-# push to a Space git remote. Bundles the app, slim requirements, the
-# chesstransformer package source, and the v2.1 model weights.
+# Assemble the Hugging Face Docker Space in hf_space/space_build/, ready to push
+# or upload: the Dockerfile and Space README, the engine and frontend sources,
+# and the int8 model. Sources are taken from git (tracked plus new, unignored
+# files), so local build directories never end up in the Space.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 BUILD="$HERE/space_build"
-WEIGHTS="$REPO/data/models/pos2move_v2.1"
+MODEL="$REPO/data/models/pos2move_v2.1/model.int8.onnx"
 
-if [ ! -f "$WEIGHTS/model.safetensors" ]; then
-  echo "ERROR: weights not found at $WEIGHTS (run git lfs pull?)" >&2
+# An LFS pointer is a ~130-byte text file; the real model is ~16 MB.
+if [ ! -f "$MODEL" ] || [ "$(stat -c %s "$MODEL")" -lt 1000000 ]; then
+  echo "ERROR: model missing or an LFS pointer at $MODEL (run git lfs pull?)" >&2
   exit 1
 fi
 
 rm -rf "$BUILD"
-mkdir -p "$BUILD/model"
+mkdir -p "$BUILD"
 
-cp "$HERE/app.py" "$BUILD/app.py"
-cp "$HERE/requirements.txt" "$BUILD/requirements.txt"
-cp "$HERE/README.md" "$BUILD/README.md"
+cp "$HERE/Dockerfile" "$HERE/README.md" "$BUILD/"
+( cd "$REPO" && git ls-files -z --cached --others --exclude-standard rust frontend \
+    | rsync -a --from0 --files-from=- ./ "$BUILD/" )
+cp "$MODEL" "$BUILD/model.int8.onnx"
 
-# Vendor the package source (inference path only needs this subtree).
-cp -r "$REPO/src/chesstransformer" "$BUILD/chesstransformer"
-# Drop bundled data (old model weights / tokenizer blobs ~200 MB) and caches —
-# the inference path loads weights from ./model, not from inside the package.
-rm -rf "$BUILD/chesstransformer/data"
-find "$BUILD/chesstransformer" -name '__pycache__' -type d -prune -exec rm -rf {} +
-find "$BUILD/chesstransformer" -name '*.pyc' -delete
+cat > "$BUILD/.gitattributes" <<'ATTR'
+*.onnx filter=lfs diff=lfs merge=lfs -text
+ATTR
+cat > "$BUILD/.dockerignore" <<'IGNORE'
+**/node_modules
+**/.next
+**/target
+IGNORE
 
-# Bundle weights (HF will store the large file via LFS on push).
-cp "$WEIGHTS/model_config.json" "$BUILD/model/model_config.json"
-cp "$WEIGHTS/model.safetensors" "$BUILD/model/model.safetensors"
-
-# A .gitattributes so the Space tracks the weights with LFS.
-cat > "$BUILD/.gitattributes" <<'EOF'
-*.safetensors filter=lfs diff=lfs merge=lfs -text
-EOF
-
-echo "Built Space at: $BUILD"
-echo "Contents:"
-( cd "$BUILD" && find . -maxdepth 2 -not -path '*/.*' | sort )
+echo "Built Space at: $BUILD ($(du -sh "$BUILD" | cut -f1))"
+( cd "$BUILD" && find . -maxdepth 2 -not -path './.git*' | sort )
