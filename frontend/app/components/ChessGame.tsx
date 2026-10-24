@@ -1,955 +1,763 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Chess, Square } from 'chess.js';
-import { Chessboard } from 'react-chessboard';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
+import { Chess, type Color, type PieceSymbol, type Square } from 'chess.js';
+import { Chessboard, defaultArrowOptions, type Arrow, type ChessboardOptions } from 'react-chessboard';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
-const INITIAL_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+import { BotAvatar } from './Avatars';
+import EvalBar from './EvalBar';
+import GameOverModal from './GameOverModal';
+import MoveList from './MoveList';
+import PlayerBar, { type ClockView } from './PlayerBar';
+import PromotionPicker from './PromotionPicker';
+import SettingsMenu, { DEFAULT_SETTINGS, type Settings } from './SettingsMenu';
+import SearchView from './SearchView';
+import SetupPanel, { type ColorChoice, type EngineInfo } from './SetupPanel';
+import {
+  IconCopy,
+  IconDownload,
+  IconDraw,
+  IconFirst,
+  IconFlag,
+  IconFlip,
+  IconLast,
+  IconNext,
+  IconPause,
+  IconPlay,
+  IconPlus,
+  IconPrev,
+  IconRepeat,
+  IconUndo,
+} from './icons';
+import {
+  applyPremove,
+  isPromotionSquare,
+  kingSquare,
+  material,
+  movePiece,
+  other,
+  placement,
+  premoveDests,
+  reasonText,
+  RESULT_SCORE,
+  START_FEN,
+  TIME_CONTROLS,
+  timeControlById,
+} from '../core/chess';
+import { DRAW_OFFER_GAP, evalAt, GameController } from '../core/game';
+import { useStoredState } from '../core/hooks';
 
-interface MoveHistoryEntry {
-  moveNumber: number;
-  white?: string;
-  black?: string;
+// An empty NEXT_PUBLIC_API_URL means same origin (the Space serves the API and the page together).
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:5001';
+
+// Board palette: sand and deep teal, with brass for move highlights and coral for
+// premoves and annotations.
+const BOARD = { light: '#e9e1cc', dark: '#5d8a84' };
+const TINT = {
+  last: 'rgba(247, 206, 84, 0.5)',
+  selected: 'rgba(247, 206, 84, 0.75)',
+  premove: 'rgba(214, 86, 74, 0.6)',
+  mark: 'rgba(226, 92, 68, 0.85)',
+};
+const DOT = 'radial-gradient(circle, rgba(18, 38, 33, 0.22) 21%, transparent 22.5%)';
+const RING = 'radial-gradient(circle, transparent 71%, rgba(18, 38, 33, 0.24) 72.5%)';
+const CHECK =
+  'radial-gradient(circle, rgba(236, 62, 46, 0.95) 0%, rgba(236, 62, 46, 0.6) 34%, rgba(236, 62, 46, 0) 72%)';
+const NOTATION_SIZE = 'clamp(9px, 1.55vmin, 13px)';
+
+interface PendingPromotion {
+  from: Square;
+  to: Square;
+  premove: boolean;
 }
 
-// Piece values for material calculation
-const PIECE_VALUES: Record<string, number> = {
-  p: 1,
-  n: 3,
-  b: 3,
-  r: 5,
-  q: 9,
-};
-
-// Unicode pieces for display
-const PIECE_SYMBOLS: Record<string, { white: string; black: string }> = {
-  p: { white: '♙', black: '♟' },
-  n: { white: '♘', black: '♞' },
-  b: { white: '♗', black: '♝' },
-  r: { white: '♖', black: '♜' },
-  q: { white: '♕', black: '♛' },
-};
-
-// SVG piece images (chess.com neo theme)
-const PIECE_SVGS: Record<string, { white: string; black: string }> = {
-  p: { 
-    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wp.png',
-    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bp.png'
-  },
-  n: { 
-    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wn.png',
-    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bn.png'
-  },
-  b: { 
-    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wb.png',
-    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bb.png'
-  },
-  r: { 
-    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wr.png',
-    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/br.png'
-  },
-  q: { 
-    white: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/wq.png',
-    black: 'https://images.chesscomfiles.com/chess-themes/pieces/neo/150/bq.png'
-  },
-};
-
-// Starting piece counts
-const STARTING_PIECES: Record<string, number> = {
-  p: 8,
-  n: 2,
-  b: 2,
-  r: 2,
-  q: 1,
-};
+interface SetupPrefs {
+  color: ColorChoice;
+  tc: string;
+}
 
 export default function ChessGame() {
-  const [game, setGame] = useState(new Chess());
-  const [moveHistory, setMoveHistory] = useState<string[]>([]);
-  const [gameStatus, setGameStatus] = useState<string>('White to move');
-  const [isThinking, setIsThinking] = useState(false);
-  const [botType, setBotType] = useState<string>('Loading...');
-  const [engineLabel, setEngineLabel] = useState<string>('');
-  const [error, setError] = useState<string>('');
-  const [playerColor, setPlayerColor] = useState<'w' | 'b'>('w');
-  const [gameStarted, setGameStarted] = useState(false);
-  const [selectedSquare, setSelectedSquare] = useState<Square | null>(null);
-  const [lastMove, setLastMove] = useState<{ from: Square; to: Square } | null>(null);
-  // Position history for move navigation
-  const [positionHistory, setPositionHistory] = useState<string[]>([INITIAL_FEN]);
-  const [viewingMoveIndex, setViewingMoveIndex] = useState<number>(0); // 0 = start position, then increments
-  // Evaluation bar
-  const [evaluation, setEvaluation] = useState<number | null>(null); // value in [-1, 1] from white's perspective
-  const [showEvalBar, setShowEvalBar] = useState<boolean>(true);
+  const [ctl] = useState(() => new GameController(API_BASE_URL));
+  const snap = useSyncExternalStore(ctl.subscribe, ctl.getSnapshot, ctl.getSnapshot);
+  const { phase, plies, playerColor, thinking, premoves, result, clock, autoplay } = snap;
+
+  const [prefs, setPrefs] = useStoredState<SetupPrefs>('ct-setup', { color: 'w', tc: 'none' });
+  const [settings, setSettings] = useStoredState<Settings>('ct-settings', DEFAULT_SETTINGS);
+  const [engine, setEngine] = useState<EngineInfo | null>(null);
+  const [offline, setOffline] = useState(false);
+
+  // Board interaction state. `view` and `marks` remember the move count they were
+  // set at, so a new move returns the board to the live position and wipes marks.
+  const [flipped, setFlipped] = useState(false);
+  const [view, setView] = useState<{ ply: number; len: number } | null>(null);
+  const [selected, setSelected] = useState<Square | null>(null);
+  const [marks, setMarks] = useState<{ squares: string[]; len: number; at: number } | null>(null);
+  const [promotion, setPromotion] = useState<PendingPromotion | null>(null);
+  const [confirmResign, setConfirmResign] = useState(false);
+  const [dismissedGame, setDismissedGame] = useState(0);
+  const [copied, setCopied] = useState(false);
+  const [tab, setTab] = useState<'moves' | 'search'>('moves');
+  // A search line replayed on the board: hovered, or pinned by a click. Both are
+  // tied to the position they were set on, so any move or navigation drops them.
+  const [hoverPath, setHoverPath] = useState<{ path: string[]; key: string } | null>(null);
+  const [pinnedPath, setPinnedPath] = useState<{ path: string[]; key: string } | null>(null);
+  const lastDrop = useRef(0);
+  const rightDown = useRef<string | null>(null);
+
+  useEffect(() => ctl.setSoundEnabled(settings.sound), [ctl, settings.sound]);
+  useEffect(() => () => ctl.dispose(), [ctl]);
 
   useEffect(() => {
     let cancelled = false;
+    let timer = 0;
     const poll = (attempt: number) => {
       fetch(`${API_BASE_URL}/api/health`)
-        .then(res => res.json())
-        .then(data => {
+        .then((res) => res.json())
+        .then((data) => {
           if (cancelled) return;
-          setBotType(data.bot_type);
-          if (data.engine && data.engine !== 'none') {
-            const search = data.engine === 'mcts' ? `MCTS ${data.sims} sims` : data.engine;
-            const parts = [data.model, search];
-            if (data.approx_elo) parts.push(`~${data.approx_elo} Elo`);
-            setEngineLabel(parts.filter(Boolean).join(' · '));
-          }
+          setEngine({ sims: data.sims, elo: data.approx_elo, model: data.model });
+          setOffline(false);
         })
         .catch(() => {
           if (cancelled) return;
-          if (attempt < 20) {
-            setTimeout(() => poll(attempt + 1), 2000);
-          } else {
-            setError('Failed to connect to the backend. Make sure the API server is running.');
-          }
+          if (attempt >= 2) setOffline(true);
+          timer = window.setTimeout(() => poll(attempt + 1), 2500);
         });
     };
     poll(0);
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
-  // Keyboard navigation for moves
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!gameStarted) return;
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        goToPreviousMove();
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        goToNextMove();
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        goToFirstMove();
-      } else if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        goToLastMove();
+  // ------------------------------------------------------------ derived position state
+
+  const botColor = other(playerColor);
+  const liveFen = plies.length ? plies[plies.length - 1].fen : START_FEN;
+  const shown = view && view.len === plies.length ? view.ply : plies.length;
+  const isLive = shown === plies.length;
+  const shownFen = shown === 0 ? START_FEN : plies[shown - 1].fen;
+  const orientation: 'white' | 'black' = (playerColor === 'w') !== flipped ? 'white' : 'black';
+  const visibleMarks = useMemo(
+    () => (marks && marks.len === plies.length && marks.at === shown ? marks.squares : []),
+    [marks, plies.length, shown],
+  );
+
+  // The search shown is the one made from this position, else the one that led to it.
+  const searchIndex = snap.searches[shown] ? shown : snap.searches[shown - 1] ? shown - 1 : null;
+  const search = searchIndex == null ? null : snap.searches[searchIndex];
+  const previewKey = `${plies.length}:${shown}:${tab}`;
+  const activePath =
+    (hoverPath?.key === previewKey ? hoverPath.path : null) ?? (pinnedPath?.key === previewKey ? pinnedPath.path : null);
+  const searchRootFen = searchIndex == null ? null : searchIndex === 0 ? START_FEN : plies[searchIndex - 1].fen;
+
+  const preview = useMemo(() => {
+    if (!activePath || !searchRootFen) return null;
+    const g = new Chess(searchRootFen);
+    const side = g.turn();
+    const arrows: Arrow[] = [];
+    let last: { from: string; to: string } | null = null;
+    for (const [i, uci] of activePath.entries()) {
+      try {
+        const m = g.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] });
+        // the searching side's moves in jade, replies in brass; older moves fade
+        const alpha = Math.max(0.3, 0.95 - (activePath.length - 1 - i) * 0.13).toFixed(2);
+        const rgb = m.color === side ? '63, 191, 143' : '240, 168, 48';
+        arrows.push({ startSquare: m.from, endSquare: m.to, color: `rgba(${rgb}, ${alpha})` });
+        last = { from: m.from, to: m.to };
+      } catch {
+        break;
       }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [gameStarted, viewingMoveIndex, positionHistory.length]);
+    }
+    return { position: placement(g.fen()), arrows, last };
+  }, [activePath, searchRootFen]);
 
-  // Navigation functions
-  const goToFirstMove = () => setViewingMoveIndex(0);
-  const goToPreviousMove = () => setViewingMoveIndex(prev => Math.max(0, prev - 1));
-  const goToNextMove = () => setViewingMoveIndex(prev => Math.min(positionHistory.length - 1, prev + 1));
-  const goToLastMove = () => setViewingMoveIndex(positionHistory.length - 1);
-  const goToMove = (index: number) => setViewingMoveIndex(index);
-
-  // Check if viewing current position
-  const isViewingCurrentPosition = viewingMoveIndex === positionHistory.length - 1;
-
-  // Get the position to display on the board
-  const displayedFen = positionHistory[viewingMoveIndex] || game.fen();
-
-  // Calculate captured pieces for each side
-  const capturedPieces = useMemo(() => {
-    const board = game.board().flat();
-    
-    // Count current pieces on board
-    const whitePieces: Record<string, number> = { p: 0, n: 0, b: 0, r: 0, q: 0 };
-    const blackPieces: Record<string, number> = { p: 0, n: 0, b: 0, r: 0, q: 0 };
-    
-    board.forEach(square => {
-      if (square && square.type !== 'k') {
-        if (square.color === 'w') {
-          whitePieces[square.type]++;
-        } else {
-          blackPieces[square.type]++;
-        }
-      }
-    });
-    
-    // Calculate captured (starting - current)
-    const capturedByWhite: string[] = []; // Black pieces captured by white
-    const capturedByBlack: string[] = []; // White pieces captured by black
-    
-    let whiteMaterial = 0;
-    let blackMaterial = 0;
-    
-    Object.keys(STARTING_PIECES).forEach(piece => {
-      const blackCaptured = STARTING_PIECES[piece] - blackPieces[piece];
-      const whiteCaptured = STARTING_PIECES[piece] - whitePieces[piece];
-      
-      // White captured these black pieces
-      for (let i = 0; i < blackCaptured; i++) {
-        capturedByWhite.push(piece);
-        whiteMaterial += PIECE_VALUES[piece];
-      }
-      
-      // Black captured these white pieces
-      for (let i = 0; i < whiteCaptured; i++) {
-        capturedByBlack.push(piece);
-        blackMaterial += PIECE_VALUES[piece];
-      }
-    });
-    
-    // Sort by value (queen, rook, bishop, knight, pawn)
-    const pieceOrder = ['q', 'r', 'b', 'n', 'p'];
-    capturedByWhite.sort((a, b) => pieceOrder.indexOf(a) - pieceOrder.indexOf(b));
-    capturedByBlack.sort((a, b) => pieceOrder.indexOf(a) - pieceOrder.indexOf(b));
-    
-    return {
-      byWhite: capturedByWhite,
-      byBlack: capturedByBlack,
-      whiteMaterial,
-      blackMaterial,
-      advantage: whiteMaterial - blackMaterial,
-    };
-  }, [game]);
-
-  const updateGameStatus = useCallback((chess: Chess) => {
-    if (chess.isCheckmate()) {
-      const winner = chess.turn() === 'w' ? 'Black' : 'White';
-      setGameStatus(`🏆 Checkmate! ${winner} wins!`);
-    } else if (chess.isDraw()) {
-      setGameStatus('🤝 Game drawn!');
-    } else if (chess.isStalemate()) {
-      setGameStatus('🤝 Stalemate!');
-    } else if (chess.isCheck()) {
-      setGameStatus('⚠️ Check!');
+  const onPreview = (path: string[] | null, pin = false) => {
+    if (path && pin) {
+      const same = pinnedPath?.key === previewKey && pinnedPath.path.join() === path.join();
+      setPinnedPath(same ? null : { path, key: previewKey });
     } else {
-      const turn = chess.turn() === 'w' ? 'White' : 'Black';
-      setGameStatus(`${turn} to move`);
-    }
-  }, []);
-
-  // Calculate legal moves for selected piece
-  const legalMoves = useMemo(() => {
-    if (!selectedSquare) return [];
-    const moves = game.moves({ square: selectedSquare, verbose: true });
-    return moves.map(m => m.to);
-  }, [game, selectedSquare]);
-
-  // Generate square styles for highlighting
-  const squareStyles = useMemo(() => {
-    const styles: Record<string, React.CSSProperties> = {};
-    
-    // Highlight selected square
-    if (selectedSquare) {
-      styles[selectedSquare] = {
-        backgroundColor: 'rgba(255, 255, 0, 0.5)',
-      };
-    }
-    
-    // Highlight legal move squares
-    legalMoves.forEach(square => {
-      const piece = game.get(square as Square);
-      if (piece) {
-        // Capture move - red circle
-        styles[square] = {
-          background: 'radial-gradient(circle, transparent 60%, rgba(220, 38, 38, 0.5) 60%)',
-        };
-      } else {
-        // Regular move - darker green dot
-        styles[square] = {
-          background: 'radial-gradient(circle, rgba(34, 197, 94, 0.6) 25%, transparent 25%)',
-        };
-      }
-    });
-
-    // Highlight last move
-    if (lastMove) {
-      styles[lastMove.from] = {
-        ...styles[lastMove.from],
-        backgroundColor: 'rgba(250, 204, 21, 0.5)',
-      };
-      styles[lastMove.to] = {
-        ...styles[lastMove.to],
-        backgroundColor: 'rgba(250, 204, 21, 0.5)',
-      };
-    }
-    
-    return styles;
-  }, [selectedSquare, legalMoves, lastMove, game]);
-
-  const onDrop = (sourceSquare: Square, targetSquare: Square): boolean => {
-    if (game.turn() !== playerColor) return false;
-    if (!isViewingCurrentPosition) return false; // Can't move if viewing history
-    
-    try {
-      const move = game.move({
-        from: sourceSquare,
-        to: targetSquare,
-        promotion: 'q',
-      });
-
-      if (move === null) return false;
-
-      const newGame = new Chess(game.fen());
-      setGame(newGame);
-      setMoveHistory(prev => [...prev, move.san]);
-      setPositionHistory(prev => [...prev, newGame.fen()]);
-      setViewingMoveIndex(prev => prev + 1);
-      setLastMove({ from: sourceSquare, to: targetSquare });
-      setSelectedSquare(null);
-      updateGameStatus(newGame);
-
-      // Fetch evaluation for position after player's move
-      fetchEvaluation(newGame.fen());
-
-      if (!newGame.isGameOver()) {
-        getBotMove(newGame.fen());
-      }
-
-      return true;
-    } catch (err) {
-      console.error('Invalid move:', err);
-      return false;
+      setHoverPath(path ? { path, key: previewKey } : null);
     }
   };
+  const clearPreview = () => {
+    setHoverPath(null);
+    setPinnedPath(null);
+  };
+
+  const liveGame = useMemo(() => new Chess(liveFen), [liveFen]);
+  const livePosition = useMemo(() => placement(liveFen), [liveFen]);
+  const shownPosition = useMemo(() => placement(shownFen), [shownFen]);
+  const plannedPosition = useMemo(() => premoves.reduce(applyPremove, livePosition), [livePosition, premoves]);
+  const boardPosition = useMemo(() => {
+    if (!isLive) return shownPosition;
+    return promotion ? movePiece(plannedPosition, promotion.from, promotion.to) : plannedPosition;
+  }, [isLive, shownPosition, plannedPosition, promotion]);
+
+  const myTurn = phase === 'playing' && !autoplay && liveGame.turn() === playerColor && !thinking;
+  const activeSelected =
+    selected && phase === 'playing' && isLive && plannedPosition[selected]?.pieceType[0] === playerColor
+      ? selected
+      : null;
+
+  const dests = useMemo<Square[]>(() => {
+    if (!activeSelected) return [];
+    return myTurn
+      ? liveGame.moves({ square: activeSelected, verbose: true }).map((m) => m.to)
+      : premoveDests(plannedPosition, activeSelected, playerColor);
+  }, [activeSelected, myTurn, liveGame, plannedPosition, playerColor]);
+
+  const squareStyles = useMemo(() => {
+    const s: Record<string, CSSProperties> = {};
+    const tint = (sq: string, color: string) => (s[sq] = { ...s[sq], backgroundColor: color });
+    const last = shown > 0 ? plies[shown - 1] : null;
+    if (last) {
+      tint(last.from, TINT.last);
+      tint(last.to, TINT.last);
+      if (last.check) {
+        const king = kingSquare(shownPosition, other(last.color));
+        if (king) s[king] = { ...s[king], backgroundImage: CHECK };
+      }
+    }
+    if (isLive) {
+      premoves.forEach((pm) => {
+        tint(pm.from, TINT.premove);
+        tint(pm.to, TINT.premove);
+      });
+      if (activeSelected) {
+        tint(activeSelected, TINT.selected);
+        if (settings.legalMoves) {
+          dests.forEach((d) => (s[d] = { ...s[d], backgroundImage: boardPosition[d] ? RING : DOT }));
+        }
+      }
+    }
+    visibleMarks.forEach((sq) => tint(sq, TINT.mark));
+    return s;
+  }, [shown, plies, shownPosition, isLive, premoves, activeSelected, settings.legalMoves, dests, boardPosition, visibleMarks]);
+
+  // ------------------------------------------------------------ actions
+
+  const goTo = (ply: number) => {
+    const clamped = Math.max(0, Math.min(plies.length, ply));
+    setView(clamped === plies.length ? null : { ply: clamped, len: plies.length });
+    setPromotion(null);
+  };
+
+  /** Start a game with the saved setup; `watch` hands both sides to the engine. */
+  const begin = (watch = false) => {
+    const color: Color = prefs.color === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : prefs.color;
+    setFlipped(false);
+    setView(null);
+    setSelected(null);
+    setMarks(null);
+    setPromotion(null);
+    setConfirmResign(false);
+    clearPreview();
+    if (watch) setTab('search');
+    ctl.start(color, timeControlById(prefs.tc), watch);
+  };
+
+  const toSetup = () => {
+    setView(null);
+    setSelected(null);
+    setPromotion(null);
+    ctl.reset();
+  };
+
+  const resign = () => {
+    if (!plies.some((p) => p.color === playerColor) || confirmResign) {
+      setConfirmResign(false);
+      ctl.resign();
+      return;
+    }
+    setConfirmResign(true);
+    window.setTimeout(() => setConfirmResign(false), 3000);
+  };
+
+  const downloadPgn = () => {
+    const url = URL.createObjectURL(new Blob([ctl.pgn()], { type: 'application/x-chess-pgn' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chesstransformer-${new Date().toISOString().slice(0, 10)}.pgn`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const copyPgn = async () => {
+    try {
+      await navigator.clipboard.writeText(ctl.pgn());
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // clipboard blocked; the download button still works
+    }
+  };
+
+  /** Queue a premove if the piece could ever make it; promotions ask for a piece first. */
+  const planPremove = (from: Square, to: Square): boolean => {
+    if (!premoveDests(plannedPosition, from, playerColor).includes(to)) return false;
+    setSelected(null);
+    if (isPromotionSquare(plannedPosition, from, to) && !settings.autoQueen) {
+      setPromotion({ from, to, premove: true });
+    } else {
+      ctl.queuePremove({ from, to });
+    }
+    return true;
+  };
+
+  const tryMove = (from: Square, to: Square): boolean => {
+    // Ask the controller rather than this render: a drag started while the
+    // engine was thinking can be dropped after its reply, and is then a move.
+    if (ctl.isPlayerTurn()) {
+      if (ctl.needsPromotion(from, to) && !settings.autoQueen) {
+        setSelected(null);
+        setPromotion({ from, to, premove: false });
+        return true;
+      }
+      const moved = ctl.playMove(from, to);
+      if (moved) setSelected(null);
+      return moved;
+    }
+    return planPremove(from, to);
+  };
+
+  const pickPromotion = (piece: PieceSymbol) => {
+    if (!promotion) return;
+    const { from, to, premove } = promotion;
+    setPromotion(null);
+    if (premove && !ctl.isPlayerTurn()) ctl.queuePremove({ from, to, promotion: piece });
+    else ctl.playMove(from, to, piece);
+  };
+
+  const onDrop = (from: string, to: string | null): boolean => {
+    lastDrop.current = performance.now();
+    if (!to || from === to || !isLive || phase !== 'playing' || promotion || autoplay) return false;
+    return tryMove(from as Square, to as Square);
+  };
+  // react-chessboard keeps the drop handler from when the drag began; route
+  // through a ref so a drop always sees the current position and settings.
+  const dropRef = useRef(onDrop);
+  useEffect(() => {
+    dropRef.current = onDrop;
+  });
 
   const onSquareClick = (square: Square) => {
-    if (isThinking || game.isGameOver()) return;
-    if (game.turn() !== playerColor) return;
-    if (!isViewingCurrentPosition) return; // Can't interact if viewing history
-
-    const piece = game.get(square);
-    
-    // If clicking on own piece, select it
-    if (piece && piece.color === playerColor) {
-      setSelectedSquare(square);
+    // a drag that ends on its own square also fires a click; ignore that echo
+    if (performance.now() - lastDrop.current < 150) return;
+    if (preview) return clearPreview();
+    if (!isLive) return goTo(plies.length);
+    if (phase !== 'playing' || promotion || autoplay) return;
+    if (activeSelected && activeSelected !== square && dests.includes(square)) {
+      tryMove(activeSelected, square);
+      setSelected(null);
       return;
     }
-    
-    // If a piece is selected and clicking on a legal move square, make the move
-    if (selectedSquare && legalMoves.includes(square)) {
-      onDrop(selectedSquare, square);
+    const own = plannedPosition[square]?.pieceType[0] === playerColor;
+    if (own && activeSelected !== square) return setSelected(square);
+    setSelected(null);
+    if (!own) ctl.clearPremoves();
+  };
+
+  const onSquareRightClick = (square: string) => {
+    if (premoves.length || activeSelected) {
+      ctl.clearPremoves();
+      setSelected(null);
       return;
     }
-    
-    // Otherwise deselect
-    setSelectedSquare(null);
+    const squares = visibleMarks.includes(square)
+      ? visibleMarks.filter((s) => s !== square)
+      : [...visibleMarks, square];
+    setMarks({ squares, len: plies.length, at: shown });
   };
 
-  const fetchEvaluation = async (fen: string) => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/evaluate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fen }),
-      });
-      if (response.ok) {
-        const data = await response.json();
-        if (data.value != null) {
-          // value is from the current player's perspective; convert to white's
-          const turn = fen.split(' ')[1];
-          const whiteValue = turn === 'w' ? data.value : -data.value;
-          setEvaluation(whiteValue);
-        }
+  // ------------------------------------------------------------ keyboard
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [role="dialog"]')) {
+        if (e.key !== 'Escape') return;
       }
-    } catch {
-      // Silently fail — eval bar is optional
-    }
-  };
-
-  const getBotMove = async (currentFen: string) => {
-    setIsThinking(true);
-    setError('');
-
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/move`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fen: currentFen }),
-      });
-
-      if (!response.ok) throw new Error('Failed to get bot move');
-
-      const data = await response.json();
-      const tempGame = new Chess(currentFen);
-      const from = data.move.substring(0, 2) as Square;
-      const to = data.move.substring(2, 4) as Square;
-      const promotionPiece = data.move.length > 4 ? data.move.substring(4) as 'q' | 'r' | 'b' | 'n' : 'q';
-      const moveObj = tempGame.move({ from, to, promotion: promotionPiece });
-      
-      if (!moveObj) throw new Error('Invalid bot move');
-      
-      const newGame = new Chess(data.fen);
-      setGame(newGame);
-      setMoveHistory(prev => [...prev, moveObj.san]);
-      setPositionHistory(prev => [...prev, newGame.fen()]);
-      setViewingMoveIndex(prev => prev + 1);
-      setLastMove({ from, to });
-      updateGameStatus(newGame);
-
-      // Update evaluation from the move response
-      if (data.value != null) {
-        // value was evaluated before the bot pushed its move (from the bot's perspective).
-        // After the bot moves, newGame.turn() is the *opponent*. So if turn is 'b',
-        // the bot played white and the value is already white's perspective.
-        const whiteValue = newGame.turn() === 'b' ? data.value : -data.value;
-        setEvaluation(whiteValue);
+      const step = (to: number) => {
+        e.preventDefault();
+        goTo(to);
+      };
+      switch (e.key) {
+        case 'ArrowLeft':
+          return step(shown - 1);
+        case 'ArrowRight':
+          return step(shown + 1);
+        case 'ArrowUp':
+        case 'Home':
+          return step(0);
+        case 'ArrowDown':
+        case 'End':
+          return step(plies.length);
+        case 'f':
+          return setFlipped((f) => !f);
+        case 'Escape':
+          clearPreview();
+          setDismissedGame(snap.gameId);
+          setPromotion(null);
+          setSelected(null);
+          ctl.clearPremoves();
+          return;
       }
-    } catch (err) {
-      setError('Failed to get bot move. Please try again.');
-      console.error('Error getting bot move:', err);
-    } finally {
-      setIsThinking(false);
-    }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  // ------------------------------------------------------------ view model
+
+  const { takenBy, balance } = useMemo(() => material(shownPosition), [shownPosition]);
+  const setupTc = timeControlById(prefs.tc);
+  const clockFor = (c: Color): ClockView | null => {
+    if (phase === 'setup') return setupTc ? { ms: setupTc.base * 1000, since: 0, running: false } : null;
+    if (!clock) return null;
+    return { ms: clock[c], since: clock.since, running: clock.running === c && phase === 'playing' };
   };
 
-  const startNewGame = async (color: 'w' | 'b') => {
-    const newGame = new Chess();
-    setGame(newGame);
-    setMoveHistory([]);
-    setPositionHistory([INITIAL_FEN]);
-    setViewingMoveIndex(0);
-    setError('');
-    setPlayerColor(color);
-    setGameStarted(true);
-    setSelectedSquare(null);
-    setLastMove(null);
-    setEvaluation(null);
-    updateGameStatus(newGame);
-    
-    if (color === 'b') {
-      getBotMove(INITIAL_FEN);
-    }
-  };
-
-  const resetToColorSelection = () => {
-    setGameStarted(false);
-    const newGame = new Chess();
-    setGame(newGame);
-    setMoveHistory([]);
-    setPositionHistory([INITIAL_FEN]);
-    setViewingMoveIndex(0);
-    setError('');
-    setSelectedSquare(null);
-    setLastMove(null);
-    setEvaluation(null);
-    updateGameStatus(newGame);
-  };
-
-  const formatMoveHistory = (): MoveHistoryEntry[] => {
-    const formatted: MoveHistoryEntry[] = [];
-    for (let i = 0; i < moveHistory.length; i += 2) {
-      formatted.push({
-        moveNumber: Math.floor(i / 2) + 1,
-        white: moveHistory[i],
-        black: moveHistory[i + 1],
-      });
-    }
-    return formatted;
-  };
-
-  // Color selection screen
-  if (!gameStarted) {
+  const bar = (c: Color) => {
+    // Under autoplay the engine is playing the player's side too, and the bar says so.
+    const isBot = c === botColor || autoplay;
     return (
-      <div className="min-h-screen bg-gradient-to-br from-emerald-900 via-green-800 to-emerald-900 relative overflow-hidden">
-        {/* Decorative chess pattern background */}
-        <div className="absolute inset-0 opacity-5">
-          <div className="grid grid-cols-8 h-full">
-            {Array.from({ length: 64 }).map((_, i) => (
-              <div
-                key={i}
-                className={`aspect-square ${
-                  (Math.floor(i / 8) + i) % 2 === 0 ? 'bg-white' : 'bg-transparent'
-                }`}
-              />
-            ))}
+      <PlayerBar
+        kind={isBot ? 'bot' : 'human'}
+        name={isBot ? 'ChessTransformer' : 'You'}
+        rating={isBot ? engine?.elo : undefined}
+        color={c}
+        taken={takenBy[c]}
+        advantage={c === 'w' ? balance : -balance}
+        clock={clockFor(c)}
+        toMove={phase === 'playing' && liveGame.turn() === c}
+        thinking={thinking && liveGame.turn() === c}
+      />
+    );
+  };
+  const bottomColor: Color = orientation === 'white' ? 'w' : 'b';
+
+  const finalScore = result && !['resignation', 'timeout', 'abort'].includes(result.reason) ? RESULT_SCORE(result) : undefined;
+  const evalValue = evalAt(snap.evals, shown);
+
+  const playerMoves = plies.filter((p) => p.color === playerColor).length;
+  const status = (() => {
+    if (phase === 'over' && result) {
+      if (result.reason === 'abort') return 'Game aborted';
+      const who =
+        result.winner === null
+          ? 'Draw'
+          : autoplay
+            ? `${result.winner === 'w' ? 'White' : 'Black'} won`
+            : result.winner === playerColor
+              ? 'You won'
+              : 'ChessTransformer won';
+      return `${who} ${reasonText(result)}`;
+    }
+    if (snap.engineError) return "The engine didn't answer.";
+    if (autoplay) return 'ChessTransformer is playing itself';
+    if (thinking) return 'ChessTransformer is thinking…';
+    if (phase === 'playing' && liveGame.turn() === playerColor) return liveGame.inCheck() ? 'Your move. You are in check.' : 'Your move';
+    return '';
+  })();
+  const tcLabel = TIME_CONTROLS.find((t) => t.value === snap.timeControl)?.label ?? 'No clock';
+
+  const boardOptions: ChessboardOptions = {
+    id: 'ct-board',
+    position: preview?.position ?? boardPosition,
+    boardOrientation: orientation,
+    squareStyles: preview
+      ? preview.last
+        ? { [preview.last.from]: { backgroundColor: TINT.last }, [preview.last.to]: { backgroundColor: TINT.last } }
+        : {}
+      : squareStyles,
+    arrows: preview?.arrows ?? [],
+    allowDrawingArrows: !preview,
+    darkSquareStyle: { backgroundColor: BOARD.dark },
+    lightSquareStyle: { backgroundColor: BOARD.light },
+    darkSquareNotationStyle: { color: BOARD.light, fontWeight: 600 },
+    lightSquareNotationStyle: { color: BOARD.dark, fontWeight: 600 },
+    alphaNotationStyle: { fontSize: NOTATION_SIZE, position: 'absolute', bottom: 1, right: 3, userSelect: 'none' },
+    numericNotationStyle: { fontSize: NOTATION_SIZE, position: 'absolute', top: 2, left: 3, userSelect: 'none' },
+    dropSquareStyle: { boxShadow: 'inset 0 0 0 3px rgba(255, 255, 255, 0.7)' },
+    draggingPieceStyle: { transform: 'scale(1.12)' },
+    draggingPieceGhostStyle: { opacity: 0.3 },
+    boardStyle: { borderRadius: 4, boxShadow: '0 6px 24px rgba(0, 0, 0, 0.35)' },
+    animationDurationInMs: 170,
+    allowDragging: phase === 'playing' && isLive && !preview,
+    canDragPiece: ({ piece }) => piece.pieceType[0] === playerColor && !promotion && !autoplay,
+    arrowOptions: {
+      ...defaultArrowOptions,
+      color: '#f0a830',
+      secondaryColor: '#3fbf8f',
+      tertiaryColor: '#e0574b',
+      opacity: 0.82,
+      activeOpacity: 0.6,
+    },
+    onPieceDrag: ({ square }) => square && setSelected(square as Square),
+    onPieceDrop: ({ sourceSquare, targetSquare }) => dropRef.current(sourceSquare, targetSquare),
+    onSquareClick: ({ square }) => onSquareClick(square as Square),
+    // Right-click is read from mousedown/up on the same square rather than the
+    // contextmenu event, which Linux fires on mousedown, before an arrow drag.
+    onSquareMouseDown: ({ square }, e) => {
+      if (e.button === 0 && visibleMarks.length) setMarks(null);
+      if (e.button === 2) rightDown.current = square;
+    },
+    onSquareMouseUp: ({ square }, e) => {
+      if (e.button === 2 && rightDown.current === square) onSquareRightClick(square);
+      rightDown.current = null;
+    },
+  };
+
+  const showModal = phase === 'over' && result && dismissedGame !== snap.gameId;
+
+  return (
+    <main className="app">
+      <div className="play-area">
+        <div className="board-grid" data-eval={settings.evalBar ? 'on' : 'off'}>
+          <div className="strip-slot lg:hidden">
+            <MoveList variant="strip" plies={plies} current={shown} onSelect={goTo} emptyText="Moves appear here" />
           </div>
+          <div className="top-slot">{bar(other(bottomColor))}</div>
+          {settings.evalBar ? (
+            <div className="eval-slot">
+              <EvalBar value={evalValue} final={isLive ? finalScore : undefined} orientation={orientation} />
+            </div>
+          ) : null}
+          <div className="board-slot relative" onContextMenu={(e) => e.preventDefault()}>
+            <Chessboard options={boardOptions} />
+            {promotion ? (
+              <PromotionPicker
+                square={promotion.to}
+                color={playerColor}
+                orientation={orientation}
+                onPick={pickPromotion}
+                onCancel={() => setPromotion(null)}
+              />
+            ) : null}
+            {showModal ? (
+              <GameOverModal
+                result={result}
+                playerColor={playerColor}
+                selfPlay={autoplay}
+                onRematch={() => begin(autoplay)}
+                onNewGame={toSetup}
+                onDownload={downloadPgn}
+                onClose={() => setDismissedGame(snap.gameId)}
+              />
+            ) : null}
+          </div>
+          <div className="bottom-slot">{bar(bottomColor)}</div>
         </div>
 
-        <div className="relative z-10 min-h-screen flex flex-col items-center justify-center p-4 sm:p-6">
-          {/* Hero Section */}
-          <div className="text-center mb-8 sm:mb-12">
-            <div className="inline-flex items-center justify-center w-20 h-20 sm:w-24 sm:h-24 bg-white/10 backdrop-blur rounded-2xl mb-6 shadow-2xl border border-white/20">
-              <span className="text-5xl sm:text-6xl">♟️</span>
+        <aside className="panel">
+          <header className="flex items-center justify-between border-b border-line py-2.5 pl-4 pr-2">
+            <div className="flex items-center gap-2.5">
+              <BotAvatar size={26} />
+              <span className="font-display text-[19px] font-bold tracking-[-0.01em] text-fg">ChessTransformer</span>
             </div>
-            <h1 className="text-4xl sm:text-5xl md:text-6xl font-bold text-white mb-4 tracking-tight">
-              ChessTransformer
-            </h1>
-            <p className="text-emerald-200 text-lg sm:text-xl max-w-md mx-auto leading-relaxed">
-              Challenge an AI powered by transformer neural networks
-            </p>
-            
-            {/* Bot Status Badge */}
-            <div className="mt-6 inline-flex items-center gap-3 bg-black/20 backdrop-blur-sm px-5 py-2.5 rounded-full border border-white/10">
-              <span className="relative flex h-3 w-3">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
-              </span>
-              <span className="text-emerald-100 font-medium">{botType}</span>
-              {engineLabel && (
-                <span className="text-emerald-300/70 text-sm border-l border-white/10 pl-3">{engineLabel}</span>
-              )}
-            </div>
-          </div>
+            <SettingsMenu settings={settings} onChange={setSettings} />
+          </header>
 
-          {error && (
-            <div className="mb-8 p-4 bg-red-500/20 border border-red-400/50 text-red-100 rounded-xl backdrop-blur-sm max-w-md w-full text-center">
-              {error}
+          {phase === 'setup' ? (
+            <SetupPanel
+              engine={engine}
+              offline={offline}
+              color={prefs.color}
+              onColor={(color) => setPrefs({ ...prefs, color })}
+              timeControl={prefs.tc}
+              onTimeControl={(tc) => setPrefs({ ...prefs, tc })}
+              onPlay={() => begin()}
+              onWatch={() => begin(true)}
+            />
+          ) : (
+            <div className="flex min-h-0 flex-1 flex-col">
+              <div className="flex items-center justify-between gap-3 px-4 py-2.5 text-sm" aria-live="polite">
+                <span className={phase === 'over' ? 'font-semibold text-fg' : snap.engineError ? 'text-coral' : 'text-muted'}>
+                  {status}
+                </span>
+                <span className="shrink-0 text-faint">{tcLabel}</span>
+              </div>
+
+              <div role="tablist" aria-label="Game panel" className="flex gap-1 border-t border-line px-2">
+                {(['moves', 'search'] as const).map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === t}
+                    onClick={() => setTab(t)}
+                    className={`relative px-3 py-2.5 text-sm font-semibold transition-colors ${
+                      tab === t
+                        ? 'text-fg after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-jade'
+                        : 'text-muted hover:text-fg'
+                    }`}
+                  >
+                    {t === 'moves' ? 'Moves' : 'Engine search'}
+                  </button>
+                ))}
+              </div>
+              <div
+                role="tabpanel"
+                className="flex min-h-0 flex-1 flex-col border-y border-line bg-black/[0.06] max-lg:h-80 max-lg:flex-none"
+                onMouseLeave={() => setHoverPath(null)}
+              >
+                {tab === 'moves' ? (
+                  <MoveList
+                    variant="table"
+                    plies={plies}
+                    current={shown}
+                    onSelect={goTo}
+                    emptyText={playerColor === 'w' ? 'Make your first move.' : 'ChessTransformer moves first.'}
+                  />
+                ) : search && searchIndex != null && searchRootFen ? (
+                  <SearchView
+                    search={search}
+                    fen={searchRootFen}
+                    played={plies[searchIndex]?.san}
+                    active={activePath}
+                    onPreview={onPreview}
+                  />
+                ) : (
+                  <p className="px-4 py-3 text-sm leading-snug text-muted">
+                    {thinking
+                      ? 'ChessTransformer is searching. Its tree appears here once it moves.'
+                      : plies.some((p) => p.color === botColor) && !Object.keys(snap.searches).length
+                        ? "This backend doesn't report its search. The Rust backend (ct-bot serve) does."
+                        : "The engine's search shows up here after its next move."}
+                  </p>
+                )}
+              </div>
+
+              {snap.engineError ? (
+                <div className="mx-3 mt-3 flex items-center justify-between gap-3 rounded-lg bg-coral/15 px-3 py-2 text-sm text-fg">
+                  Check that the backend is running, then retry.
+                  <button type="button" onClick={() => ctl.retry()} className="btn-secondary h-8 px-3 text-sm">
+                    Retry
+                  </button>
+                </div>
+              ) : null}
+              {snap.notice ? <p className="mx-4 mt-3 text-sm text-muted">{snap.notice}</p> : null}
+
+              <div className="grid grid-cols-4 gap-2 px-3 pt-3">
+                {phase === 'playing' ? (
+                  <>
+                    <PanelButton
+                      onClick={() => ctl.offerDraw()}
+                      disabled={autoplay || playerMoves === 0 || plies.length - snap.lastDrawOffer < DRAW_OFFER_GAP}
+                      icon={<IconDraw />}
+                      label="Draw"
+                    />
+                    <PanelButton
+                      onClick={resign}
+                      icon={<IconFlag />}
+                      label={playerMoves === 0 ? 'Abort' : confirmResign ? 'Confirm' : 'Resign'}
+                      danger={confirmResign}
+                    />
+                    <PanelButton
+                      onClick={() => ctl.takeback()}
+                      disabled={autoplay || playerMoves === 0}
+                      icon={<IconUndo />}
+                      label="Takeback"
+                    />
+                    <PanelButton
+                      onClick={() => ctl.setAutoplay(!autoplay)}
+                      icon={autoplay ? <IconPause /> : <IconPlay />}
+                      label={autoplay ? 'Take over' : 'Autoplay'}
+                      primary={autoplay}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <PanelButton onClick={() => begin(autoplay)} icon={<IconRepeat />} label="Rematch" primary />
+                    <PanelButton onClick={toSetup} icon={<IconPlus />} label="New game" />
+                    <PanelButton onClick={copyPgn} icon={<IconCopy />} label={copied ? 'Copied' : 'Copy PGN'} />
+                    <PanelButton onClick={downloadPgn} icon={<IconDownload />} label="Download" />
+                  </>
+                )}
+              </div>
+
+              <div className="mt-auto flex items-center gap-1 px-3 pb-3 pt-3">
+                <NavButton onClick={() => goTo(0)} disabled={shown === 0} label="First move (Home)">
+                  <IconFirst />
+                </NavButton>
+                <NavButton onClick={() => goTo(shown - 1)} disabled={shown === 0} label="Previous move (←)">
+                  <IconPrev />
+                </NavButton>
+                <NavButton onClick={() => goTo(shown + 1)} disabled={isLive} label="Next move (→)">
+                  <IconNext />
+                </NavButton>
+                <NavButton onClick={() => goTo(plies.length)} disabled={isLive} label="Current position (End)">
+                  <IconLast />
+                </NavButton>
+                <NavButton onClick={() => setFlipped((f) => !f)} label="Flip board (F)" narrow>
+                  <IconFlip />
+                </NavButton>
+              </div>
             </div>
           )}
-
-          {/* Color Selection Cards */}
-          <div className="w-full max-w-2xl">
-            <h2 className="text-xl sm:text-2xl font-semibold text-white mb-6 text-center">
-              Choose Your Side
-            </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6 px-4">
-              {/* Play as White */}
-              <button
-                onClick={() => startNewGame('w')}
-                className="group relative bg-gradient-to-br from-white via-gray-50 to-gray-100 rounded-2xl p-6 sm:p-8 shadow-2xl hover:shadow-white/20 transition-all duration-300 hover:scale-[1.02] hover:-translate-y-1 border-4 border-transparent hover:border-yellow-400/50"
-              >
-                <div className="text-center">
-                  <div className="text-6xl sm:text-7xl mb-4 filter drop-shadow-lg transform group-hover:scale-110 transition-transform">
-                    ♔
-                  </div>
-                  <h3 className="text-xl sm:text-2xl font-bold text-gray-800 mb-2">Play White</h3>
-                  <p className="text-gray-500 text-sm sm:text-base">You make the first move</p>
-                </div>
-                <div className="absolute top-3 right-3 bg-yellow-400 text-yellow-900 text-xs font-bold px-2 py-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
-                  1st
-                </div>
-              </button>
-
-              {/* Play as Black */}
-              <button
-                onClick={() => startNewGame('b')}
-                className="group relative bg-gradient-to-br from-gray-800 via-gray-900 to-black rounded-2xl p-6 sm:p-8 shadow-2xl hover:shadow-emerald-500/20 transition-all duration-300 hover:scale-[1.02] hover:-translate-y-1 border-4 border-transparent hover:border-emerald-400/50"
-              >
-                <div className="text-center">
-                  <div className="text-6xl sm:text-7xl mb-4 filter drop-shadow-lg transform group-hover:scale-110 transition-transform">
-                    ♚
-                  </div>
-                  <h3 className="text-xl sm:text-2xl font-bold text-white mb-2">Play Black</h3>
-                  <p className="text-gray-400 text-sm sm:text-base">Bot makes the first move</p>
-                </div>
-                <div className="absolute top-3 right-3 bg-emerald-400 text-emerald-900 text-xs font-bold px-2 py-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
-                  2nd
-                </div>
-              </button>
-            </div>
-          </div>
-
-          {/* Features */}
-          <div className="mt-12 flex flex-wrap justify-center gap-6 text-emerald-200/70 text-sm">
-            <div className="flex items-center gap-2">
-              <span>🧠</span>
-              <span>Transformer AI</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span>⚡</span>
-              <span>Real-time moves</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span>🎯</span>
-              <span>Legal move hints</span>
-            </div>
-          </div>
-
-          {/* Footer with Links */}
-          <div className="mt-10 text-center space-y-4">
-            <p className="text-emerald-300/50 text-xs sm:text-sm">
-              Trained on millions of chess games from{' '}
-              <a 
-                href="https://database.lichess.org/" 
-                target="_blank" 
-                rel="noopener noreferrer"
-                className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 transition-colors"
-              >
-                Lichess Database
-              </a>
-            </p>
-            <div className="flex items-center justify-center gap-4">
-              <a
-                href="https://github.com/tchauffi/ChessTransformer"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-2 text-emerald-300/60 hover:text-white transition-colors text-sm"
-              >
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                  <path fillRule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clipRule="evenodd" />
-                </svg>
-                <span>View on GitHub</span>
-              </a>
-              <a
-                href="https://lichess.org/"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-2 text-emerald-300/60 hover:text-white transition-colors text-sm"
-              >
-                <span className="text-lg">♞</span>
-                <span>Lichess</span>
-              </a>
-            </div>
-          </div>
-        </div>
+        </aside>
       </div>
-    );
-  }
+    </main>
+  );
+}
 
-  // Game screen
+function PanelButton({
+  onClick,
+  icon,
+  label,
+  disabled,
+  danger,
+  primary,
+}: {
+  onClick: () => void;
+  icon: ReactNode;
+  label: string;
+  disabled?: boolean;
+  danger?: boolean;
+  primary?: boolean;
+}) {
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
-      <div className="max-w-7xl mx-auto p-3 sm:p-4 md:p-6">
-        {/* Header */}
-        <header className="text-center mb-4 sm:mb-6">
-          <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-white mb-1 sm:mb-2">
-            ♟️ ChessTransformer
-          </h1>
-          <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-4 text-xs sm:text-sm">
-            <span className="text-slate-400">Bot: <span className="text-emerald-400 font-medium">{botType}</span></span>
-            <span className="text-slate-600 hidden sm:inline">|</span>
-            <span className="text-slate-400">
-              Playing as <span className="font-medium text-white">{playerColor === 'w' ? '⬜ White' : '⬛ Black'}</span>
-            </span>
-          </div>
-        </header>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex h-14 flex-col items-center justify-center gap-0.5 rounded-lg text-[13px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+        primary ? 'btn-primary' : danger ? 'bg-coral text-white' : 'bg-raised text-fg hover:bg-line'
+      }`}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
 
-        {error && (
-          <div className="mb-4 p-3 sm:p-4 bg-red-500/20 border border-red-500/50 text-red-200 rounded-xl max-w-xl mx-auto text-sm sm:text-base">
-            {error}
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr,300px] xl:grid-cols-[1fr,340px] gap-4 sm:gap-6">
-          {/* Board Section */}
-          <div className="bg-slate-800/50 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-4 md:p-6 border border-slate-700/50 shadow-2xl">
-            {/* Status Bar */}
-            <div className="flex items-center justify-between mb-3 sm:mb-4 px-1 sm:px-2">
-              <div className={`text-base sm:text-lg font-semibold ${
-                game.isGameOver() 
-                  ? 'text-yellow-400' 
-                  : game.isCheck() 
-                    ? 'text-red-400' 
-                    : 'text-white'
-              }`}>
-                {gameStatus}
-              </div>
-              {isThinking && (
-                <div className="flex items-center gap-2 text-emerald-400">
-                  <div className="w-4 h-4 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin"></div>
-                  <span className="text-xs sm:text-sm">Thinking...</span>
-                </div>
-              )}
-            </div>
-
-            {/* Chess Board with Eval Bar - Responsive */}
-            <div className="flex gap-2 justify-center">
-              {/* Evaluation Bar */}
-              {showEvalBar && (
-                <div className="flex flex-col items-center w-6 sm:w-7 shrink-0">
-                  {/* Label top: black or white depending on orientation */}
-                  <span className="text-[10px] text-slate-500 mb-1">
-                    {playerColor === 'w' ? '⬛' : '⬜'}
-                  </span>
-                  <div className="relative w-full flex-1 rounded-sm overflow-hidden bg-slate-600 min-h-[200px]" style={{ aspectRatio: '1/16' }}>
-                    {/* White portion: anchored at bottom when playing white, at top when playing black */}
-                    <div
-                      className={`absolute ${playerColor === 'w' ? 'bottom-0' : 'top-0'} left-0 right-0 bg-white transition-all duration-500 ease-out`}
-                      style={{
-                        height: evaluation != null
-                          ? `${(evaluation + 1) / 2 * 100}%`
-                          : '50%',
-                      }}
-                    />
-                    {/* Numeric label */}
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <span
-                        className={`text-[10px] sm:text-xs font-bold px-0.5 ${
-                          evaluation != null && evaluation > 0
-                            ? 'text-slate-800'
-                            : 'text-slate-200'
-                        }`}
-                      >
-                        {evaluation != null
-                          ? (evaluation > 0 ? '+' : '') + evaluation.toFixed(2)
-                          : '0'}
-                      </span>
-                    </div>
-                  </div>
-                  {/* Label bottom */}
-                  <span className="text-[10px] text-slate-500 mt-1">
-                    {playerColor === 'w' ? '⬜' : '⬛'}
-                  </span>
-                </div>
-              )}
-
-              {/* Board */}
-              <div className="w-full max-w-[min(100%,600px)]">
-              {/* Captured pieces - Opponent (top) */}
-              <div className="flex items-center justify-between mb-2 px-1 min-h-[36px] bg-slate-800/60 rounded-lg py-1.5">
-                <div className="flex items-center gap-0.5 flex-wrap px-2">
-                  {(playerColor === 'w' ? capturedPieces.byBlack : capturedPieces.byWhite).map((piece, idx) => (
-                    <img 
-                      key={`top-${piece}-${idx}`} 
-                      src={PIECE_SVGS[piece][playerColor === 'w' ? 'white' : 'black']}
-                      alt={piece}
-                      className="w-6 h-6 sm:w-7 sm:h-7 drop-shadow-md"
-                    />
-                  ))}
-                  {(playerColor === 'w' ? capturedPieces.byBlack : capturedPieces.byWhite).length === 0 && (
-                    <span className="text-slate-600 text-xs">No captures</span>
-                  )}
-                </div>
-                {capturedPieces.advantage !== 0 && (
-                  <span className={`text-xs sm:text-sm font-bold px-2 py-0.5 rounded mr-2 ${
-                    (playerColor === 'w' && capturedPieces.advantage < 0) || 
-                    (playerColor === 'b' && capturedPieces.advantage > 0)
-                      ? 'bg-emerald-500/30 text-emerald-300'
-                      : 'text-slate-600'
-                  }`}>
-                    {playerColor === 'w' 
-                      ? (capturedPieces.advantage < 0 ? `+${Math.abs(capturedPieces.advantage)}` : '')
-                      : (capturedPieces.advantage > 0 ? `+${capturedPieces.advantage}` : '')
-                    }
-                  </span>
-                )}
-              </div>
-              
-              <div className="relative w-full" style={{ paddingBottom: '100%' }}>
-                <div className="absolute inset-0">
-                  <Chessboard
-                    options={{
-                      id: "main-board",
-                      position: displayedFen,
-                      boardOrientation: playerColor === 'w' ? 'white' : 'black',
-                      allowDragging: !isThinking && !game.isGameOver() && game.turn() === playerColor && isViewingCurrentPosition,
-                      squareStyles: isViewingCurrentPosition ? squareStyles : {},
-                      showNotation: true,
-                      animationDurationInMs: 200,
-                      darkSquareStyle: { backgroundColor: '#15803d' },
-                      lightSquareStyle: { backgroundColor: '#f0fdf4' },
-                      canDragPiece: ({ piece }) => {
-                        if (!isViewingCurrentPosition) return false;
-                        if (isThinking || game.isGameOver()) return false;
-                        if (game.turn() !== playerColor) return false;
-                        return piece.pieceType[0] === playerColor;
-                      },
-                      onPieceDrag: ({ square }) => {
-                        if (isViewingCurrentPosition) setSelectedSquare(square as Square);
-                      },
-                      onPieceDrop: ({ sourceSquare, targetSquare }) => {
-                        return onDrop(sourceSquare as Square, targetSquare as Square);
-                      },
-                      onSquareClick: ({ square }) => {
-                        onSquareClick(square as Square);
-                      },
-                    }}
-                  />
-                </div>
-                {/* History viewing overlay */}
-                {!isViewingCurrentPosition && (
-                  <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-amber-500/90 text-black text-xs font-semibold px-3 py-1 rounded-full shadow-lg">
-                    Viewing move {viewingMoveIndex} of {positionHistory.length - 1}
-                  </div>
-                )}
-              </div>
-              
-              {/* Captured pieces - Player (bottom) */}
-              <div className="flex items-center justify-between mt-2 px-1 min-h-[36px] bg-slate-800/60 rounded-lg py-1.5">
-                <div className="flex items-center gap-0.5 flex-wrap px-2">
-                  {(playerColor === 'w' ? capturedPieces.byWhite : capturedPieces.byBlack).map((piece, idx) => (
-                    <img 
-                      key={`bottom-${piece}-${idx}`} 
-                      src={PIECE_SVGS[piece][playerColor === 'w' ? 'black' : 'white']}
-                      alt={piece}
-                      className="w-6 h-6 sm:w-7 sm:h-7 drop-shadow-md"
-                    />
-                  ))}
-                  {(playerColor === 'w' ? capturedPieces.byWhite : capturedPieces.byBlack).length === 0 && (
-                    <span className="text-slate-600 text-xs">No captures</span>
-                  )}
-                </div>
-                {capturedPieces.advantage !== 0 && (
-                  <span className={`text-xs sm:text-sm font-bold px-2 py-0.5 rounded mr-2 ${
-                    (playerColor === 'w' && capturedPieces.advantage > 0) || 
-                    (playerColor === 'b' && capturedPieces.advantage < 0)
-                      ? 'bg-emerald-500/30 text-emerald-300'
-                      : 'text-slate-600'
-                  }`}>
-                    {playerColor === 'w' 
-                      ? (capturedPieces.advantage > 0 ? `+${capturedPieces.advantage}` : '')
-                      : (capturedPieces.advantage < 0 ? `+${Math.abs(capturedPieces.advantage)}` : '')
-                    }
-                  </span>
-                )}
-              </div>
-            </div>
-            </div>
-
-            {/* Move Navigation */}
-            <div className="flex items-center justify-center gap-1 sm:gap-2 mt-3 bg-slate-800/60 rounded-lg py-2 px-2">
-              <button
-                onClick={goToFirstMove}
-                disabled={viewingMoveIndex === 0}
-                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-                title="Go to start (↑)"
-              >
-                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
-                </svg>
-              </button>
-              <button
-                onClick={goToPreviousMove}
-                disabled={viewingMoveIndex === 0}
-                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-                title="Previous move (←)"
-              >
-                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                </svg>
-              </button>
-              <span className="text-slate-400 text-xs sm:text-sm px-2 sm:px-3 min-w-[60px] sm:min-w-[80px] text-center">
-                {viewingMoveIndex} / {positionHistory.length - 1}
-              </span>
-              <button
-                onClick={goToNextMove}
-                disabled={viewingMoveIndex === positionHistory.length - 1}
-                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-                title="Next move (→)"
-              >
-                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                </svg>
-              </button>
-              <button
-                onClick={goToLastMove}
-                disabled={viewingMoveIndex === positionHistory.length - 1}
-                className="p-2 sm:p-2.5 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-                title="Go to current (↓)"
-              >
-                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
-                </svg>
-              </button>
-            </div>
-
-            {/* Action Buttons */}
-            <div className="mt-4 sm:mt-6 flex gap-2 sm:gap-3">
-              <button
-                onClick={() => startNewGame(playerColor)}
-                className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 sm:py-3 px-4 sm:px-6 rounded-lg sm:rounded-xl transition-all text-sm sm:text-base shadow-lg hover:shadow-emerald-500/25"
-              >
-                🔄 New Game
-              </button>
-              <button
-                onClick={resetToColorSelection}
-                className="flex-1 bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2.5 sm:py-3 px-4 sm:px-6 rounded-lg sm:rounded-xl transition-all text-sm sm:text-base border border-slate-600"
-              >
-                🎨 Change Side
-              </button>
-            </div>
-          </div>
-
-          {/* Side Panel */}
-          <div className="space-y-4">
-            {/* Move History */}
-            <div className="bg-slate-800/50 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-slate-700/50">
-              <h2 className="text-base sm:text-lg font-semibold text-white mb-3 flex items-center gap-2">
-                📜 Moves
-              </h2>
-              <div className="max-h-[200px] sm:max-h-[280px] overflow-y-auto">
-                {formatMoveHistory().length === 0 ? (
-                  <p className="text-slate-500 text-center py-4 text-sm">No moves yet</p>
-                ) : (
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="text-slate-400 border-b border-slate-700">
-                        <th className="text-left py-2 px-2 w-8">#</th>
-                        <th className="text-left py-2 px-2">White</th>
-                        <th className="text-left py-2 px-2">Black</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {formatMoveHistory().map((entry, idx) => {
-                        const whiteMoveIndex = idx * 2 + 1;
-                        const blackMoveIndex = idx * 2 + 2;
-                        return (
-                          <tr key={idx} className="text-slate-200 border-b border-slate-700/50">
-                            <td className="py-1.5 sm:py-2 px-2 text-slate-500">{entry.moveNumber}</td>
-                            <td 
-                              className={`py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm cursor-pointer hover:bg-slate-600/50 rounded transition-colors ${
-                                viewingMoveIndex === whiteMoveIndex ? 'bg-emerald-600/40 text-emerald-200' : ''
-                              }`}
-                              onClick={() => entry.white && goToMove(whiteMoveIndex)}
-                            >
-                              {entry.white || ''}
-                            </td>
-                            <td 
-                              className={`py-1.5 sm:py-2 px-2 font-mono text-xs sm:text-sm cursor-pointer hover:bg-slate-600/50 rounded transition-colors ${
-                                viewingMoveIndex === blackMoveIndex ? 'bg-emerald-600/40 text-emerald-200' : ''
-                              }`}
-                              onClick={() => entry.black && goToMove(blackMoveIndex)}
-                            >
-                              {entry.black || ''}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
-
-            {/* Game Info */}
-            <div className="bg-slate-800/50 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-slate-700/50">
-              <h2 className="text-base sm:text-lg font-semibold text-white mb-3">ℹ️ Info</h2>
-              <div className="space-y-2.5 text-sm">
-                <div className="flex justify-between items-center">
-                  <span className="text-slate-400">Your Side</span>
-                  <span className="text-white font-medium">
-                    {playerColor === 'w' ? '⬜ White' : '⬛ Black'}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-slate-400">Turn</span>
-                  <span className={`font-medium ${game.turn() === playerColor ? 'text-emerald-400' : 'text-amber-400'}`}>
-                    {game.turn() === playerColor ? '👤 You' : '🤖 Bot'}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-slate-400">Moves</span>
-                  <span className="text-white font-medium">{moveHistory.length}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-slate-400">Status</span>
-                  <span className={`font-medium text-xs px-2 py-0.5 rounded-full ${
-                    game.isGameOver() 
-                      ? 'bg-amber-500/20 text-amber-300' 
-                      : 'bg-emerald-500/20 text-emerald-300'
-                  }`}>
-                    {game.isGameOver() ? 'Game Over' : 'Playing'}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* Help Tip */}
-            <div className="bg-emerald-900/30 rounded-xl p-3 border border-emerald-700/30">
-              <p className="text-emerald-300/80 text-xs text-center">
-                💡 Use arrow keys or buttons to navigate moves
-              </p>
-            </div>
-
-            {/* Eval Bar Toggle */}
-            <div className="bg-slate-800/50 backdrop-blur rounded-xl p-3 border border-slate-700/50">
-              <label className="flex items-center justify-between cursor-pointer">
-                <span className="text-sm text-slate-300">📊 Evaluation Bar</span>
-                <div className="relative">
-                  <input
-                    type="checkbox"
-                    checked={showEvalBar}
-                    onChange={() => setShowEvalBar(prev => !prev)}
-                    className="sr-only peer"
-                  />
-                  <div className="w-9 h-5 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
-                </div>
-              </label>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+function NavButton({
+  onClick,
+  disabled,
+  label,
+  narrow,
+  children,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  label: string;
+  narrow?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={label}
+      aria-label={label}
+      className={`grid h-10 place-items-center rounded-md bg-raised text-fg transition-colors hover:bg-line disabled:cursor-default disabled:text-faint disabled:hover:bg-raised ${
+        narrow ? 'ml-1 w-12' : 'flex-1'
+      }`}
+    >
+      {children}
+    </button>
   );
 }
