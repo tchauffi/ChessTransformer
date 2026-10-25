@@ -1,7 +1,7 @@
 """Where the self-play forward's GPU time goes, per batch size.
 
 FLOPs per position (FlopCounterMode, eager), then for each batch: ms per forward of the
-production compile (reduce-overhead, CUDA graphs), achieved TFLOPS, kernel time by kind
+production compile (--compile-mode, CUDA graphs), achieved TFLOPS, kernel time by kind
 (torch.profiler activity tracing: needs no GPU counter permission) and the board's duty cycles
 while a 12 s loop runs (nvidia-smi: SM busy, memory controller busy, power, SM clock). The
 ceilings it compares to are measured on the same card: an 8192^3 bf16 GEMM and a device copy.
@@ -30,7 +30,7 @@ from torch.utils.flop_counter import FlopCounterMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from selfplay_rust import load_model  # noqa: E402
+from selfplay_rust import COMPILE_MODES, load_model  # noqa: E402
 
 
 def inputs(b: int) -> list[torch.Tensor]:
@@ -100,6 +100,7 @@ def main() -> None:
     p.add_argument("--model", default="data/rl/champion")
     p.add_argument("--batches", default="64,128,256,512,1024")
     p.add_argument("--top", type=int, default=12, help="kernels listed for the largest batch")
+    p.add_argument("--compile-mode", choices=COMPILE_MODES, default=COMPILE_MODES[0])
     args = p.parse_args()
     assert torch.cuda.is_available(), "needs a CUDA GPU"
     print("GPU:", torch.cuda.get_device_name(0), "| torch", torch.__version__)
@@ -115,7 +116,7 @@ def main() -> None:
           f"{per_row / 1e9:.2f} GFLOP per position | " +
           ", ".join(f"{str(k).split('.')[-1]} {v / 64 / 1e9:.2f}" for k, v in ops))
 
-    compiled = torch.compile(model, mode="reduce-overhead")
+    compiled = torch.compile(model, mode=args.compile_mode)
     batches = [int(b) for b in args.batches.split(",")]
     print(f"\n{'batch':>6} {'ms':>7} {'pos/s':>8} {'TFLOPS':>7} {'%ceil':>6} | kernel time | "
           f"nvidia-smi SM% mem% W MHz")

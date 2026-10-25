@@ -61,12 +61,17 @@ from grpo_puzzles import load_model
 
 _BUCKETS = (32, 64, 128, 256, 512, 1024)
 
+# torch.compile mode on CUDA. Both capture CUDA graphs; "max-autotune" also benchmarks Triton
+# GEMM templates per shape and fuses their epilogues: +16% forward throughput on the RTX 5070
+# Ti (champion, 128 rows, 2026-10-25), for a longer first compile (cached by inductor).
+COMPILE_MODES = ("max-autotune", "reduce-overhead")
+
 
 class Forward:
     """Batched bf16 forward with bucketed static shapes (compile-friendly)."""
 
     def __init__(self, model_dir: str, device: str, use_ema: bool, compile_model: bool,
-                 buckets: tuple[int, ...] = _BUCKETS):
+                 buckets: tuple[int, ...] = _BUCKETS, compile_mode: str = COMPILE_MODES[0]):
         self.device = device
         # Any CUDA device ("cuda", "cuda:2"): several Forwards can share one process, each
         # on its own card (gpu_match --gpus).
@@ -82,7 +87,7 @@ class Forward:
             self.model = self.model.bfloat16()
             print(f"EMA weights loaded ({len(ema)} tensors)")
         if compile_model and self.cuda:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            self.model = torch.compile(self.model, mode=compile_mode)
         self.bufs = {}
         self.slots = {}  # async staging buffers, one set per in-flight batch
         # Warm up every bucket so CUDA-graph capture is up front -- under no_grad, as every
@@ -492,6 +497,8 @@ def main():
     p.add_argument("--flush-positions", type=int, default=10_000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-compile", action="store_true")
+    p.add_argument("--compile-mode", choices=COMPILE_MODES, default=COMPILE_MODES[0],
+                   help="torch.compile mode of the forward (CUDA)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--workers", type=int, default=1,
                    help="processes on the same --out, each feeding the GPU from its own thread")
@@ -558,7 +565,8 @@ def main():
         "depth_stats": args.depth_stats,
     }
     openings = selfplay_openings(args)
-    forward = Forward(args.model, args.device, args.ema, not args.no_compile)
+    forward = Forward(args.model, args.device, args.ema, not args.no_compile,
+                      compile_mode=args.compile_mode)
     forward.verify_every = args.verify_every
     writer = ShardWriter(out_dir, flush_positions=args.flush_positions,
                          prefix="positions_" if n_w == 1 else f"positions_w{w}_")

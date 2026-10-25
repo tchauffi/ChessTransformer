@@ -43,7 +43,7 @@ class FakeForward:
 
     instances = 0
 
-    def __init__(self, model_dir, device, use_ema, compile_model, buckets=None):
+    def __init__(self, model_dir, device, use_ema, compile_model, buckets=None, compile_mode=None):
         self.salt = FakeForward.instances * 1.7
         FakeForward.instances += 1
         self.verify_every = 0

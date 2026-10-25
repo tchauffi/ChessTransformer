@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import selfplay_core  # noqa: E402
-from selfplay_rust import Forward  # noqa: E402
+from selfplay_rust import COMPILE_MODES, Forward  # noqa: E402
 
 from chesstransformer.evaluation.sprt import (  # noqa: E402
     complete_prefix,
@@ -139,6 +139,8 @@ def main() -> None:
                    help="recompute every N-th async batch synchronously and compare (0 = never)")
     p.add_argument("--games-out", type=Path, default=None, help="append one JSON line per game")
     p.add_argument("--no-compile", action="store_true")
+    p.add_argument("--compile-mode", choices=COMPILE_MODES, default=COMPILE_MODES[0],
+                   help="torch.compile mode of both forwards (CUDA)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
     la = args.label_a or Path(args.model_a).name
@@ -175,7 +177,8 @@ def main() -> None:
     # Two compiled networks share the card: capture graphs up to 512 rows only (larger
     # batches are split), half of self-play's set.
     # Half k runs on devices[k % len(devices)]: both colours of an opening stay on one card.
-    forwards = [[Forward(m, d, False, not args.no_compile, buckets=(64, 128, 256, 512))
+    forwards = [[Forward(m, d, False, not args.no_compile, buckets=(64, 128, 256, 512),
+                         compile_mode=args.compile_mode)
                  for m in (args.model_a, args.model_b)] for d in devices]
     for fwd in (f for pair in forwards for f in pair):
         fwd.verify_every = args.verify_every

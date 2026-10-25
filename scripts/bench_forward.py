@@ -27,7 +27,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from selfplay_rust import Forward, load_model  # noqa: E402
+from selfplay_rust import COMPILE_MODES, Forward, load_model  # noqa: E402
 
 
 def inputs(n: int, width: int, rng: np.random.Generator):
@@ -40,12 +40,12 @@ def inputs(n: int, width: int, rng: np.random.Generator):
     return boards, player, castling, ep, legal
 
 
-def bench_model(model_dir: str, batches: list[int], iters: int, compile_model: bool) -> None:
+def bench_model(model_dir: str, batches: list[int], iters: int, compile_model: bool, mode: str) -> None:
     model = load_model(Path(model_dir), "cuda").bfloat16().eval()
     params = sum(p.numel() for p in model.parameters())
     gflop = 2 * params * 64 / 1e9  # ~2 FLOPs per weight per token, 64 tokens; attention extra
     if compile_model:
-        model = torch.compile(model, mode="reduce-overhead")
+        model = torch.compile(model, mode=mode)
     print(f"model: {params / 1e6:.1f}M params, ~{gflop:.1f} GFLOP/eval (weights only)")
     print(f"{'batch':>6} {'ms/batch':>9} {'evals/s':>10} {'~TFLOPS':>8} {'peak GB':>8}")
     for b in batches:
@@ -68,9 +68,9 @@ def bench_model(model_dir: str, batches: list[int], iters: int, compile_model: b
 
 
 def bench_launch(model_dir: str, batches: list[int], iters: int, top: int, width: int,
-                 compile_model: bool) -> None:
+                 compile_model: bool, mode: str) -> None:
     buckets = tuple(b for b in (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192) if b <= top)
-    fwd = Forward(model_dir, "cuda", False, compile_model, buckets=buckets)
+    fwd = Forward(model_dir, "cuda", False, compile_model, buckets=buckets, compile_mode=mode)
     fwd.verify_every = 0
     rng = np.random.default_rng(0)
     print(f"\nlaunch/wait path, buckets {buckets}, legal width {width}, two slots alternating")
@@ -101,15 +101,17 @@ def main() -> None:
     p.add_argument("--top", type=int, default=1024, help="largest CUDA-graph bucket of the launch path")
     p.add_argument("--width", type=int, default=64, help="legal-move columns per position")
     p.add_argument("--no-compile", action="store_true")
+    p.add_argument("--compile-mode", choices=COMPILE_MODES, default=COMPILE_MODES[0])
     p.add_argument("--only", choices=("model", "launch"))
     args = p.parse_args()
     assert torch.cuda.is_available(), "needs a CUDA GPU"
     print("GPU:", torch.cuda.get_device_name(0), "| torch", torch.__version__)
     batches = [int(b) for b in args.batches.split(",")]
     if args.only != "launch":
-        bench_model(args.model, batches, args.iters, not args.no_compile)
+        bench_model(args.model, batches, args.iters, not args.no_compile, args.compile_mode)
     if args.only != "model":
-        bench_launch(args.model, batches, args.iters, args.top, args.width, not args.no_compile)
+        bench_launch(args.model, batches, args.iters, args.top, args.width, not args.no_compile,
+                     args.compile_mode)
 
 
 if __name__ == "__main__":
