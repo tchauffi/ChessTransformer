@@ -57,10 +57,11 @@ WHEEL_TARGET ?= rust/target-wheel
 
 HF := uv run hf
 STATE := README.md history.tsv anchors.tsv selfplay_hours forced_playouts policy_target policy_temp \
-	fresh_full full_frac rl_generation.log gates/*
+	fresh_full full_frac draw_contempt rl_generation.log gates/*
 # The loop's self-play settings (rl_generation.sh), for the benchmark.
 SELFPLAY_ARGS = --sims 800 --fast-sims 160 --full-frac $$(cat $(RL)/full_frac 2>/dev/null || echo 0.25) --cap-total all \
 	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2 --fresh-full \
+	--draw-contempt $$(cat $(RL)/draw_contempt 2>/dev/null || echo 0.2) \
 	--book data/openings/book2k.json
 
 .PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop stop status backup push-inputs
@@ -129,12 +130,12 @@ check:  ## the GPU and the engine, then 2 self-play workers on the champion for 
 	rm -rf /tmp/ct-smoke
 	uv run python scripts/selfplay_rust.py --model $(RL)/champion --out /tmp/ct-smoke --games 64 \
 		--sims 64 --fast-sims 16 --max-plies 60 --parallel-games 64 --workers 2 --max-hours 0.02 \
-		--forced-playouts 2 --dirichlet-alpha 0.3 --fresh-full | grep -vE "wrote positions"
+		--forced-playouts 2 --dirichlet-alpha 0.3 --fresh-full --draw-contempt 0.2 | grep -vE "wrote positions"
 	# The loop's engine records the root search over every legal move (gen03 onwards).
 	uv run python -c "import glob, numpy as np; \
 		d = np.load(sorted(glob.glob('/tmp/ct-smoke/positions_*.npz'))[0]); \
 		assert 'legal_q' in d, 'this engine does not record the root search: not the loop engine'"
-	echo "smoke test: $$(wc -l < /tmp/ct-smoke/games.jsonl) games written, forced playouts on"
+	echo "smoke test: $$(wc -l < /tmp/ct-smoke/games.jsonl) games written, forced playouts and draw contempt on"
 
 bench:  ## self-play games/h at WORKERS x PARALLEL for MINUTES, the loop's settings (data/rl untouched)
 	out=/tmp/ct-bench-$(WORKERS)x$(PARALLEL); rm -rf $$out
