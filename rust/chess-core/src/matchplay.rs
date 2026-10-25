@@ -30,7 +30,7 @@ pub struct SideParams {
     pub c_puct: [f64; 2],
     pub fpu: [f64; 2],
     pub prior_temp: [f32; 2],
-    pub sim_batch: usize,
+    pub sim_batch: [usize; 2],
     pub tt_cap: usize,
     /// Per net (0 = A): it reads the rule state (`SearchParams::rule_state`).
     pub rule_state: [bool; 2],
@@ -45,7 +45,7 @@ impl SideParams {
             c_puct: self.c_puct[s],
             fpu: self.fpu[s],
             prior_temp: self.prior_temp[s],
-            sim_batch: self.sim_batch,
+            sim_batch: self.sim_batch[s],
             tt_cap: self.tt_cap,
             legal_in_requests: true,
             rule_state: self.rule_state[s],
@@ -290,12 +290,13 @@ mod tests {
     #[test]
     fn each_net_searches_with_its_own_settings() {
         let p = SideParams {
-            c_puct: [1.0, 2.5], fpu: [0.2, 0.05], prior_temp: [1.0, 1.4], sim_batch: 16,
+            c_puct: [1.0, 2.5], fpu: [0.2, 0.05], prior_temp: [1.0, 1.4], sim_batch: [16, 1],
             tt_cap: 1000, rule_state: [true, false], twofold_history: [false, true],
         };
         let (a, b) = (p.search_params(0), p.search_params(1));
         assert_eq!((a.c_puct, a.fpu, a.prior_temp, a.rule_state, a.twofold_history), (1.0, 0.2, 1.0, true, false));
         assert_eq!((b.c_puct, b.fpu, b.prior_temp, b.rule_state, b.twofold_history), (2.5, 0.05, 1.4, false, true));
+        assert_eq!((a.sim_batch, b.sim_batch), (16, 1));
     }
 
     fn pos(fen: &str) -> Chess {
@@ -304,7 +305,7 @@ mod tests {
 
     fn params(sim_batch: usize) -> SideParams {
         SideParams {
-            c_puct: [1.0; 2], fpu: [0.2; 2], prior_temp: [1.0; 2], sim_batch, tt_cap: 2_000_000,
+            c_puct: [1.0; 2], fpu: [0.2; 2], prior_temp: [1.0; 2], sim_batch: [sim_batch; 2], tt_cap: 2_000_000,
             rule_state: [false, false], twofold_history: [false, false],
         }
     }

@@ -108,7 +108,8 @@ def main() -> None:
     p.add_argument("--fpu", type=float, default=0.2)
     p.add_argument("--prior-temp", type=float, default=1.0,
                    help="softmax temperature of the policy priors (ct-bot --prior-temp)")
-    for side in ("a", "b"):  # per-net overrides of the three search settings
+    for side in ("a", "b"):  # per-net overrides of the four search settings
+        p.add_argument(f"--sim-batch-{side}", type=int, default=None)
         p.add_argument(f"--c-puct-{side}", type=float, default=None)
         p.add_argument(f"--fpu-{side}", type=float, default=None)
         p.add_argument(f"--prior-temp-{side}", type=float, default=None)
@@ -162,11 +163,12 @@ def main() -> None:
     }
     search = {}
     for side in ("a", "b"):
-        for key in ("c_puct", "fpu", "prior_temp"):
+        for key in ("sim_batch", "c_puct", "fpu", "prior_temp"):
             v = getattr(args, f"{key}_{side}")
             cfg[f"{key}_{side}"] = v if v is not None else cfg[key]
         cfg[f"twofold_history_{side}"] = getattr(args, f"twofold_history_{side}")
-        search[side] = (f"c_puct {cfg[f'c_puct_{side}']}, fpu {cfg[f'fpu_{side}']}, "
+        search[side] = (f"sim_batch {cfg[f'sim_batch_{side}']}, "
+                        f"c_puct {cfg[f'c_puct_{side}']}, fpu {cfg[f'fpu_{side}']}, "
                         f"prior_temp {cfg[f'prior_temp_{side}']}"
                         f"{', two-fold over history' if cfg[f'twofold_history_{side}'] else ''}")
     halves = [Half(cfg, lines, list(range(k, args.openings, k_eng))) for k in range(k_eng)]

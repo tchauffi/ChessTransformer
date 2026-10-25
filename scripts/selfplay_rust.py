@@ -431,6 +431,9 @@ def main():
                         "0 = off. Not --legacy-engine")
     p.add_argument("--contempt-ramp", type=float, default=0.3,
                    help="root value at which --draw-contempt applies in full")
+    p.add_argument("--depth-stats", action="store_true",
+                   help="with --report-every, also report the trees' depth per move (a walk of the "
+                        "tree after every search; benchmarks). Not --legacy-engine")
     p.add_argument("--book", default=None,
                    help="also start games from this book's openings (gpu_match's format, e.g. "
                         "data/openings/book2k.json), mixed with the shallow built-in ones")
@@ -540,6 +543,7 @@ def main():
         "twofold_history": args.twofold_history,
         "draw_contempt": args.draw_contempt,
         "contempt_ramp": args.contempt_ramp,
+        "depth_stats": args.depth_stats,
     }
     openings = selfplay_openings(args)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
@@ -598,6 +602,7 @@ def main():
     active, last = 0.0, time.monotonic()
     inflight = [None] * len(engines)
     next_report = args.report_every
+    launches, rows = 0, 0
     while not (all(e.done() for e in engines) and all(h is None for h in inflight)):
         now = time.monotonic()
         if now - last < 600:
@@ -608,7 +613,9 @@ def main():
             break
         if 0 < next_report <= active and not args.legacy_engine:
             searched = sum(e.stats()[4] for e in engines)
-            print(f"searched {searched} positions in {active:.0f} s", flush=True)
+            print(f"searched {searched} positions in {active:.0f} s | "
+                  f"{rows / max(launches, 1):.0f} positions per forward | "
+                  f"{search_report(engines, args.depth_stats)}", flush=True)
             next_report += args.report_every
         for k, eng in enumerate(engines):
             if args.legacy_engine:  # synchronous, full logits
@@ -630,6 +637,7 @@ def main():
             record(eng.drain_finished(), k)
             if len(player):
                 inflight[k] = forward.launch(k, boards, player, castling, ep, legal)
+                launches, rows = launches + 1, rows + len(player)
             elif not eng.done():
                 raise RuntimeError("engine returned an empty batch with games left")
 
@@ -639,6 +647,27 @@ def main():
     print(f"\nDone: {done_games} games, {n_positions} positions | "
           f"W {counts['1-0']} / D {counts['1/2-1/2']} / B {counts['0-1']} | "
           f"{el / 60:.1f} min ({done_games / el * 3600:.0f} games/h)")
+    if not args.legacy_engine:
+        print(f"search per move: {search_report(engines, args.depth_stats)}")
+
+
+def search_report(engines: list, depth: bool) -> str:
+    """Per move, by search kind: sims, GPU evals, TT hits and (with --depth-stats) the
+    tree's mean / max simulation depth and main-line length, all engines summed."""
+    parts = []
+    for kind, i in (("full", 1), ("fast", 0)):
+        t = {key: sum(e.search_stats()[i][key] for e in engines)
+             for key in ("moves", "sims", "nn_evals", "tt_hits", "depth_mean", "depth_max", "main_line")}
+        m = t["moves"]
+        if not m:
+            continue
+        s = (f"{kind} {m} moves: {t['sims'] / m:.0f} sims, {t['nn_evals'] / m:.0f} evals, "
+             f"{t['tt_hits'] / m:.0f} tt")
+        if depth:
+            s += (f", depth {t['depth_mean'] / m:.2f} mean / {t['depth_max'] / m:.1f} max / "
+                  f"{t['main_line'] / m:.1f} line")
+        parts.append(s)
+    return " | ".join(parts)
 
 
 if __name__ == "__main__":

@@ -73,6 +73,35 @@ pub struct SelfPlayRules {
     /// Contempt for rule draws when ahead (`SearchParams::draw_contempt`).
     pub draw_contempt: f64,
     pub contempt_ramp: f64,
+    /// Measure the tree's depth after every search (`SearchTally`); a walk of the
+    /// whole tree per move, so off outside benchmarks.
+    pub depth_stats: bool,
+}
+
+/// A game's searches summed, per kind (`SelfPlayGame::tally`): what the self-play
+/// benchmark reports per move. Depths come from `Search::depth_stats` (warm visits
+/// of the reused tree included) and stay 0 unless `SelfPlayRules::depth_stats`.
+#[derive(Clone, Copy, Default)]
+pub struct SearchTally {
+    pub moves: u64,
+    pub sims: u64,
+    pub nn_evals: u64,
+    pub tt_hits: u64,
+    pub depth_mean: f64,
+    pub depth_max: u64,
+    pub main_line: u64,
+}
+
+impl SearchTally {
+    pub fn add(&mut self, o: &SearchTally) {
+        self.moves += o.moves;
+        self.sims += o.sims;
+        self.nn_evals += o.nn_evals;
+        self.tt_hits += o.tt_hits;
+        self.depth_mean += o.depth_mean;
+        self.depth_max += o.depth_max;
+        self.main_line += o.main_line;
+    }
 }
 
 pub struct Record {
@@ -117,6 +146,7 @@ pub struct SelfPlayGame {
     resign_sign: i32,
     records: Vec<Record>,
     end: Option<(f32, &'static str)>,
+    tally: [SearchTally; 2],
 }
 
 impl SelfPlayGame {
@@ -160,9 +190,15 @@ impl SelfPlayGame {
             resign_sign: 0,
             records: Vec::new(),
             end: None,
+            tally: [SearchTally::default(); 2],
         };
         g.check_end(rules);
         g
+    }
+
+    /// The game's searches so far, [fast, full].
+    pub fn tally(&self) -> &[SearchTally; 2] {
+        &self.tally
     }
 
     /// (z from white's POV, reason) once the game is over.
@@ -245,6 +281,17 @@ impl SelfPlayGame {
                         Some(visits) => self.search.finish_with_visits(job, visits),
                         None => self.search.finish(job),
                     };
+                    let t = &mut self.tally[self.full as usize];
+                    t.moves += 1;
+                    t.sims += result.sims as u64;
+                    t.nn_evals += result.nn_evals as u64;
+                    t.tt_hits += result.tt_hits as u64;
+                    if rules.depth_stats {
+                        let d = self.search.depth_stats();
+                        t.depth_mean += d.mean as f64;
+                        t.depth_max += d.max as u64;
+                        t.main_line += d.main_line as u64;
+                    }
                     self.record(result.value, pruned.as_deref());
                     self.play(result.best, result.value, rules);
                 }
@@ -374,7 +421,7 @@ mod tests {
             no_resign_frac: 0.1, max_plies: 40, sim_batch: 16, c_puct: 1.0, fpu: 0.2,
             prior_temp: 1.0, tt_cap: 2_000_000, cap_total_full: false, cap_total_fast: false,
             rule_state: false, forced_playouts: 0.0, fresh_full: false, twofold_history: false,
-            draw_contempt: 0.0, contempt_ramp: 0.3,
+            draw_contempt: 0.0, contempt_ramp: 0.3, depth_stats: false,
         }
     }
 
@@ -433,6 +480,22 @@ mod tests {
             assert_eq!(g.moves_uci(), &want[..], "caps {cap_total_full} {cap_total_fast}");
             assert_eq!(g.records().iter().map(|r| r.full).collect::<Vec<_>>(), fulls);
         }
+    }
+
+    #[test]
+    fn tally_sums_the_searches_by_kind() {
+        let off = batched(&rules(), 11);
+        let r = SelfPlayRules { depth_stats: true, ..rules() };
+        let g = batched(&r, 11);
+        assert_eq!(g.moves_uci(), off.moves_uci(), "measuring the depth changes no move");
+        let [fast, full] = *g.tally();
+        let n_full = g.records().iter().filter(|r| r.full == 1).count() as u64;
+        assert_eq!((full.moves, fast.moves), (n_full, g.records().len() as u64 - n_full));
+        assert_eq!((full.sims, fast.sims), (full.moves * 64, fast.moves * 16));
+        assert!(full.nn_evals > 0 && full.nn_evals + full.tt_hits <= full.sims);
+        assert!(full.depth_mean > fast.depth_mean / fast.moves as f64 * full.moves as f64);
+        assert!(full.main_line >= full.moves && full.depth_max >= full.main_line);
+        assert_eq!(off.tally()[1].depth_mean, 0.0);
     }
 
     #[test]

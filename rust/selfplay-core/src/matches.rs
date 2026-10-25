@@ -62,7 +62,7 @@ struct MatchConfig {
     fpu: f64,
     #[serde(default = "d_one")]
     prior_temp: f32,
-    /// Per-net overrides of the three search settings above (net A / net B).
+    /// Per-net overrides of the four search settings above (net A / net B).
     #[serde(default)]
     c_puct_a: Option<f64>,
     #[serde(default)]
@@ -75,6 +75,10 @@ struct MatchConfig {
     prior_temp_a: Option<f32>,
     #[serde(default)]
     prior_temp_b: Option<f32>,
+    #[serde(default)]
+    sim_batch_a: Option<usize>,
+    #[serde(default)]
+    sim_batch_b: Option<usize>,
     /// TT entries per search. ct-bot's 2M would need tens of GB across hundreds
     /// of searches; the TT only caches evaluations, so a smaller one changes the
     /// GPU work, not the search.
@@ -202,7 +206,7 @@ impl MatchEngine {
             fpu: [cfg.fpu_a.unwrap_or(cfg.fpu), cfg.fpu_b.unwrap_or(cfg.fpu)],
             prior_temp: [cfg.prior_temp_a.unwrap_or(cfg.prior_temp),
                          cfg.prior_temp_b.unwrap_or(cfg.prior_temp)],
-            sim_batch: cfg.sim_batch,
+            sim_batch: [cfg.sim_batch_a.unwrap_or(cfg.sim_batch), cfg.sim_batch_b.unwrap_or(cfg.sim_batch)],
             tt_cap: cfg.tt_cap,
             rule_state: [cfg.rule_state_a, cfg.rule_state_b],
             twofold_history: [cfg.twofold_history_a, cfg.twofold_history_b],

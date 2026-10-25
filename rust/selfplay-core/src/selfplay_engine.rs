@@ -3,7 +3,7 @@
 //! and game records as `Engine`, which keeps its own older search.
 
 use chess_core::search::EvalOutput;
-use chess_core::selfplay::{SelfPlayGame, SelfPlayRules};
+use chess_core::selfplay::{SearchTally, SelfPlayGame, SelfPlayRules};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
             PyReadonlyArray3};
 use pyo3::prelude::*;
@@ -98,6 +98,9 @@ struct Config {
     draw_contempt: f64,
     #[serde(default = "d_contempt_ramp")]
     contempt_ramp: f64,
+    /// Measure the tree's depth after every search (`SelfPlayRules::depth_stats`).
+    #[serde(default)]
+    depth_stats: bool,
 }
 fn d_games() -> usize { 128 }
 fn d_batch() -> usize { 16 }
@@ -129,6 +132,8 @@ pub struct SelfPlayEngine {
     completed: usize,
     target: usize,
     positions_recorded: usize,
+    /// The finished games' searches, [fast, full].
+    tally_done: [SearchTally; 2],
     /// (game slot, positions) of the last collect, in batch order.
     owners: Vec<(usize, usize)>,
     /// Legal-move count per position of the last collect, and the padded width.
@@ -206,7 +211,7 @@ impl SelfPlayEngine {
             cap_total_full: c.cap_total_full, cap_total_fast: c.cap_total_fast,
             rule_state: c.rule_state, forced_playouts: c.forced_playouts, fresh_full: c.fresh_full,
             twofold_history: c.twofold_history, draw_contempt: c.draw_contempt,
-            contempt_ramp: c.contempt_ramp,
+            contempt_ramp: c.contempt_ramp, depth_stats: c.depth_stats,
         };
         let mut e = SelfPlayEngine {
             rules,
@@ -221,6 +226,7 @@ impl SelfPlayEngine {
             completed: 0,
             target,
             positions_recorded: 0,
+            tally_done: [SearchTally::default(); 2],
             owners: Vec::new(),
             legal_lens: Vec::new(),
             legal_width: 1,
@@ -252,6 +258,9 @@ impl SelfPlayEngine {
                 if self.games[i].end().is_some() {
                     let g = self.games.swap_remove(i);
                     self.positions_recorded += g.records().len();
+                    for (done, t) in self.tally_done.iter_mut().zip(g.tally()) {
+                        done.add(t);
+                    }
                     self.completed += 1;
                     self.finished.push(g);
                 } else {
@@ -450,5 +459,28 @@ impl SelfPlayEngine {
         let tt = self.games.iter().map(|g| g.tt_len()).sum();
         let in_flight: usize = self.games.iter().map(|g| g.records().len()).sum();
         (self.started, self.completed, self.positions_recorded, tt, self.positions_recorded + in_flight)
+    }
+
+    /// The searches so far, games in flight included, as [fast, full] dicts of sums: moves,
+    /// sims, nn_evals, tt_hits, depth_mean, depth_max, main_line (the depths 0 unless
+    /// `depth_stats`).
+    fn search_stats<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let mut sum = self.tally_done;
+        for g in &self.games {
+            for (s, t) in sum.iter_mut().zip(g.tally()) {
+                s.add(t);
+            }
+        }
+        sum.iter().map(|t| {
+            let d = PyDict::new(py);
+            d.set_item("moves", t.moves)?;
+            d.set_item("sims", t.sims)?;
+            d.set_item("nn_evals", t.nn_evals)?;
+            d.set_item("tt_hits", t.tt_hits)?;
+            d.set_item("depth_mean", t.depth_mean)?;
+            d.set_item("depth_max", t.depth_max)?;
+            d.set_item("main_line", t.main_line)?;
+            Ok(d)
+        }).collect()
     }
 }
