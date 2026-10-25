@@ -2,6 +2,8 @@
 //! parallel threads, their waves handed to Python as one batch. Same protocol
 //! and game records as `Engine`, which keeps its own older search.
 
+use std::collections::{HashMap, VecDeque};
+
 use chess_core::search::EvalOutput;
 use chess_core::selfplay::{SearchTally, SelfPlayGame, SelfPlayRules};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
@@ -125,7 +127,9 @@ pub struct SelfPlayEngine {
     threads: usize,
     openings: Vec<Chess>,
     opening_fens: Vec<String>,
-    games: Vec<SelfPlayGame>,
+    /// Game slots. `collect` closes the gap a finished game leaves; `collect_queued` empties
+    /// its slot instead, as batches in flight hold slot numbers.
+    games: Vec<Option<SelfPlayGame>>,
     finished: Vec<SelfPlayGame>,
     rng: StdRng,
     started: usize,
@@ -142,17 +146,137 @@ pub struct SelfPlayEngine {
     /// Rule state (halfmove clock, repetitions) per position of the last collect.
     rule50: Vec<u8>,
     repetition: Vec<u8>,
+    /// Queued protocol: the slots whose positions wait for a batch, in arrival order, and
+    /// per slot whether it waits there or in a batch on the GPU.
+    queue: VecDeque<usize>,
+    queued: Vec<bool>,
+    in_flight: Vec<bool>,
+    /// The batches handed out by `collect_queued` and not applied yet, by id.
+    batches: HashMap<u64, Batch>,
+    next_batch: u64,
+}
+
+/// One batch of the queued protocol: (slot, positions) in batch order, each position's
+/// legal-move count and the padded width.
+struct Batch {
+    owners: Vec<(usize, usize)>,
+    lens: Vec<u16>,
+    width: usize,
+}
+
+/// The NN inputs of a batch, in its order.
+struct Rows {
+    boards: Vec<u8>,
+    player: Vec<u8>,
+    castling: Vec<u8>,
+    ep: Vec<u8>,
+    rule50: Vec<u8>,
+    repetition: Vec<u8>,
+    legal: Vec<i16>,
+    width: usize,
+    lens: Vec<u16>,
 }
 
 impl SelfPlayEngine {
+    /// Start games until `num_parallel_games` play, into emptied slots first. Every new game
+    /// takes the next (opening, seed) draw, so game k is the same game whatever the protocol.
     fn fill(&mut self) {
-        while self.games.len() < self.num_parallel_games && self.started < self.target {
-            let oi = self.rng.gen_range(0..self.openings.len());
-            let seed = self.rng.gen();
-            let g = SelfPlayGame::new(self.started, oi, self.openings[oi].clone(), &self.rules, seed);
-            self.started += 1;
-            self.games.push(g);
+        for i in 0..self.games.len() {
+            if self.games[i].is_none() && self.started < self.target {
+                self.games[i] = Some(self.spawn());
+            }
         }
+        while self.games.len() < self.num_parallel_games && self.started < self.target {
+            let g = self.spawn();
+            self.games.push(Some(g));
+        }
+    }
+
+    fn spawn(&mut self) -> SelfPlayGame {
+        let oi = self.rng.gen_range(0..self.openings.len());
+        let seed = self.rng.gen();
+        let g = SelfPlayGame::new(self.started, oi, self.openings[oi].clone(), &self.rules, seed);
+        self.started += 1;
+        g
+    }
+
+    fn game(&self, slot: usize) -> &SelfPlayGame {
+        self.games[slot].as_ref().expect("live game slot")
+    }
+
+    /// Advance every game until it waits on an eval or ends, retire the finished ones and
+    /// start their successors, until no game finishes. `in_place`: empty a finished game's
+    /// slot instead of closing the gap.
+    fn advance_all(&mut self, in_place: bool) -> PyResult<()> {
+        loop {
+            let rules = self.rules;
+            self.par_games(|_, g| g.advance(&rules));
+            if let Some(g) = self.games.iter().flatten().find(|g| g.stalled()) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "self-play engine stalled in game {}", g.id)));
+            }
+            let mut retired = false;
+            let mut i = 0;
+            while i < self.games.len() {
+                if self.games[i].as_ref().is_some_and(|g| g.end().is_some()) {
+                    let g = if in_place { self.games[i].take() } else { self.games.swap_remove(i) }
+                        .expect("finished game");
+                    self.positions_recorded += g.records().len();
+                    for (done, t) in self.tally_done.iter_mut().zip(g.tally()) {
+                        done.add(t);
+                    }
+                    self.completed += 1;
+                    self.finished.push(g);
+                    retired = true;
+                    if in_place {
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            self.fill();
+            if !retired || self.games.iter().all(Option::is_none) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The pending positions of `owners`' games, in order.
+    fn rows(&self, owners: &[(usize, usize)]) -> Rows {
+        let (mut boards, mut player, mut castling, mut ep) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut rule50, mut repetition) = (Vec::new(), Vec::new());
+        let reqs = || owners.iter().flat_map(|&(gi, _)| self.game(gi).pending().unwrap().iter());
+        for r in reqs() {
+            boards.extend_from_slice(&r.tokens);
+            player.push(r.player);
+            castling.push(r.castling);
+            ep.push(r.ep);
+            rule50.push(r.rule50);
+            repetition.push(r.repetition);
+        }
+        let (legal, width, lens) = legal_rows(reqs());
+        Rows { boards, player, castling, ep, rule50, repetition, legal, width, lens }
+    }
+
+    /// Resolve the games of `owners` with the gathered legal-move logits (rows of `width`)
+    /// and values of their positions, in order.
+    fn resolve(&mut self, owners: &[(usize, usize)], lens: &[u16], width: usize, flat: &[f32], values: &[f32]) {
+        let mut offset = vec![None; self.games.len()];
+        let mut at = 0;
+        for &(gi, k) in owners {
+            offset[gi] = Some((at, k));
+            at += k;
+        }
+        let offset = &offset;
+        self.par_games(|gi, g| {
+            let Some((at, k)) = offset[gi] else { return };
+            let outputs: Vec<EvalOutput> = (at..at + k)
+                .map(|i| EvalOutput { logits: flat[i * width..i * width + lens[i] as usize].to_vec(),
+                                      value: values[i] })
+                .collect();
+            g.resolve(outputs);
+        });
     }
 
     /// Run `f` over every game on `threads` threads, which pull small chunks as they finish:
@@ -167,7 +291,9 @@ impl SelfPlayEngine {
         let threads = self.threads.max(1).min(n.div_ceil(GRAIN)).max(1);
         if threads == 1 {
             for (i, g) in self.games.iter_mut().enumerate() {
-                f(i, g);
+                if let Some(g) = g {
+                    f(i, g);
+                }
             }
             return;
         }
@@ -179,7 +305,9 @@ impl SelfPlayEngine {
                     let next = work.lock().unwrap().next();
                     let Some((ci, games)) = next else { break };
                     for (j, g) in games.iter_mut().enumerate() {
-                        f(ci * GRAIN + j, g);
+                        if let Some(g) = g {
+                            f(ci * GRAIN + j, g);
+                        }
                     }
                 });
             }
@@ -232,6 +360,11 @@ impl SelfPlayEngine {
             legal_width: 1,
             rule50: Vec::new(),
             repetition: Vec::new(),
+            queue: VecDeque::new(),
+            queued: Vec::new(),
+            in_flight: Vec::new(),
+            batches: HashMap::new(),
+            next_batch: 0,
         };
         e.fill();
         Ok(e)
@@ -245,65 +378,106 @@ impl SelfPlayEngine {
         Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<u8>>,
         Bound<'py, PyArray1<u8>>, Bound<'py, PyArray2<i16>>,
     )> {
-        loop {
-            let rules = self.rules;
-            self.par_games(|_, g| g.advance(&rules));
-            if let Some(g) = self.games.iter().find(|g| g.stalled()) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "self-play engine stalled in game {}", g.id)));
+        self.advance_all(false)?;
+        self.owners = self.games.iter().enumerate()
+            .filter_map(|(gi, g)| Some((gi, g.as_ref()?.pending()?.len())))
+            .collect();
+        let r = self.rows(&self.owners);
+        let n = r.player.len();
+        self.legal_lens = r.lens;
+        self.legal_width = r.width;
+        self.rule50 = r.rule50;
+        self.repetition = r.repetition;
+        Ok((
+            PyArray1::from_vec(py, r.boards).reshape([n, 64]).expect("reshape"),
+            r.player.into_pyarray(py),
+            r.castling.into_pyarray(py),
+            r.ep.into_pyarray(py),
+            PyArray1::from_vec(py, r.legal).reshape([n, r.width]).expect("reshape"),
+        ))
+    }
+
+    /// The queued protocol, where up to `batches in flight` batches of one bucket each keep
+    /// the GPU fed without lockstep waves: advance every game whose evaluation is back, queue
+    /// its positions, and hand out the oldest queued ones as batch `id`, whole games only, at
+    /// most `max_rows` positions (a single game bigger than that goes alone). Returns (id,
+    /// boards, player, castling, ep, legal), as `collect` plus the id `apply_queued` takes; an
+    /// empty batch (no id taken, nothing to apply) means every game waits on a batch in
+    /// flight. Games are the same games as under `collect`; one engine uses one protocol.
+    #[allow(clippy::type_complexity)]
+    fn collect_queued<'py>(&mut self, py: Python<'py>, max_rows: usize) -> PyResult<(
+        u64, Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<u8>>,
+        Bound<'py, PyArray1<u8>>, Bound<'py, PyArray2<i16>>,
+    )> {
+        self.advance_all(true)?;
+        let n_slots = self.games.len();
+        self.queued.resize(n_slots, false);
+        self.in_flight.resize(n_slots, false);
+        for (gi, g) in self.games.iter().enumerate() {
+            if g.as_ref().is_some_and(|g| g.pending().is_some()) && !self.queued[gi] && !self.in_flight[gi] {
+                self.queue.push_back(gi);
+                self.queued[gi] = true;
             }
-            let before = self.games.len();
-            let mut i = 0;
-            while i < self.games.len() {
-                if self.games[i].end().is_some() {
-                    let g = self.games.swap_remove(i);
-                    self.positions_recorded += g.records().len();
-                    for (done, t) in self.tally_done.iter_mut().zip(g.tally()) {
-                        done.add(t);
-                    }
-                    self.completed += 1;
-                    self.finished.push(g);
-                } else {
-                    i += 1;
-                }
-            }
-            let retired = before != self.games.len();
-            self.fill();
-            if !retired || self.games.is_empty() {
+        }
+        let mut owners = Vec::new();
+        let mut rows = 0;
+        while let Some(&gi) = self.queue.front() {
+            let k = self.game(gi).pending().expect("queued game waits on an eval").len();
+            if rows > 0 && rows + k > max_rows {
                 break;
             }
+            self.queue.pop_front();
+            self.queued[gi] = false;
+            self.in_flight[gi] = true;
+            owners.push((gi, k));
+            rows += k;
         }
-
-        self.owners.clear();
-        let (mut boards, mut player, mut castling, mut ep) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        self.rule50.clear();
-        self.repetition.clear();
-        for (gi, g) in self.games.iter().enumerate() {
-            if let Some(reqs) = g.pending() {
-                for r in reqs {
-                    boards.extend_from_slice(&r.tokens);
-                    player.push(r.player);
-                    castling.push(r.castling);
-                    ep.push(r.ep);
-                    self.rule50.push(r.rule50);
-                    self.repetition.push(r.repetition);
-                }
-                self.owners.push((gi, reqs.len()));
-            }
+        let r = self.rows(&owners);
+        let n = r.player.len();
+        let id = self.next_batch;
+        if n > 0 {
+            self.next_batch += 1;
+            self.batches.insert(id, Batch { owners, lens: r.lens, width: r.width });
         }
-        let n = player.len();
-        let (legal, width, lens) = legal_rows(
-            self.owners.iter().flat_map(|&(gi, _)| self.games[gi].pending().unwrap().iter()));
-        self.legal_lens = lens;
-        self.legal_width = width;
+        self.rule50 = r.rule50;
+        self.repetition = r.repetition;
         Ok((
-            PyArray1::from_vec(py, boards).reshape([n, 64]).expect("reshape"),
-            player.into_pyarray(py),
-            castling.into_pyarray(py),
-            ep.into_pyarray(py),
-            PyArray1::from_vec(py, legal).reshape([n, width]).expect("reshape"),
+            id,
+            PyArray1::from_vec(py, r.boards).reshape([n, 64]).expect("reshape"),
+            r.player.into_pyarray(py),
+            r.castling.into_pyarray(py),
+            r.ep.into_pyarray(py),
+            PyArray1::from_vec(py, r.legal).reshape([n, r.width]).expect("reshape"),
         ))
+    }
+
+    /// `apply_legal` for batch `id` of `collect_queued`, in any order of the batches.
+    fn apply_queued(&mut self, id: u64, logits: PyReadonlyArray2<f32>, values: PyReadonlyArray1<f32>) -> PyResult<()> {
+        let Some(b) = self.batches.remove(&id) else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "apply_queued: no batch {id} in flight")));
+        };
+        let logits = logits.as_array();
+        let values = values.as_slice()?;
+        let total = b.lens.len();
+        if values.len() != total || logits.shape() != [total, b.width] {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "apply_queued: got {} values / logits {:?} for batch {id} of {} positions of width {}",
+                values.len(), logits.shape(), total, b.width)));
+        }
+        let flat = logits.as_slice().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("apply_queued: logits must be C-contiguous")
+        })?;
+        self.resolve(&b.owners, &b.lens, b.width, flat, values);
+        for &(gi, _) in &b.owners {
+            self.in_flight[gi] = false;
+        }
+        Ok(())
+    }
+
+    /// Batches handed out by `collect_queued` and not applied yet.
+    fn batches_in_flight(&self) -> usize {
+        self.batches.len()
     }
 
     /// (rule50, repetition) of the last collect's positions, in its order -- the extra
@@ -329,23 +503,8 @@ impl SelfPlayEngine {
             pyo3::exceptions::PyValueError::new_err("apply_legal: logits must be C-contiguous")
         })?;
         let lens = std::mem::take(&mut self.legal_lens);
-        let lens = &lens;
-        let mut offset = vec![None; self.games.len()];
-        let mut at = 0;
-        for &(gi, k) in &self.owners {
-            offset[gi] = Some((at, k));
-            at += k;
-        }
-        let offset = &offset;
-        self.par_games(|gi, g| {
-            let Some((at, k)) = offset[gi] else { return };
-            let outputs: Vec<EvalOutput> = (at..at + k)
-                .map(|i| EvalOutput { logits: flat[i * width..i * width + lens[i] as usize].to_vec(),
-                                      value: values[i] })
-                .collect();
-            g.resolve(outputs);
-        });
-        self.owners.clear();
+        let owners = std::mem::take(&mut self.owners);
+        self.resolve(&owners, &lens, width, flat, values);
         Ok(())
     }
 
@@ -456,8 +615,8 @@ impl SelfPlayEngine {
     /// (games started, games completed, positions recorded, TT entries, positions searched):
     /// the last counts the games in flight too, a throughput that needs no game to finish.
     fn stats(&self) -> (usize, usize, usize, usize, usize) {
-        let tt = self.games.iter().map(|g| g.tt_len()).sum();
-        let in_flight: usize = self.games.iter().map(|g| g.records().len()).sum();
+        let tt = self.games.iter().flatten().map(|g| g.tt_len()).sum();
+        let in_flight: usize = self.games.iter().flatten().map(|g| g.records().len()).sum();
         (self.started, self.completed, self.positions_recorded, tt, self.positions_recorded + in_flight)
     }
 
@@ -466,7 +625,7 @@ impl SelfPlayEngine {
     /// `depth_stats`).
     fn search_stats<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let mut sum = self.tally_done;
-        for g in &self.games {
+        for g in self.games.iter().flatten() {
             for (s, t) in sum.iter_mut().zip(g.tally()) {
                 s.add(t);
             }

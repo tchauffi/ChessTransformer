@@ -153,3 +153,53 @@ def test_records_keep_the_root_search_over_every_legal_move():
             raw = dict(zip(idx.tolist(), n.tolist()))
             for k, c in zip(g["visit_idx"][vptr[i]:vptr[i + 1]], g["visit_cnt"][vptr[i]:vptr[i + 1]]):
                 assert c <= raw[int(k)]  # the target is the raw visits, pruned
+
+
+def _run_queued(cfg, games=6, seed=0, max_rows=8, in_flight=3, sizes=None):
+    """Play `games` games on the queued protocol: up to `in_flight` batches out at once,
+    applied newest first to shuffle the order; `sizes`, a list, collects every batch's size."""
+    base = dict(num_parallel_games=4, max_plies=24, resign_threshold=2.0, threads=2)
+    eng = selfplay_core.SelfPlayEngine(json.dumps({**base, **cfg}), [START, ITALIAN], seed, games)
+    out, pending = [], []
+    while not (eng.done() and not pending):
+        if not eng.done():
+            bid, boards, player, _, _, legal = eng.collect_queued(max_rows)
+            out += eng.drain_finished()
+            if len(player):
+                if sizes is not None:
+                    sizes.append(len(player))
+                logits, values = _net(boards)
+                flat = np.concatenate([logits.reshape(len(logits), 64 * 73),
+                                       np.zeros((len(logits), 1), np.float32)], 1)
+                pending.append((bid, np.take_along_axis(flat, legal.astype(np.int64), 1), values))
+                assert eng.batches_in_flight() == len(pending)
+                if len(pending) < in_flight:
+                    continue
+        if pending:
+            eng.apply_queued(*pending.pop())
+    return sorted(out, key=lambda g: g["id"])
+
+
+@pytest.mark.parametrize("sim_batch", [1, 16])
+def test_queued_protocol_plays_the_same_games(sim_batch):
+    """Batches of any size, out in any number and applied in any order: every game is the
+    game the lockstep protocol plays, record for record."""
+    cfg = dict(num_sims=24, fast_sims=8, full_frac=0.3, dirichlet_alpha=0.3, forced_playouts=2.0,
+               sim_batch=sim_batch)
+    want = _run(cfg, games=8, seed=6)
+    sizes = []
+    got = _run_queued(cfg, games=8, seed=6, max_rows=max(2, sim_batch), sizes=sizes)
+    assert [g["id"] for g in got] == [g["id"] for g in want]
+    for a, b in zip(got, want):
+        assert a["moves"] == b["moves"] and a["fen"] == b["fen"]
+        for k in ("visit_idx", "visit_cnt", "z", "root_v", "legal_n", "legal_q"):
+            assert (a[k] == b[k]).all(), k
+    # Whole games per batch, at most max_rows unless one game alone is bigger.
+    assert max(sizes) <= max(2, sim_batch) and len(sizes) > 10
+
+
+def test_queued_protocol_rejects_unknown_batches():
+    eng = selfplay_core.SelfPlayEngine(json.dumps(dict(num_sims=8)), [START], 0, 1)
+    bid, *_ = eng.collect_queued(4)
+    with pytest.raises(ValueError, match="no batch"):
+        eng.apply_queued(bid + 1, np.zeros((1, 1), np.float32), np.zeros(1, np.float32))

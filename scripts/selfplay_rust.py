@@ -35,6 +35,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import json
 import os
@@ -463,6 +464,15 @@ def main():
     p.add_argument("--engines", type=int, default=2,
                    help="engine halves taking turns on the GPU (2 = the CPU searches one while "
                         "the GPU evaluates the other); 1 = no overlap")
+    p.add_argument("--queued", action="store_true",
+                   help="no lockstep halves: games queue their positions as their evaluations come "
+                        "back, and batches of --batch-rows leave the queue with up to "
+                        "--batches-in-flight on the GPU at once. Same games as lockstep; full "
+                        "buckets once enough games play. Not --legacy-engine")
+    p.add_argument("--batch-rows", type=int, default=0,
+                   help="--queued: positions per batch (0 = the largest CUDA-graph bucket)")
+    p.add_argument("--batches-in-flight", type=int, default=3,
+                   help="--queued: batches queued on the GPU while the CPU searches")
     p.add_argument("--report-every", type=float, default=0.0,
                    help="every this many seconds, print the positions searched so far, games in "
                         "flight included: a throughput that needs no game to finish (benchmarks; "
@@ -495,6 +505,8 @@ def main():
                 "--parallel-games or --workers to give the GPU bigger batches")
     if not 0.0 <= args.book_share <= 1.0:
         p.error("--book-share must be in [0, 1]")
+    if args.queued and args.legacy_engine:
+        p.error("--queued needs the default engine")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -569,7 +581,7 @@ def main():
     else:
         cfg["tt_cap"] = min(args.tt_cap, 200_000)  # per game here, one shared TT in Engine
         del cfg["leaves_per_wave"]  # the legacy engine's batching; this one rejects unknown keys
-        k_eng = max(1, args.engines)
+        k_eng = 1 if args.queued else max(1, args.engines)
         cfg["num_parallel_games"] = max(1, parallel // k_eng)
         engines = [selfplay_core.SelfPlayEngine(
             json.dumps(cfg), openings, seed + id_offset + 1_000_003 * k,
@@ -601,9 +613,12 @@ def main():
     budget = args.max_hours * 3600 if args.max_hours > 0 else float("inf")
     active, last = 0.0, time.monotonic()
     inflight = [None] * len(engines)
+    out = collections.deque()  # --queued: (batch id, forward handle), oldest first
+    slot = 0
+    batch_rows = args.batch_rows or forward.buckets[-1]
     next_report = args.report_every
     launches, rows = 0, 0
-    while not (all(e.done() for e in engines) and all(h is None for h in inflight)):
+    while not (all(e.done() for e in engines) and all(h is None for h in inflight) and not out):
         now = time.monotonic()
         if now - last < 600:
             active += now - last
@@ -617,6 +632,25 @@ def main():
                   f"{rows / max(launches, 1):.0f} positions per forward | "
                   f"{search_report(engines, args.depth_stats)}", flush=True)
             next_report += args.report_every
+        if args.queued:
+            # Collect and launch until --batches-in-flight batches are out, then take back the
+            # oldest: its games queue again at the next collect, behind those still waiting.
+            eng = engines[0]
+            if not eng.done():
+                bid, boards, player, castling, ep, legal = eng.collect_queued(batch_rows)
+                record(eng.drain_finished(), 0)
+                if len(player):
+                    out.append((bid, forward.launch(slot, boards, player, castling, ep, legal)))
+                    slot = (slot + 1) % args.batches_in_flight
+                    launches, rows = launches + 1, rows + len(player)
+                    if len(out) < args.batches_in_flight:
+                        continue
+                elif not out and not eng.done():
+                    raise RuntimeError("engine returned an empty batch with games left")
+            if out:
+                bid, handle = out.popleft()
+                eng.apply_queued(bid, *forward.wait(handle))
+            continue
         for k, eng in enumerate(engines):
             if args.legacy_engine:  # synchronous, full logits
                 boards, player, castling, ep = eng.collect()
