@@ -422,6 +422,15 @@ def main():
     p.add_argument("--twofold-history", action="store_true",
                    help="Lc0's two-fold rule over the game history too: a search position that "
                         "repeats any earlier one of the game is a draw. Not --legacy-engine")
+    p.add_argument("--draw-contempt", type=float, default=0.2,
+                   help="contempt for repetition and 50-move draws: the side the network calls "
+                        "ahead at the root (value v) scores them -C * min(|v| / --contempt-ramp, 1) "
+                        "wherever it moves in the search, so it plays on rather than repeat; the "
+                        "other side's stay 0. Recorded values are unchanged. On gen14, 0.2 cut the "
+                        "threefolds from 43%% to 36%% of games at the same Stockfish move quality. "
+                        "0 = off. Not --legacy-engine")
+    p.add_argument("--contempt-ramp", type=float, default=0.3,
+                   help="root value at which --draw-contempt applies in full")
     p.add_argument("--book", default=None,
                    help="also start games from this book's openings (gpu_match's format, e.g. "
                         "data/openings/book2k.json), mixed with the shallow built-in ones")
@@ -529,6 +538,8 @@ def main():
         "forced_playouts": args.forced_playouts,
         "fresh_full": args.fresh_full,
         "twofold_history": args.twofold_history,
+        "draw_contempt": args.draw_contempt,
+        "contempt_ramp": args.contempt_ramp,
     }
     openings = selfplay_openings(args)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile)
@@ -546,6 +557,9 @@ def main():
             print("WARNING: --legacy-engine has no tree reuse; --fresh-full changes nothing", flush=True)
         if args.twofold_history:
             print("WARNING: --legacy-engine has no two-fold rule; --twofold-history changes nothing",
+                  flush=True)
+        if args.draw_contempt:
+            print("WARNING: --legacy-engine has no draw contempt; --draw-contempt changes nothing",
                   flush=True)
         engines = [selfplay_core.Engine(json.dumps(cfg), openings, seed + id_offset, n_games)]
     else:

@@ -93,6 +93,11 @@ struct Config {
     /// The two-fold rule over the game history (`SearchParams::twofold_history`).
     #[serde(default)]
     twofold_history: bool,
+    /// Contempt for rule draws when ahead (`SearchParams::draw_contempt`; 0 = off).
+    #[serde(default)]
+    draw_contempt: f64,
+    #[serde(default = "d_contempt_ramp")]
+    contempt_ramp: f64,
 }
 fn d_games() -> usize { 128 }
 fn d_batch() -> usize { 16 }
@@ -108,6 +113,7 @@ fn d_max_plies() -> u32 { 300 }
 fn d_tt() -> usize { 100_000 }
 fn d_dir_eps() -> f64 { 0.25 }
 fn d_threads() -> usize { 6 }
+fn d_contempt_ramp() -> f64 { 0.3 }
 
 #[pyclass]
 pub struct SelfPlayEngine {
@@ -199,7 +205,8 @@ impl SelfPlayEngine {
             c_puct: c.c_puct, fpu: c.fpu, prior_temp: c.prior_temp, tt_cap: c.tt_cap,
             cap_total_full: c.cap_total_full, cap_total_fast: c.cap_total_fast,
             rule_state: c.rule_state, forced_playouts: c.forced_playouts, fresh_full: c.fresh_full,
-            twofold_history: c.twofold_history,
+            twofold_history: c.twofold_history, draw_contempt: c.draw_contempt,
+            contempt_ramp: c.contempt_ramp,
         };
         let mut e = SelfPlayEngine {
             rules,

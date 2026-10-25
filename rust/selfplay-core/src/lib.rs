@@ -249,7 +249,7 @@ impl Engine {
             if !self.games[gi].tree[node_idx].expanded {
                 return (node_idx, path, pos, keys);
             }
-            let idx = puct_select(&self.games[gi].tree[node_idx], self.cfg.c_puct, self.cfg.fpu);
+            let idx = puct_select(&self.games[gi].tree[node_idx], self.cfg.c_puct, self.cfg.fpu, 0.0);
             {
                 let node = &mut self.games[gi].tree[node_idx];
                 node.n[idx] += 1; // virtual loss

@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crate::encoding::{
     action_plane, encode_position, halfmove, move_coords, rule_key, rule_state,
-    search_terminal_value, zobrist,
+    search_terminal, zobrist,
     NUM_PLANES,
 };
-use crate::tree::{backup_vl, forced_select, prune_forced, puct_select, softmax_priors, Node};
+use crate::tree::{backup_rule_draw, backup_vl, forced_select, prune_forced, puct_select, softmax_priors, Node};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use shakmaty::{Chess, Move, Position};
@@ -55,6 +55,14 @@ pub struct SearchParams {
     /// occurrence. Off, a repeat of a pre-root position needs the full threefold, so a
     /// side ahead can shuffle back into the game's positions as if they were fresh.
     pub twofold_history: bool,
+    /// Contempt for rule draws (repetition, 50-move): the side the network calls ahead
+    /// at the root, |v| > 0, scores them -draw_contempt * min(|v| / contempt_ramp, 1)
+    /// wherever it picks a move in the tree, so it plays on rather than repeat; the other
+    /// side still scores them 0. Whoever is to move at the root, the same side carries it,
+    /// so the visits a reused tree brings from the opponent's search already hold it.
+    /// Selection only: the reported values and Qs score draws 0. 0 = off.
+    pub draw_contempt: f64,
+    pub contempt_ramp: f64,
     /// Syzygy tables. In-tree, positions reached by a capture or pawn move
     /// that the tables cover are scored exactly (WDL) instead of by the value
     /// head. At a covered root, a won position plays the DTZ-optimal move
@@ -76,6 +84,8 @@ impl Default for SearchParams {
             legal_in_requests: false,
             rule_state: false,
             twofold_history: false,
+            draw_contempt: 0.0,
+            contempt_ramp: 0.3,
             syzygy: None,
         }
     }
@@ -266,6 +276,9 @@ pub struct Search<E: Evaluator> {
     prev_start: Option<Chess>,
     prev_moves: Vec<Move>,
     rng: StdRng,
+    /// What a rule draw scores for the side that moves at even / odd depths in this
+    /// search (`SearchParams::draw_contempt`), set once the root is expanded.
+    draw: [f64; 2],
 }
 
 impl<E: Evaluator> Search<E> {
@@ -283,6 +296,7 @@ impl<E: Evaluator> Search<E> {
             prev_start: None,
             prev_moves: Vec::new(),
             rng: StdRng::from_entropy(),
+            draw: [0.0; 2],
         }
     }
 
@@ -480,6 +494,7 @@ impl<E: Evaluator> Search<E> {
                 Stage::Root => {
                     job.stage = Stage::Waves;
                     if self.tree[0].expanded {
+                        self.draw = self.draw_scores();
                         continue;
                     }
                     let pos_key = *self.history.last().unwrap();
@@ -683,7 +698,20 @@ impl<E: Evaluator> Search<E> {
             None => (moves, priors),
         };
         self.tree[0].expand(moves, priors);
+        self.draw = self.draw_scores();
         self.apply_root_noise(job);
+    }
+
+    /// The rule-draw scores by depth parity (`SearchParams::draw_contempt`): the contempt
+    /// for the side the network's value of the root calls ahead, 0 for the other; both 0
+    /// when off or once the cache has dropped that value.
+    fn draw_scores(&self) -> [f64; 2] {
+        if self.params.draw_contempt <= 0.0 {
+            return [0.0; 2];
+        }
+        let Some((_, v)) = self.root_eval() else { return [0.0; 2] };
+        let c = -self.params.draw_contempt * (v.abs() as f64 / self.params.contempt_ramp).min(1.0);
+        if v > 0.0 { [c, 0.0] } else { [0.0, c] }
     }
 
     /// Descend one wave of leaves. Terminal and tablebase leaves are backed up
@@ -705,8 +733,12 @@ impl<E: Evaluator> Search<E> {
             } else {
                 self.history.len() - 1
             };
-            if let Some(t) = search_terminal_value(&pos, &all_keys, key, root_idx) {
-                backup_vl(&mut self.tree, &path, t);
+            if let Some((t, rule_draw)) = search_terminal(&pos, &all_keys, key, root_idx) {
+                if rule_draw {
+                    backup_rule_draw(&mut self.tree, &path);
+                } else {
+                    backup_vl(&mut self.tree, &path, t);
+                }
                 job.sims_done += 1;
                 continue;
             }
@@ -837,7 +869,8 @@ impl<E: Evaluator> Search<E> {
                 return (node_idx, path, pos, keys);
             }
             let forced = if node_idx == 0 && forced_k > 0.0 { forced_select(&self.tree[0], forced_k) } else { None };
-            let idx = forced.unwrap_or_else(|| puct_select(&self.tree[node_idx], self.params.c_puct, self.params.fpu));
+            let draw = self.draw[path.len() % 2];
+            let idx = forced.unwrap_or_else(|| puct_select(&self.tree[node_idx], self.params.c_puct, self.params.fpu, draw));
             {
                 let node = &mut self.tree[node_idx];
                 node.n[idx] += 1; // virtual loss
@@ -880,7 +913,7 @@ impl<E: Evaluator> Search<E> {
     /// The root's visit counts after KataGo policy target pruning
     /// (`tree::prune_forced`), in `root_moves` order.
     pub fn pruned_root_visits(&self, forced_k: f64) -> Vec<u32> {
-        prune_forced(&self.tree[0], self.params.c_puct, forced_k)
+        prune_forced(&self.tree[0], self.params.c_puct, forced_k, self.draw[0])
     }
 
     /// Root children as (move, visits, Q from the root side-to-move POV, prior),
@@ -1013,6 +1046,7 @@ fn reroot(tree: &[Node], root: usize) -> Vec<Node> {
                 priors: node.priors.clone(),
                 n: node.n.clone(),
                 w: node.w.clone(),
+                d: node.d.clone(),
                 children: node
                     .children
                     .iter()
@@ -1286,29 +1320,126 @@ mod tests {
         // Black is a queen and rook down; per Stockfish (d26) every move loses
         // (-6.5 or worse) except Qf2+ Kh1 Qf1+ Kh2 Qf2+, a perpetual. With the
         // two-fold rule that cycle scores as a draw 5 plies in; threefold-only
-        // needs 9, which this budget does not reach.
+        // needs 9, which this budget does not reach. A contempt leaves it alone:
+        // the side behind still wants the draw.
         let p = pos("6k1/5ppp/R7/Q7/3q4/6PP/7K/8 b - - 0 1");
-        let mut s = Search::new(CheckingMaterialEval, SearchParams::default());
-        s.set_position(p, &[]);
-        let r = s.go(3000, None, &AtomicBool::new(false)).unwrap();
-        let best = r.best.to_uci(CastlingMode::Standard).to_string();
-        assert_eq!(best, "d4f2", "should take the perpetual (value {})", r.value);
-        assert!(r.value > -0.2, "perpetual should score near 0, got {}", r.value);
+        for draw_contempt in [0.0, 0.3] {
+            let params = SearchParams { draw_contempt, ..SearchParams::default() };
+            let mut s = Search::new(CheckingMaterialEval, params);
+            s.set_position(p.clone(), &[]);
+            let r = s.go(3000, None, &AtomicBool::new(false)).unwrap();
+            let best = r.best.to_uci(CastlingMode::Standard).to_string();
+            assert_eq!(best, "d4f2", "should take the perpetual (contempt {draw_contempt}, value {})", r.value);
+            assert!(r.value > -0.2, "perpetual should score near 0, got {}", r.value);
+        }
+    }
+
+    /// Uniform priors; the root position (`root`, White to move) is worth +0.5 to
+    /// White, every other one 0.1 to Black: a net that calls White ahead but sees
+    /// nothing better than a slightly worse game past the root.
+    struct AheadAtRootEval {
+        root: [u8; 64],
+    }
+
+    impl Evaluator for AheadAtRootEval {
+        fn eval_batch(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>> {
+            Ok(batch
+                .iter()
+                .map(|r| {
+                    let value = match (r.player == 1, r.tokens == self.root) {
+                        (true, true) => 0.5,
+                        (true, false) => -0.1,
+                        (false, _) => 0.1,
+                    };
+                    EvalOutput { logits: vec![0.0; 64 * NUM_PLANES], value }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn contempt_plays_on_instead_of_repeating_when_ahead() {
+        // K+R vs K back at the start for the 2nd time; with twofold_history Rh1-g1
+        // returns to a position of the game, a draw at 0, while every other move
+        // searches to -0.1. Plain, White takes the draw; with a contempt the draw
+        // costs it 0.3 (the root at +0.5 is past the ramp) and it plays on.
+        let start = pos("8/8/8/4k3/8/8/4K3/7R w - - 0 1");
+        let mut moves = Vec::new();
+        let mut p = start.clone();
+        for u in ["h1g1", "e5d5", "g1h1", "d5e5"] {
+            let m = mv(&p, u);
+            p.play_unchecked(&m);
+            moves.push(m);
+        }
+        let back = mv(&p, "h1g1");
+        let best = |draw_contempt: f64| {
+            let params = SearchParams { twofold_history: true, draw_contempt, ..SearchParams::default() };
+            let mut s = Search::new(AheadAtRootEval { root: encode_position(&p).0 }, params);
+            s.set_position(start.clone(), &moves);
+            let r = s.go(400, None, &AtomicBool::new(false)).unwrap();
+            let i = s.root().moves.iter().position(|m| *m == back).unwrap();
+            assert_eq!(s.root().d[i], s.root().n[i], "every visit of Rg1 is a rule draw");
+            assert!(r.value.abs() <= 0.11, "the reported value scores draws 0, got {}", r.value);
+            r.best
+        };
+        assert_eq!(best(0.0), back, "plain: the draw beats -0.1");
+        assert_ne!(best(0.3), back, "contempt: play on");
+    }
+
+    /// Uniform priors; `root` is worth `v` to its side to move, every other position 0.
+    struct RootValueEval {
+        root: [u8; 64],
+        v: f32,
+    }
+
+    impl Evaluator for RootValueEval {
+        fn eval_batch(&mut self, batch: &[EvalRequest]) -> Result<Vec<EvalOutput>> {
+            Ok(batch
+                .iter()
+                .map(|r| EvalOutput {
+                    logits: vec![0.0; 64 * NUM_PLANES],
+                    value: if r.tokens == self.root { self.v } else { 0.0 },
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn the_contempt_stays_with_the_side_ahead_whoever_is_to_move() {
+        // Draw scores by depth parity, the root's side at even depths. With Black to
+        // move and behind, White's replies carry the contempt: the tree that White's
+        // next search reuses was grown with it.
+        for (fen, v, want) in [
+            ("8/8/8/4k3/8/8/4K3/7R w - - 0 1", 0.5, [-0.5, 0.0]),
+            ("8/8/8/4k3/8/8/4K3/7R b - - 0 1", -0.5, [0.0, -0.5]),
+            ("8/8/8/4k3/8/8/4K3/7R b - - 0 1", -0.125, [0.0, -0.25]), // half the ramp
+            ("8/8/8/4k3/8/8/4K3/7R b - - 0 1", 0.0, [0.0, 0.0]),
+        ] {
+            let p = pos(fen);
+            let params = SearchParams { draw_contempt: 0.5, contempt_ramp: 0.25, ..SearchParams::default() };
+            let mut s = Search::new(RootValueEval { root: encode_position(&p).0, v }, params);
+            s.set_position(p, &[]);
+            s.go(8, None, &AtomicBool::new(false)).unwrap();
+            assert_eq!(s.draw, want, "{fen} at {v}");
+        }
     }
 
     #[test]
     fn twofold_only_counts_repeats_inside_the_search() {
-        use crate::encoding::search_terminal_value;
+        use crate::encoding::search_terminal;
         let p = Chess::default(); // non-terminal; only the key sequence matters
         let (a, b, c, d) = (1u64, 2, 3, 4);
-        // Cycle entirely after the root (root at index 0): draw.
-        assert_eq!(search_terminal_value(&p, &[a, b, c, d, a], a, 0), Some(0.0));
+        // Cycle entirely after the root (root at index 0): a rule draw.
+        assert_eq!(search_terminal(&p, &[a, b, c, d, a], a, 0), Some((0.0, true)));
         // The earlier occurrence predates the root: only one repeat, play on.
-        assert_eq!(search_terminal_value(&p, &[a, b, c, d, a], a, 1), None);
+        assert_eq!(search_terminal(&p, &[a, b, c, d, a], a, 1), None);
         // ... unless it is the third occurrence overall.
-        assert_eq!(search_terminal_value(&p, &[a, b, a, c, d, a], a, 3), Some(0.0));
+        assert_eq!(search_terminal(&p, &[a, b, a, c, d, a], a, 3), Some((0.0, true)));
         // No repeat at all.
-        assert_eq!(search_terminal_value(&p, &[a, b, c, d], d, 0), None);
+        assert_eq!(search_terminal(&p, &[a, b, c, d], d, 0), None);
+        // A draw on the board is not a rule draw.
+        let bare = pos("8/8/8/4k3/8/8/4K3/8 w - - 0 1");
+        assert_eq!(search_terminal(&bare, &[a], a, 0), Some((0.0, false)));
     }
 
     /// Tables from $SYZYGY_PATH (3-4-piece is enough for these tests).

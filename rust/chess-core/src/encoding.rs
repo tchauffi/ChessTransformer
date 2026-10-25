@@ -131,19 +131,25 @@ pub fn rule_key(key: u64, rule50: u8, repetition: u8) -> u64 {
 /// including the current position — mirrors python-chess is_repetition(3)
 /// seeing the search pushes on the shared board.
 pub fn terminal_value(pos: &Chess, keys: &[u64], current: u64) -> Option<f32> {
+    terminal(pos, keys, current).map(|(t, _)| t)
+}
+
+/// `terminal_value`, and whether it is a rule draw: repetition or the 50-move rule,
+/// which a side avoids by playing on, unlike stalemate or insufficient material.
+fn terminal(pos: &Chess, keys: &[u64], current: u64) -> Option<(f32, bool)> {
     if pos.legal_moves().is_empty() {
-        return Some(if pos.is_check() { -1.0 } else { 0.0 });
+        return Some((if pos.is_check() { -1.0 } else { 0.0 }, false));
     }
-    if pos.is_insufficient_material() || pos.halfmoves() >= 100 {
-        return Some(0.0);
+    if pos.is_insufficient_material() {
+        return Some((0.0, false));
     }
-    if keys.iter().filter(|&&k| k == current).count() >= 3 {
-        return Some(0.0);
+    if pos.halfmoves() >= 100 || keys.iter().filter(|&&k| k == current).count() >= 3 {
+        return Some((0.0, true));
     }
     None
 }
 
-/// `terminal_value` for a position inside a search tree (Lc0's two-fold rule).
+/// `terminal` for a position inside a search tree (Lc0's two-fold rule).
 /// A position that repeats one already on the search path — root included,
 /// i.e. `keys[root_idx..]` — is a draw at its second occurrence: whoever could
 /// have deviated chose to repeat, and can keep repeating. Without this the
@@ -151,13 +157,13 @@ pub fn terminal_value(pos: &Chess, keys: &[u64], current: u64) -> Option<f32> {
 /// round a third time, 4+ plies deeper than it needs to. Repetitions that
 /// reach back into the pre-root game history still need the full threefold,
 /// unless the caller passes `root_idx` 0 (`SearchParams::twofold_history`).
-pub fn search_terminal_value(pos: &Chess, keys: &[u64], current: u64, root_idx: usize) -> Option<f32> {
-    if let Some(t) = terminal_value(pos, keys, current) {
+pub fn search_terminal(pos: &Chess, keys: &[u64], current: u64, root_idx: usize) -> Option<(f32, bool)> {
+    if let Some(t) = terminal(pos, keys, current) {
         return Some(t);
     }
     let prior = &keys[..keys.len().saturating_sub(1)];
     if prior.len() > root_idx && prior[root_idx..].contains(&current) {
-        return Some(0.0);
+        return Some((0.0, true));
     }
     None
 }
