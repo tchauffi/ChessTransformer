@@ -62,6 +62,7 @@ Gate the result before promoting it:
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import json
 import shutil
@@ -81,7 +82,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from grpo_puzzles import load_model  # shared model loader
 from chesstransformer.datasets.flat_shard_dataset import FlatShardDataset, make_dataloader
-from chesstransformer.models.transformer.pos2move_v2 import NUM_ACTION_PLANES
+from chesstransformer.models.transformer.pos2move_v2 import NUM_ACTION_PLANES, Pos2MoveV2
 
 ACTION_SPACE = 64 * NUM_ACTION_PLANES  # 4672
 # Game ids restart at 0 in every self-play directory; offset them per directory
@@ -281,10 +282,39 @@ def value_loss_per_sample(value, target):
     return (q - target) ** 2, q
 
 
+def value_distill(value, ref_value):
+    """The student's value head against the teacher's on the same position: cross-entropy
+    to the teacher's WDL when both heads are WDL, else MSE between their scalar Q."""
+    if value.size(-1) == 3 and ref_value.size(-1) == 3:
+        return -(F.softmax(ref_value.float(), dim=-1) * F.log_softmax(value.float(), dim=-1)).sum(-1).mean()
+
+    def q(v):
+        if v.size(-1) == 3:
+            p = F.softmax(v.float(), dim=-1)
+            return p[:, 0] - p[:, 2]
+        return v.float().squeeze(-1)
+    return ((q(value) - q(ref_value)) ** 2).mean()
+
+
+def distill_terms(logits, value, ref_logits, ref_value, distill_coef, distill_value_coef):
+    """(weighted loss, policy KL(ref || pi), value term) of distilling the teacher."""
+    zero = torch.zeros((), device=logits.device)
+    distill, distill_v = zero, zero
+    if distill_coef > 0:
+        B = logits.size(0)
+        logp = F.log_softmax(logits.reshape(B, -1).float(), dim=-1)
+        ref_logp = F.log_softmax(ref_logits.reshape(B, -1).float(), dim=-1)
+        distill = (ref_logp.exp() * (ref_logp - logp)).sum(dim=-1).mean()
+    if distill_value_coef > 0:
+        distill_v = value_distill(value, ref_value)
+    return distill_coef * distill + distill_value_coef * distill_v, distill, distill_v
+
+
 def compute_loss(logits, value, policy_tgt, full, z, root_v, halfmove, ref_logits,
-                 value_weight, kl_coef, soft_mix, ramp_halfmoves):
+                 value_weight, kl_coef, soft_mix, ramp_halfmoves,
+                 ref_value=None, distill_coef=0.0, distill_value_coef=0.0, visit_coef=1.0):
     B = logits.size(0)
-    flat = logits.view(B, -1).float()
+    flat = logits.reshape(B, -1).float()
     logp = F.log_softmax(flat, dim=-1)
 
     # Policy: cross-entropy with the soft visit-distribution target, on full
@@ -294,7 +324,7 @@ def compute_loss(logits, value, policy_tgt, full, z, root_v, halfmove, ref_logit
 
     # KL anchor to the frozen base policy: KL(pi || ref).
     if kl_coef > 0:
-        ref_logp = F.log_softmax(ref_logits.view(B, -1).float(), dim=-1)
+        ref_logp = F.log_softmax(ref_logits.reshape(B, -1).float(), dim=-1)
         kl = (logp.exp() * (logp - ref_logp)).sum(dim=-1).mean()
     else:
         kl = torch.zeros((), device=logits.device)
@@ -305,24 +335,32 @@ def compute_loss(logits, value, policy_tgt, full, z, root_v, halfmove, ref_logit
     progress = (halfmove / ramp_halfmoves).clamp(max=1.0) if ramp_halfmoves > 0 else torch.ones_like(z)
     value_loss = (progress * per_v).mean()
 
-    total = policy_loss + value_weight * value_loss + kl_coef * kl
+    # Distillation (a fresh student, --init-config): the teacher's policy, KL(ref || pi), and
+    # its value on every position -- fast searches too, which carry no policy target.
+    d_loss, distill, distill_v = distill_terms(logits, value, ref_logits, ref_value,
+                                               distill_coef, distill_value_coef)
+    total = visit_coef * policy_loss + value_weight * value_loss + kl_coef * kl + d_loss
 
     with torch.no_grad():
         decisive = z != 0
         sign_acc = ((q.sign() == z.sign()) & decisive).sum() / decisive.sum().clamp(min=1)
     metrics = {"policy": policy_loss.detach(), "value": value_loss.detach(),
-               "kl": kl.detach(), "sign_acc": sign_acc}
+               "kl": kl.detach(), "sign_acc": sign_acc,
+               "distill": distill.detach(), "distill_v": distill_v.detach()}
     return total, metrics
 
 
-def human_loss(model, hb, device, value_weight, elo_gap=True):
+def human_loss(model, hb, device, value_weight, elo_gap=True, ref=None, distill_coef=0.0,
+               distill_value_coef=0.0):
     """Supervised loss on one batch of human shards: the played move and the
-    (tablebase-adjudicated, when the shards carry it) game result.
+    (tablebase-adjudicated, when the shards carry it) game result, plus the teacher's
+    policy and value on the same positions when distilling (`ref`).
 
     With ``elo_gap`` the rating gap goes through the value head's Elo offset, as in
     pretraining (pos2move_v2_trainer.prepare_batch). Without it a human result is read
     as a game between equals, so the head is taught to explain the stronger player's
-    wins through the position -- the bias the offset exists to remove."""
+    wins through the position -- the bias the offset exists to remove. The teacher
+    reads the board without the gap: its value is a game between equals."""
     board = hb["position"].to(device, non_blocking=True).long()
     is_white = hb["is_white"].to(device, non_blocking=True).bool()
     gap = None
@@ -330,20 +368,25 @@ def human_loss(model, hb, device, value_weight, elo_gap=True):
         gap = hb["elo_gap"].to(device, non_blocking=True).float()
         if "result_tb" in hb and "value_exact" in hb:  # a tablebase result is exact
             gap = gap.masked_fill(hb["value_exact"].to(device).bool(), 0.0)
-    logits, value = model(board, is_white.long(),
-                          hb["castling_rights"].to(device, non_blocking=True).long(),
-                          hb["en_passant_file"].to(device, non_blocking=True).long(),
-                          elo_gap=gap)
+    castling = hb["castling_rights"].to(device, non_blocking=True).long()
+    ep = hb["en_passant_file"].to(device, non_blocking=True).long()
+    logits, value = model(board, is_white.long(), castling, ep, elo_gap=gap)
     B = board.size(0)
     target = (hb["from_square"].to(device).long() * NUM_ACTION_PLANES
               + hb["action_plane"].to(device).long())
-    policy = F.cross_entropy(logits.view(B, -1).float(), target)
+    policy = F.cross_entropy(logits.reshape(B, -1).float(), target)
     result = hb["result_tb" if "result_tb" in hb else "result"].to(device).long()
     z = torch.zeros(B, dtype=torch.float32, device=device)  # 1 = white won, 2 = black won
     z[((result == 1) & is_white) | ((result == 2) & ~is_white)] = 1.0
     z[((result == 1) & ~is_white) | ((result == 2) & is_white)] = -1.0
     per_v, _ = value_loss_per_sample(value, z)
-    return policy + value_weight * per_v.mean()
+    loss = policy + value_weight * per_v.mean()
+    if ref is not None and (distill_coef > 0 or distill_value_coef > 0):
+        with torch.no_grad():
+            ref_logits, ref_value = ref(board, is_white.long(), castling, ep)
+        loss = loss + distill_terms(logits, value, ref_logits, ref_value, distill_coef,
+                                    distill_value_coef)[0]
+    return loss
 
 
 def cycle(loader):
@@ -405,6 +448,15 @@ def format_parts(res):
                       for name, r in res.items() if name != "all")
 
 
+def log_parts(writer, prefix, res, step):
+    """Held-out metrics to TensorBoard: `prefix/<metric>` overall, `prefix_dirs/<dir>_<metric>`."""
+    if writer is None:
+        return
+    for name, r in res.items():
+        for k, v in r.items():
+            writer.add_scalar(f"{prefix}/{k}" if name == "all" else f"{prefix}_dirs/{name}_{k}", v, step)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", required=True, nargs="+",
@@ -432,6 +484,22 @@ def main():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--value-weight", type=float, default=1.0)
     p.add_argument("--kl-coef", type=float, default=0.1, help="KL anchor strength to frozen base policy")
+    p.add_argument("--init-config", default=None,
+                   help="model_config.json of a fresh student (random init) to train instead of "
+                        "fine-tuning --base, which then only teaches (the frozen reference)")
+    p.add_argument("--distill-coef", type=float, default=0.0,
+                   help="weight of KL(base || student) on every position's policy (distillation)")
+    p.add_argument("--distill-value-coef", type=float, default=0.0,
+                   help="weight of the student's value against base's on every position")
+    p.add_argument("--tb-dir", default=None,
+                   help="TensorBoard log dir: train losses every --tb-every steps, held-out metrics "
+                        "(and the frozen base's, as reference lines) at every validation")
+    p.add_argument("--tb-every", type=int, default=100)
+    p.add_argument("--val-every", type=int, default=0,
+                   help="also validate (EMA weights) every N steps, not only at epoch ends")
+    p.add_argument("--visit-coef", type=float, default=1.0,
+                   help="weight of the search's visit (or gumbel) policy target; 0 = learn the "
+                        "policy from the teacher and the human moves only")
     p.add_argument("--soft-mix", type=float, default=0.0, help="value target = (1-x)*z + x*root_v")
     p.add_argument("--ramp-halfmoves", type=float, default=40.0)
     p.add_argument("--val-frac", type=float, default=0.05,
@@ -498,7 +566,14 @@ def main():
                    for name, idx in val_parts.items()}
 
     # ── Model + frozen reference ─────────────────────────────────────────
-    model = load_model(Path(args.base), device)
+    # --init-config: a fresh student of another shape; --base only teaches (the reference).
+    teacher = load_model(Path(args.base), device) if args.init_config else None
+    if args.init_config:
+        student_cfg = json.loads(Path(args.init_config).read_text())
+        model = Pos2MoveV2(**student_cfg).to(device)
+        print(f"Fresh student {args.init_config}, teacher {args.base}")
+    else:
+        model = load_model(Path(args.base), device)
     if not args.train_dropout:
         for mod in model.modules():
             if isinstance(mod, nn.Dropout):
@@ -507,7 +582,7 @@ def main():
                 mod.layer_drop = 0.0
             if hasattr(mod, "dropout") and isinstance(mod.dropout, float):
                 mod.dropout = 0.0  # attention-probability dropout inside SDPA
-    ref = copy.deepcopy(model).eval()
+    ref = (teacher if teacher is not None else copy.deepcopy(model)).eval()
     for q in ref.parameters():
         q.requires_grad_(False)
     # Training forwards go through the compiled wrappers; `model` keeps the parameters, so
@@ -517,9 +592,10 @@ def main():
     print(f"Model parameters: {sum(t.numel() for t in model.parameters()):,}")
 
     # ── Baseline: frozen base net on the val split ───────────────────────
-    base_parts = evaluate_parts(model, val_loaders, device, args)
+    base_parts = evaluate_parts(ref, val_loaders, device, args)
     base_val = base_parts["all"]
-    print(f"Baseline (frozen base): val policy_ce={base_val['policy']:.4f} | "
+    who = "teacher" if teacher is not None else "base"
+    print(f"Baseline (frozen {who}): val policy_ce={base_val['policy']:.4f} | "
           f"value_mse={base_val['value']:.4f} | sign_acc={base_val['sign_acc']:.4f}")
     print(f"  held out: {format_parts(base_parts)}")
 
@@ -568,6 +644,29 @@ def main():
     bad_epochs = 0
     step = 0
 
+    writer = None
+    if args.tb_dir:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(args.tb_dir)
+        writer.add_text("args", "```\n" + json.dumps(vars(args), indent=2) + "\n```", 0)
+        writer.add_text("model", f"{sum(t.numel() for t in model.parameters()):,} parameters, "
+                        f"{len(train_idx):,} training positions, {total_steps} steps", 0)
+        log_parts(writer, "base", base_parts, 0)
+        print(f"TensorBoard: {args.tb_dir}")
+
+    def validate():
+        """Held-out metrics of the EMA weights, logged with the frozen base's as reference."""
+        swap_ema(model, ema)
+        res = evaluate_parts(model, val_loaders, device, args)
+        swap_ema(model, ema)
+        model.train()
+        log_parts(writer, "val", res, step)
+        log_parts(writer, "base", base_parts, step)
+        if writer is not None:
+            writer.flush()
+        return res
+
+    win, win_n, t_win = collections.defaultdict(float), 0, time.time()
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
@@ -580,39 +679,67 @@ def main():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
                 logits, value = fwd(board, player, castling, ep)
                 with torch.no_grad():
-                    ref_logits, _ = ref_fwd(board, player, castling, ep)
+                    ref_logits, ref_value = ref_fwd(board, player, castling, ep)
                 loss, m = compute_loss(logits, value, policy, full, z, root_v, halfmove, ref_logits,
-                                       args.value_weight, args.kl_coef, args.soft_mix, args.ramp_halfmoves)
+                                       args.value_weight, args.kl_coef, args.soft_mix, args.ramp_halfmoves,
+                                       ref_value=ref_value, distill_coef=args.distill_coef,
+                                       distill_value_coef=args.distill_value_coef,
+                                       visit_coef=args.visit_coef)
                 if human_iter is not None:
                     h = human_loss(fwd, next(human_iter), device, args.value_weight,
-                                   elo_gap=args.human_elo_gap)
+                                   elo_gap=args.human_elo_gap, ref=ref_fwd,
+                                   distill_coef=args.distill_coef,
+                                   distill_value_coef=args.distill_value_coef)
                     loss = (1.0 - args.human_frac) * loss + args.human_frac * h
                     m["human"] = h.detach()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if args.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                win["grad_norm"] += grad_norm.item()
             opt.step()
             sched.step()
             update_ema(model, ema, args.ema_decay)
             b = board.size(0)
+            if writer is not None:
+                win["loss"] += loss.item()
+                for k, v in m.items():
+                    win[k] += v.item()
+                win_n += 1
+                if step % args.tb_every == args.tb_every - 1:
+                    for k, v in win.items():
+                        writer.add_scalar(f"train/{k}", v / win_n, step + 1)
+                    writer.add_scalar("train/lr", sched.get_last_lr()[1], step + 1)
+                    writer.add_scalar("train/samples_per_s", win_n * (b + human_bs) / (time.time() - t_win), step + 1)
+                    win, win_n, t_win = collections.defaultdict(float), 0, time.time()
             run["policy"] += m["policy"].item() * b
             run["value"] += m["value"].item() * b
             run["kl"] += m["kl"].item() * b
+            if args.distill_coef > 0 or args.distill_value_coef > 0:
+                run["distill"] = run.get("distill", 0.0) + m["distill"].item() * b
+                run["distill_v"] = run.get("distill_v", 0.0) + m["distill_v"].item() * b
             if "human" in m:
                 run["human"] = run.get("human", 0.0) + m["human"].item() * b
             seen += b
             step += 1
             if step % 500 == 0:
                 print(f"  step {step}/{total_steps} | policy={run['policy'] / seen:.4f} "
-                      f"value={run['value'] / seen:.4f} kl={run['kl'] / seen:.4f}", flush=True)
+                      f"value={run['value'] / seen:.4f} kl={run['kl'] / seen:.4f}"
+                      + (f" distill={run['distill'] / seen:.4f} distill_v={run['distill_v'] / seen:.4f}"
+                         if "distill" in run else ""), flush=True)
+            if args.val_every and step % args.val_every == 0 and step < total_steps:
+                mid = validate()["all"]
+                print(f"  step {step} held out (EMA): policy={mid['policy']:.4f} value={mid['value']:.4f} "
+                      f"sign_acc={mid['sign_acc']:.4f}", flush=True)
+                # A new window: the validation's time is not training throughput.
+                win, win_n, t_win = collections.defaultdict(float), 0, time.time()
             if step >= total_steps:
                 break
         tr = {k: v / seen for k, v in run.items()}
 
         # Validate with EMA weights.
+        val_parts_res = validate()
         swap_ema(model, ema)
-        val_parts_res = evaluate_parts(model, val_loaders, device, args)
         val = val_parts_res["all"]
         val_loss = val["policy"] + args.value_weight * val["value"]
         print(f"Epoch {epoch}/{args.epochs} ({time.time()-t0:.0f}s) | "
@@ -647,8 +774,13 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     save_file(best_state, str(out / "model.safetensors"))
-    shutil.copy(Path(args.base) / "model_config.json", out / "model_config.json")
+    if args.init_config:
+        (out / "model_config.json").write_text(json.dumps(student_cfg, indent=2))
+    else:
+        shutil.copy(Path(args.base) / "model_config.json", out / "model_config.json")
     meta = {"base": str(args.base), "data": [str(d) for d in args.data], "epochs": epoch,
+            "init_config": args.init_config, "distill_coef": args.distill_coef,
+            "distill_value_coef": args.distill_value_coef, "visit_coef": args.visit_coef,
             "steps": step, "select": args.select,
             "kl_coef": args.kl_coef, "value_weight": args.value_weight, "soft_mix": args.soft_mix,
             "policy_target": args.policy_target, "policy_temp": args.policy_temp,

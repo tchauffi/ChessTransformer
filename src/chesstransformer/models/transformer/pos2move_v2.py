@@ -128,10 +128,10 @@ class ChessGroupedQueryAttention(nn.Module):
         # Chess-geometry relative bias: one learned scalar per (head, relation).
         # Massively fewer params than a fully-learned (H, T, T) bias.
         self.num_relations = 9 if state_relation else 8
-        self.register_buffer(
-            "rel_idx", _RELATION_INDEX_STATE if state_relation else _RELATION_INDEX,
-            persistent=False,
-        )
+        rel = _RELATION_INDEX_STATE if state_relation else _RELATION_INDEX
+        if context_size != CONTEXT_SIZE:  # 64 tokens: no state token rows
+            rel = build_chess_relation_index(context_size, state_relation)
+        self.register_buffer("rel_idx", rel, persistent=False)
         # attn_bias "full" learns one scalar per (head, token pair) instead. The
         # relation buckets tie together pairs that should differ: two of the eight
         # (king-adjacent, nearby) are shadowed by the file / rank / diagonal / knight
@@ -297,8 +297,19 @@ class Pos2MoveV2(nn.Module):
         smolgen_compress: int = 8,
         smolgen_hidden: int = 128,
         smolgen_gen: int = 64,
+        state_tokens: str = "separate",
     ):
         super().__init__()
+        # state_tokens "separate" gives castling, en passant and the side to move a token each
+        # (67 tokens, v2.1). "fold" adds their embeddings to every square instead, as Leela
+        # encodes them: 64 tokens, which the attention and bias kernels tile cleanly -- the same
+        # network runs 1.26x faster on an RTX 5070 Ti (2026-10-25). The inputs are the same.
+        if state_tokens not in ("separate", "fold"):
+            raise ValueError(f"state_tokens must be 'separate' or 'fold', got {state_tokens!r}")
+        if state_tokens == "fold" and value_pool != "attn":
+            raise ValueError("state_tokens 'fold' leaves no state tokens to pool: use value_pool 'attn'")
+        self.fold_state = state_tokens == "fold"
+        context = BOARD_SQUARES if self.fold_state else CONTEXT_SIZE
         if not 0 <= head_tower_layers < nb_transformer_layers:
             raise ValueError(
                 f"head_tower_layers must be in [0, {nb_transformer_layers}), got {head_tower_layers}"
@@ -332,10 +343,10 @@ class Pos2MoveV2(nn.Module):
         )
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.position_embedding = nn.Embedding(67, embed_dim)  # 64 squares + 3 extra tokens
+        self.position_embedding = nn.Embedding(context, embed_dim)  # 64 squares (+ 3 state tokens)
         # Static position indices, kept as a buffer so we don't rebuild the
         # arange (and a host->device copy) on every forward pass.
-        self.register_buffer("pos_index", torch.arange(67), persistent=False)
+        self.register_buffer("pos_index", torch.arange(context), persistent=False)
         self.castling_embedding = nn.Embedding(16, embed_dim)  # 4-bit bitmask: 0-15
         self.en_passant_embedding = nn.Embedding(9, embed_dim)  # 8 files + no en passant (8)
         self.player_embedding = nn.Embedding(2, embed_dim)  # White or Black
@@ -350,14 +361,14 @@ class Pos2MoveV2(nn.Module):
         # until training moves it.
         smol = (dict(compress=smolgen_compress, hidden=smolgen_hidden, gen=smolgen_gen)
                 if smolgen else None)
-        self.smolgen_proj = nn.Linear(smolgen_gen, 67 * 67, bias=False) if smolgen else None
+        self.smolgen_proj = nn.Linear(smolgen_gen, context * context, bias=False) if smolgen else None
 
         def make_layer(i):
             return ChessTransformerLayer(
                 dim=embed_dim,
                 nb_heads=num_heads,
                 qkv_bias=kvq_bias,
-                context_size=67,  # Max sequence length (64 squares + 3 extra tokens)
+                context_size=context,  # sequence length: 64 squares (+ 3 state tokens)
                 dropout=dropout,
                 layer_drop=drop_rates[i],
                 state_relation=state_relation,
@@ -476,12 +487,15 @@ class Pos2MoveV2(nn.Module):
         player_emb = self.player_embedding(player_token).unsqueeze(1)  # (B, 1, D)
 
         x = token_emb + pos_emb[:64]  # Add positional embedding to board tokens
-        x = torch.cat([
-            x,
-            castling_emb + pos_emb[64],
-            en_passant_emb + pos_emb[65],
-            player_emb + pos_emb[66],
-        ], dim=1)  # (B, 67, D)
+        if self.fold_state:
+            x = x + castling_emb + en_passant_emb + player_emb  # (B, 64, D)
+        else:
+            x = torch.cat([
+                x,
+                castling_emb + pos_emb[64],
+                en_passant_emb + pos_emb[65],
+                player_emb + pos_emb[66],
+            ], dim=1)  # (B, 67, D)
 
         g = self.smolgen_proj
         for layer in self.transformer_layers:
