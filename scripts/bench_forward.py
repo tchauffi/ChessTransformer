@@ -9,9 +9,11 @@ Run from the repo root:
     uv run python scripts/bench_forward.py --model data/rl/champion
     uv run python scripts/bench_forward.py --batches 1024,4096,8192 --top 2048   # bigger buckets
 
-Self-play's batch per engine half is about parallel_games / workers / 2 * 16 leaves, e.g.
-1024 games over 2 workers -> ~4000. Compare evals/s with what `make bench` reports
-(games/h * ~106 moves/game * ~180 evals/move / 3600) to see whether the GPU or the CPU is the limit.
+Self-play's batch per engine half is about parallel_games / workers / 2 * sim_batch leaves, e.g.
+1024 games over 2 workers at sim_batch 16 -> ~4000; a batch above a bucket runs in the next one
+up, padded. Pick the batch where evals/s peaks (128 rows on the RTX 5070 Ti) and size
+--parallel-games to it. Compare evals/s with what `make bench` reports
+(games/h * ~106 moves/game * ~110 evals/move / 3600) to see whether the GPU or the CPU is the limit.
 """
 from __future__ import annotations
 
@@ -93,7 +95,8 @@ def bench_launch(model_dir: str, batches: list[int], iters: int, top: int, width
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--model", default="data/rl/champion")
-    p.add_argument("--batches", default="256,512,1024,2048,4096,8192")
+    # Small sizes too: on the RTX 5070 Ti evals/s peaks at 128 rows and falls slightly above.
+    p.add_argument("--batches", default="64,128,256,512,1024,2048,4096,8192")
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--top", type=int, default=1024, help="largest CUDA-graph bucket of the launch path")
     p.add_argument("--width", type=int, default=64, help="legal-move columns per position")
