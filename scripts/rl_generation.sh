@@ -26,7 +26,10 @@
 #    game outcome, so fast moves buy more independent value labels per GPU hour. The
 #    earlier expert-iteration runs taught at 128 sims and were gated at 400: the teacher
 #    must search at least as deep as the gate, hence 800 vs ct-bot's 1800 nodes with
-#    tree reuse (~800 fresh). CAP_TOTAL=all counts the reused tree's warm visits toward
+#    tree reuse (~800 fresh). Unset, SIMS is read from $RL/sims (default 800); 4000 from gen17
+#    (2026-10-26), the gates' and the bot's depth: a policy trained on 800-sim targets went
+#    from 12 to 8 moves rated >= 0.5% in one generation, a narrowing that only costs at deep
+#    search (-5 Elo against the wider student at 800 sims, ~-40 at 4000). CAP_TOTAL=all counts the reused tree's warm visits toward
 #    both budgets (fast: fast moves only; none: fresh sims on top of the reused tree, which
 #    cost 2.7x the old engine's evaluations per position in gen02's first half hour).
 #    Unset, FULL_FRAC is read from $RL/full_frac (default 0.25); 1 drops the fast moves, so
@@ -111,7 +114,7 @@ export LC_ALL=C
 
 RL="${RL:-data/rl}"
 SELFPLAY_HOURS="${SELFPLAY_HOURS:-$(cat "$RL/selfplay_hours" 2>/dev/null || echo 8)}"
-SIMS="${SIMS:-800}"
+SIMS="${SIMS:-$(cat "$RL/sims" 2>/dev/null || echo 800)}"
 FAST_SIMS="${FAST_SIMS:-160}"
 FULL_FRAC="${FULL_FRAC:-$(cat "$RL/full_frac" 2>/dev/null || echo 0.25)}"
 CAP_TOTAL="${CAP_TOTAL:-all}"
