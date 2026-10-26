@@ -76,7 +76,7 @@ INPUTS_REPO = "tchauffi/chesstransformer-inputs"
 # The loop's state; data/rl/selfplay_workers, _gpus and _parallel belong to the machine.
 STATE_FILES = ("history.tsv", "anchors.tsv", "selfplay_hours", "forced_playouts", "policy_target",
                "policy_temp", "fresh_full", "full_frac", "draw_contempt", "sim_batch", "temp_cutoff",
-               "selfplay_games")
+               "selfplay_games", "soft_mix")
 INPUTS = ("openings", "shards/elite_k32_v2")
 CHAMPION_FILES = ("model.safetensors", "model_config.json", "model.onnx", "expert_iter_meta.json",
                   "SOURCE")

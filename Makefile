@@ -57,7 +57,7 @@ WHEEL_TARGET ?= rust/target-wheel
 
 HF := uv run hf
 STATE := README.md history.tsv anchors.tsv selfplay_hours forced_playouts policy_target policy_temp \
-	fresh_full full_frac draw_contempt sim_batch temp_cutoff selfplay_games rl_generation.log gates/*
+	fresh_full full_frac draw_contempt sim_batch temp_cutoff selfplay_games soft_mix rl_generation.log gates/*
 # The loop's self-play settings (rl_generation.sh), for the benchmark.
 SELFPLAY_ARGS = --sims 800 --fast-sims 160 --full-frac $$(cat $(RL)/full_frac 2>/dev/null || echo 0.25) --cap-total all \
 	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2 --fresh-full \

@@ -76,7 +76,12 @@
 #    POLICY_TARGET=gumbel trains the policy on Gumbel completed-Q targets instead of the
 #    visit counts; unset, it is read from $RL/policy_target (default visits). POLICY_TEMP=T
 #    ($RL/policy_temp, default 1) trains on visits^(1/T): pruned 800-sim targets carry 0.91
-#    nats against gen14's own 1.34, and T=1.25 brings them to 1.12.
+#    nats against gen14's own 1.34, and T=1.25 brings them to 1.12. One generation at T=1 took
+#    the policy from v2.1's 1.75 nats over the legal moves to 1.45 (gen03; 1.39 by gen14), the
+#    moves it rates >= 0.5% from 12 to 8, which costs ~40 Elo at the bot's 4000 sims.
+#    SOFT_MIX=x ($RL/soft_mix, default 0.5): value target (1-x)*z + x*root_v. Against Stockfish on
+#    gen14/gen16 positions, 0.5 is twice as far off (MSE 0.14/0.10) as the root value alone or a
+#    TD(0.8) return (0.08/0.05), though a flatter target can make the head too cautious.
 # 3. Gate. Candidate vs champion, up to GATE_GAMES games ($RL/gate_games, default 400), with
 #    an SPRT of H0 +0 vs H1 +GATE_ELO1 Elo (15) that stops the match once it decides. The
 #    candidate passes only when the SPRT accepts H1 (PROMOTE_RULE=score restores the rule up to
@@ -140,6 +145,7 @@ FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(cat "$RL/forced_playouts" 2>/dev/null || e
 KATAGO_ON_FAIL="${KATAGO_ON_FAIL:-0}"
 POLICY_TARGET="${POLICY_TARGET:-$(cat "$RL/policy_target" 2>/dev/null || echo visits)}"
 POLICY_TEMP="${POLICY_TEMP:-$(cat "$RL/policy_temp" 2>/dev/null || echo 1.0)}"
+SOFT_MIX="${SOFT_MIX:-$(cat "$RL/soft_mix" 2>/dev/null || echo 0.5)}"
 FRESH_FULL="${FRESH_FULL:-$(cat "$RL/fresh_full" 2>/dev/null || echo 1)}"
 DRAW_CONTEMPT="${DRAW_CONTEMPT:-$(cat "$RL/draw_contempt" 2>/dev/null || echo 0.2)}"
 SELFPLAY_GAMES="${SELFPLAY_GAMES:-$(cat "$RL/selfplay_games" 2>/dev/null || echo 0)}"
@@ -267,9 +273,9 @@ if [[ ! -f "$CAND/model.safetensors" ]]; then
     d="$RL/selfplay/gen$(printf %02d $k)"
     ((k >= 1 && k > SEEN)) && [[ -f "$d/.selfplay_done" ]] && DATA+=("$d")
   done
-  log "training $CAND from $CHAMP_NAME on ${DATA[*]}, $EPOCHS epochs, $POLICY_TARGET policy targets (temperature $POLICY_TEMP)"
+  log "training $CAND from $CHAMP_NAME on ${DATA[*]}, $EPOCHS epochs, $POLICY_TARGET policy targets (temperature $POLICY_TEMP), soft mix $SOFT_MIX"
   uv run python scripts/train_expert_iter.py --data "${DATA[@]}" --base "$CHAMP" --out "$CAND" \
-    --epochs "$EPOCHS" --batch-size 512 --lr 1e-4 --kl-coef 0.1 --soft-mix 0.5 --value-weight 1.0 \
+    --epochs "$EPOCHS" --batch-size 512 --lr 1e-4 --kl-coef 0.1 --soft-mix "$SOFT_MIX" --value-weight 1.0 \
     --human-shards "$HUMAN_SHARDS" --human-frac 0.2 --select last --compile \
     --policy-target "$POLICY_TARGET" --policy-temp "$POLICY_TEMP" \
     || { log "training failed"; exit 1; }
