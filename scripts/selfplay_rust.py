@@ -122,6 +122,28 @@ class Forward:
         return self.bufs[bucket]
 
     @torch.no_grad()
+    def reload(self, model_dir: str) -> None:
+        """Load another checkpoint of the same network into this Forward, in place: the
+        compiled graphs read the parameters at their addresses, so they run the new weights
+        without a recompile (continuous training publishes every few minutes). Batches in
+        flight finish on the old weights first."""
+        from safetensors.torch import load_file
+        state = load_file(str(Path(model_dir) / "model.safetensors"))
+        mod = getattr(self.model, "_orig_mod", self.model)
+        own = dict(mod.named_parameters())
+        own.update(mod.named_buffers())
+        missing = [k for k, _ in mod.named_parameters() if k not in state]
+        if missing:
+            raise ValueError(f"{model_dir}: no {missing[:3]}... -- not the same network")
+        if self.cuda:
+            torch.cuda.synchronize(self.device)
+        for k, t in state.items():
+            if k in own:
+                own[k].copy_(t.to(own[k].device, own[k].dtype))
+        if self.cuda:
+            torch.cuda.synchronize(self.device)
+
+    @torch.no_grad()
     def __call__(self, boards: np.ndarray, player: np.ndarray, castling: np.ndarray,
                  ep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n = len(player)
@@ -312,7 +334,12 @@ class ShardWriter:
             np.cumsum(legal_lens, out=arrays["legal_ptr"][1:])
             arrays["root_net_v"] = np.concatenate(self.root_net_v)
         path = self.out_dir / f"{self.prefix}{self.shard_idx:04d}.npz"
-        np.savez_compressed(path, **arrays)
+        # Written aside, then renamed: a trainer following the directory (train_continuous.py)
+        # never reads a half-written shard. The dot keeps the part file out of every glob.
+        part = self.out_dir / f".{path.name}.part"
+        with open(part, "wb") as f:
+            np.savez_compressed(f, **arrays)
+        os.replace(part, path)
         print(f"  wrote {path.name} ({self.n} positions)", flush=True)
         self.shard_idx += 1
         self._reset()
@@ -485,6 +512,10 @@ def main():
                    help="--queued: positions per batch (0 = the largest CUDA-graph bucket)")
     p.add_argument("--batches-in-flight", type=int, default=3,
                    help="--queued: batches queued on the GPU while the CPU searches")
+    p.add_argument("--reload-from", default=None,
+                   help="a published model dir (a symlink continuous training moves): poll it and "
+                        "load each new target into the running network in place")
+    p.add_argument("--reload-every", type=float, default=30.0, help="seconds between --reload-from polls")
     p.add_argument("--report-every", type=float, default=0.0,
                    help="every this many seconds, print the positions searched so far, games in "
                         "flight included: a throughput that needs no game to finish (benchmarks; "
@@ -611,6 +642,9 @@ def main():
             json.dumps(cfg), openings, seed + id_offset + 1_000_003 * k,
             n_games // k_eng + (k < n_games % k_eng)) for k in range(k_eng)]
 
+    # --reload-from: the network that finished each game (continuous training republishes).
+    net = os.path.realpath(args.model)
+
     def record(games: list, k: int):
         nonlocal done_games, n_positions
         for g in games:
@@ -624,6 +658,7 @@ def main():
                 "id": gid, "fen": g["fen"], "moves": g["moves"], "result": result,
                 "end": g["end"], "plies": len(g["moves"]),
                 "resign_allowed": g["resign_allowed"],
+                **({"net": Path(net).name} if args.reload_from else {}),
             }) + "\n")
             done_games += 1
             if done_games % 20 == 0:
@@ -641,6 +676,7 @@ def main():
     slot = 0
     batch_rows = args.batch_rows or forward.buckets[-1]
     next_report = args.report_every
+    next_reload = time.monotonic() + args.reload_every
     launches, rows = 0, 0
     while not (all(e.done() for e in engines) and all(h is None for h in inflight) and not out):
         now = time.monotonic()
@@ -650,6 +686,13 @@ def main():
         if active >= budget:
             print(f"time budget of {args.max_hours} h reached", flush=True)
             break
+        if args.reload_from and now >= next_reload:
+            next_reload = now + args.reload_every
+            target = os.path.realpath(args.reload_from)
+            if target != net:
+                forward.reload(target)
+                net = target
+                print(f"reloaded {Path(target).name} after {done_games} games", flush=True)
         if 0 < next_report <= active and not args.legacy_engine:
             searched = sum(e.stats()[4] for e in engines)
             print(f"searched {searched} positions in {active:.0f} s | "
