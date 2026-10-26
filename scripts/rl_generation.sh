@@ -50,6 +50,14 @@
 #    gen15 ended 40% of its games in threefolds; on gen14, over 1000 games paired by opening
 #    and seed, 0.2 cut them from 43% to 36% and lifted decisive games from 53% to 57%, at the
 #    same Stockfish move quality. The recorded values and Qs still score draws 0.
+#    SELFPLAY_GAMES=N ($RL/selfplay_games, default 0 = the hour budget) sizes a generation in
+#    games instead: N finished games, however long they take (from the d384x8 student lineage,
+#    2026-10-26: 50k).
+#    TEMP_CUTOFF=C ($RL/temp_cutoff, default 0.05; 0 = off; from the same date): the opening
+#    temperature samples only moves within C of the most-visited move's Q (Lc0's
+#    temp-value-cutoff). Over every move, gen14's sampler gave away ~0.3 Q a game before ply
+#    30 and swung 36% of games by more than 0.2 -- noise in the outcomes the value head learns
+#    from; 0.05 removes it and keeps 2/3 of the moves that differ from the best.
 # 2. Train. A candidate from the champion, EPOCHS passes over the last WINDOW generations
 #    of self-play: policy on the visit distributions, WDL value on the outcome mixed 50/50
 #    with the root Q (less label variance -- the value head overfit last time), KL-anchored
@@ -134,6 +142,8 @@ POLICY_TARGET="${POLICY_TARGET:-$(cat "$RL/policy_target" 2>/dev/null || echo vi
 POLICY_TEMP="${POLICY_TEMP:-$(cat "$RL/policy_temp" 2>/dev/null || echo 1.0)}"
 FRESH_FULL="${FRESH_FULL:-$(cat "$RL/fresh_full" 2>/dev/null || echo 1)}"
 DRAW_CONTEMPT="${DRAW_CONTEMPT:-$(cat "$RL/draw_contempt" 2>/dev/null || echo 0.2)}"
+SELFPLAY_GAMES="${SELFPLAY_GAMES:-$(cat "$RL/selfplay_games" 2>/dev/null || echo 0)}"
+TEMP_CUTOFF="${TEMP_CUTOFF:-$(cat "$RL/temp_cutoff" 2>/dev/null || echo 0.05)}"
 # Self-play openings: BOOK's past its first BOOK_SKIP (the gates' and anchors'), on BOOK_SHARE
 # of the games; BOOK= (empty) keeps the shallow built-in ones only.
 BOOK="${BOOK-data/openings/book2k.json}"
@@ -212,24 +222,34 @@ log "=== $GEN: champion $CHAMP_NAME ==="
 
 # ── 1. self-play ─────────────────────────────────────────────────────────────
 if [[ ! -f "$SP/.selfplay_done" ]]; then
-  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, draw contempt $DRAW_CONTEMPT, $SIM_BATCH leaves per wave, book ${BOOK:-none}, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
+  if (( SELFPLAY_GAMES > 0 )); then BUDGET="$SELFPLAY_GAMES games"; else BUDGET="${SELFPLAY_HOURS} h"; fi
+  log "self-play: $BUDGET, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, draw contempt $DRAW_CONTEMPT, temperature cutoff $TEMP_CUTOFF, $SIM_BATCH leaves per wave, book ${BOOK:-none}, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
   selfplay() {
+    # A games budget counts the finished games already in the file: a rerun plays the rest.
+    local budget=(--games 1000000 --max-hours "$SELFPLAY_HOURS") played
+    if (( SELFPLAY_GAMES > 0 )); then
+      played="$(cat "$SP/games.jsonl" 2>/dev/null | wc -l)"
+      (( played >= SELFPLAY_GAMES )) && return 0
+      budget=(--games $((SELFPLAY_GAMES - played)) --max-hours 0)
+    fi
     uv run python scripts/selfplay_rust.py --model "$CHAMP" --out "$SP" \
-      --games 1000000 --max-hours "$SELFPLAY_HOURS" --parallel-games "$PARALLEL" \
+      "${budget[@]}" --parallel-games "$PARALLEL" \
       --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total "$CAP_TOTAL" \
       --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
-      --draw-contempt "$DRAW_CONTEMPT" --sim-batch "$SIM_BATCH" \
+      --draw-contempt "$DRAW_CONTEMPT" --temp-cutoff "$TEMP_CUTOFF" --sim-batch "$SIM_BATCH" \
       --seed "$G" --workers "$SELFPLAY_WORKERS" --threads "$SELFPLAY_THREADS" \
       ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} \
       ${BOOK:+--book "$BOOK" --book-skip "$BOOK_SKIP" --book-share "$BOOK_SHARE"} \
       $([[ "$FRESH_FULL" == 1 ]] && echo --fresh-full) "$@"
   }
   # The bot's search; should it crash, the older engine finishes the generation (it
-  # resumes the games file, but restarts the hour budget) -- except with forced playouts or
-  # a draw contempt, which the older engine lacks: its games would be plain-MCTS data.
+  # resumes the games file, but restarts the hour budget) -- except with forced playouts, a
+  # draw contempt or a temperature cutoff, which the older engine lacks: its games would be
+  # plain-MCTS data.
   if ! selfplay; then
-    if awk -v k="$FORCED_PLAYOUTS" -v c="$DRAW_CONTEMPT" 'BEGIN { exit !(k > 0 || c > 0) }'; then
-      log "self-play failed (no legacy fallback: it has no forced playouts or draw contempt)"; exit 1
+    if awk -v k="$FORCED_PLAYOUTS" -v c="$DRAW_CONTEMPT" -v t="$TEMP_CUTOFF" \
+        'BEGIN { exit !(k > 0 || c > 0 || t > 0) }'; then
+      log "self-play failed (no legacy fallback: it has no forced playouts, draw contempt or temperature cutoff)"; exit 1
     fi
     log "self-play failed -- rerunning on the legacy engine"
     selfplay --legacy-engine || { log "self-play failed"; exit 1; }

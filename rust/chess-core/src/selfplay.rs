@@ -19,7 +19,7 @@
 //!   the visits left after policy target pruning (`tree::prune_forced`), which also
 //!   choose the move;
 //! * move temperature for the first `temp_plies` half-moves (the bot's own
-//!   sampler, seeded);
+//!   sampler, seeded), over the moves within `temp_cutoff` of the best Q when set;
 //! * resignation once the root value stays past `resign_threshold` for
 //!   `resign_plies` plies, except in a `no_resign_frac` share of games.
 //!
@@ -46,6 +46,10 @@ pub struct SelfPlayRules {
     pub dirichlet_eps: f64,
     pub move_temp: f64,
     pub temp_plies: u32,
+    /// Sample only the moves within this of the most-visited move's Q
+    /// (`SearchParams::move_temp_cutoff`; 0 = all). In gen14, T=1 over every move gave
+    /// away ~0.3 Q a game before ply 30, and a 0.05 cutoff keeps 2/3 of the variety.
+    pub temp_cutoff: f64,
     pub resign_threshold: f32,
     pub resign_plies: u32,
     pub no_resign_frac: f64,
@@ -161,6 +165,7 @@ impl SelfPlayGame {
             sim_batch: rules.sim_batch,
             move_temp: rules.move_temp,
             move_temp_plies: rules.temp_plies,
+            move_temp_cutoff: rules.temp_cutoff,
             tt_cap: rules.tt_cap,
             legal_in_requests: true,
             rule_state: rules.rule_state,
@@ -417,7 +422,7 @@ mod tests {
     fn rules() -> SelfPlayRules {
         SelfPlayRules {
             num_sims: 64, fast_sims: 16, full_frac: 0.3, dirichlet_alpha: 0.0, dirichlet_eps: 0.25,
-            move_temp: 1.0, temp_plies: 10, resign_threshold: 2.0, resign_plies: 6,
+            move_temp: 1.0, temp_plies: 10, temp_cutoff: 0.0, resign_threshold: 2.0, resign_plies: 6,
             no_resign_frac: 0.1, max_plies: 40, sim_batch: 16, c_puct: 1.0, fpu: 0.2,
             prior_temp: 1.0, tt_cap: 2_000_000, cap_total_full: false, cap_total_fast: false,
             rule_state: false, forced_playouts: 0.0, fresh_full: false, twofold_history: false,
@@ -661,5 +666,36 @@ mod tests {
         let differs = (0..a.records().len().min(b.records().len()))
             .any(|i| a.records()[i].visit_cnt != b.records()[i].visit_cnt);
         assert!(differs, "noise left every full search unchanged");
+    }
+
+    /// The sampled moves' worst shortfall from the most-visited move's Q, over the
+    /// sampled plies (no forced playouts, so the raw visits chose the move).
+    fn worst_sampled_shortfall(g: &SelfPlayGame, temp_plies: u32) -> f32 {
+        let mut worst = 0.0f32;
+        for (rec, mv) in g.records().iter().zip(&g.moves) {
+            if u32::from(rec.halfmove) >= temp_plies {
+                break;
+            }
+            let (f, t, p) = move_coords(mv);
+            let played = (f * NUM_PLANES + action_plane(f, t, p)) as u16;
+            let k = rec.legal_idx.iter().position(|&i| i == played).unwrap();
+            let top = (0..rec.legal_n.len()).max_by_key(|&i| rec.legal_n[i]).unwrap();
+            worst = worst.max(rec.legal_q[top] - rec.legal_q[k]);
+        }
+        worst
+    }
+
+    #[test]
+    fn temp_cutoff_samples_only_moves_near_the_best_q() {
+        let open = SelfPlayRules { temp_plies: 40, max_plies: 40, ..rules() };
+        let cut = SelfPlayRules { temp_cutoff: 0.05, ..open };
+        let (mut before, mut after) = (0.0f32, 0.0f32);
+        for seed in 0..6 {
+            before = before.max(worst_sampled_shortfall(&batched(&open, seed), 40));
+            after = after.max(worst_sampled_shortfall(&batched(&cut, seed), 40));
+        }
+        assert!(before > 0.05, "no sampled move fell short without the cutoff: {before}");
+        assert!(after <= 0.05 + 1e-5, "a sampled move fell {after} short of the best Q");
+        assert_eq!(batched(&cut, 3).moves_uci(), batched(&cut, 3).moves_uci(), "must follow the seed");
     }
 }

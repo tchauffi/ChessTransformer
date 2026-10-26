@@ -57,6 +57,9 @@ struct Config {
     move_temp: f64,
     #[serde(default = "d_temp_plies")]
     temp_plies: u32,
+    /// Sample only moves within this of the best Q (`SelfPlayRules::temp_cutoff`; 0 = all).
+    #[serde(default)]
+    temp_cutoff: f64,
     #[serde(default = "d_resign")]
     resign_threshold: f32,
     #[serde(default = "d_resign_plies")]
@@ -332,7 +335,7 @@ impl SelfPlayEngine {
         let rules = SelfPlayRules {
             num_sims: c.num_sims, fast_sims: c.fast_sims, full_frac: c.full_frac,
             dirichlet_alpha: c.dirichlet_alpha, dirichlet_eps: c.dirichlet_eps,
-            move_temp: c.move_temp, temp_plies: c.temp_plies,
+            move_temp: c.move_temp, temp_plies: c.temp_plies, temp_cutoff: c.temp_cutoff,
             resign_threshold: c.resign_threshold, resign_plies: c.resign_plies,
             no_resign_frac: c.no_resign_frac, max_plies: c.max_plies, sim_batch: c.sim_batch,
             c_puct: c.c_puct, fpu: c.fpu, prior_temp: c.prior_temp, tt_cap: c.tt_cap,

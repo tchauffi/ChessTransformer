@@ -42,6 +42,10 @@ pub struct SearchParams {
     /// half-moves (0.0 = always argmax — the deterministic gauntlet setting).
     pub move_temp: f64,
     pub move_temp_plies: u32,
+    /// Lc0's temp-value-cutoff: the sampler only draws moves whose Q is within this of
+    /// the most-visited move's, so temperature varies the game without throwing it away.
+    /// 0 = every visited move.
+    pub move_temp_cutoff: f64,
     pub tt_cap: usize,
     /// Fill `EvalRequest::legal` (batched drivers that gather legal logits on
     /// the GPU). The bot leaves it off and evaluates full logits.
@@ -80,6 +84,7 @@ impl Default for SearchParams {
             sim_batch: 16,
             move_temp: 0.0,
             move_temp_plies: 0,
+            move_temp_cutoff: 0.0,
             tt_cap: 2_000_000,
             legal_in_requests: false,
             rule_state: false,
@@ -578,9 +583,17 @@ impl<E: Evaluator> Search<E> {
         let best_idx = if self.params.move_temp > 0.0
             && halfmove(&self.pos) < self.params.move_temp_plies
         {
+            let q = |i: usize| -root.w[i] / root.n[i].max(1) as f64;
+            let top = (0..counts.len()).max_by_key(|&i| counts[i]).unwrap_or(0);
+            let floor = if self.params.move_temp_cutoff > 0.0 && counts.get(top).is_some_and(|&n| n > 0) {
+                q(top) - self.params.move_temp_cutoff
+            } else {
+                f64::NEG_INFINITY
+            };
             let weights: Vec<f64> = counts
                 .iter()
-                .map(|&n| (n as f64).powf(1.0 / self.params.move_temp))
+                .enumerate()
+                .map(|(i, &n)| if q(i) < floor { 0.0 } else { (n as f64).powf(1.0 / self.params.move_temp) })
                 .collect();
             let total: f64 = weights.iter().sum();
             if total > 0.0 {

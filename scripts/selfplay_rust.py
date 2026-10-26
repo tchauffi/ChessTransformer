@@ -496,6 +496,11 @@ def main():
     p.add_argument("--fpu", type=float, default=0.2)
     p.add_argument("--move-temp", type=float, default=1.0)
     p.add_argument("--temp-plies", type=int, default=30)
+    p.add_argument("--temp-cutoff", type=float, default=0.0,
+                   help="sample only the moves whose Q is within this of the most-visited move's "
+                        "(Lc0's temp-value-cutoff; 0 = every move). In gen14, sampling over every "
+                        "move gave away ~0.3 Q a game before ply 30; 0.05 removes it and keeps "
+                        "2/3 of the moves that differ from the best")
     p.add_argument("--resign", type=float, default=0.93)
     p.add_argument("--resign-plies", type=int, default=6)
     p.add_argument("--no-resign-frac", type=float, default=0.1)
@@ -553,6 +558,7 @@ def main():
         "fpu": args.fpu,
         "move_temp": args.move_temp,
         "temp_plies": args.temp_plies,
+        "temp_cutoff": args.temp_cutoff,
         "resign_threshold": args.resign,
         "resign_plies": args.resign_plies,
         "no_resign_frac": args.no_resign_frac,
@@ -591,6 +597,9 @@ def main():
                   flush=True)
         if args.draw_contempt:
             print("WARNING: --legacy-engine has no draw contempt; --draw-contempt changes nothing",
+                  flush=True)
+        if args.temp_cutoff:
+            print("WARNING: --legacy-engine samples every move; --temp-cutoff changes nothing",
                   flush=True)
         engines = [selfplay_core.Engine(json.dumps(cfg), openings, seed + id_offset, n_games)]
     else:

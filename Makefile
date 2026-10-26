@@ -57,11 +57,12 @@ WHEEL_TARGET ?= rust/target-wheel
 
 HF := uv run hf
 STATE := README.md history.tsv anchors.tsv selfplay_hours forced_playouts policy_target policy_temp \
-	fresh_full full_frac draw_contempt sim_batch rl_generation.log gates/*
+	fresh_full full_frac draw_contempt sim_batch temp_cutoff selfplay_games rl_generation.log gates/*
 # The loop's self-play settings (rl_generation.sh), for the benchmark.
 SELFPLAY_ARGS = --sims 800 --fast-sims 160 --full-frac $$(cat $(RL)/full_frac 2>/dev/null || echo 0.25) --cap-total all \
 	--dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts 2 --fresh-full \
 	--draw-contempt $$(cat $(RL)/draw_contempt 2>/dev/null || echo 0.2) \
+	--temp-cutoff $$(cat $(RL)/temp_cutoff 2>/dev/null || echo 0.05) \
 	--sim-batch $$(cat $(RL)/sim_batch 2>/dev/null || echo 1) \
 	--book data/openings/book2k.json
 
@@ -86,7 +87,8 @@ env: tools  ## the Python env, with the optimized group (ONNX export and parity 
 engine: env  ## build and install the Rust self-play engine (uv sync removes it)
 	uvx maturin build --release -m rust/selfplay-core/Cargo.toml -o dist \
 		--target-dir $(WHEEL_TARGET) --interpreter .venv/bin/python
-	uv pip install --force-reinstall --no-deps "$$(ls -t dist/selfplay_core-*.whl | head -1)"
+	uv pip install --python .venv/bin/python --force-reinstall --no-deps \
+		"$$(ls -t dist/selfplay_core-*.whl | head -1)"  # --python: not an activated VIRTUAL_ENV
 
 data:  ## download the champion, the games, the loop's state and the inputs; rebuild data/rl
 	@if [[ -e $(RL)/champion && -z "$(FORCE)" ]]; then
