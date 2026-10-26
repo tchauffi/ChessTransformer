@@ -8,9 +8,12 @@ targets needed for expert-iteration training.
 The Rust engine runs N games concurrently and batches leaf evaluations across
 all of them; Python only runs the batched NN forward. Games are searched with
 the deployed bot's own search (``SelfPlayEngine`` on ``chess_core::search``:
-16-leaf waves, deferred TT hits, the tree reused from move to move), so the
-teacher is the search the network is judged and deployed with;
-``--legacy-engine`` selects the older self-play search (``Engine``).
+deferred TT hits, the tree reused from move to move), so the teacher is the
+search the network is judged and deployed with -- but one leaf per wave by
+default where the bot sends 16: the GPU batch comes from the games instead, and
+the plain sequential search beat the 16-leaf waves by +49 Elo at 800 sims for
+the same evaluations (2026-10-25). ``--legacy-engine`` selects the older
+self-play search (``Engine``).
 
 One process drives one GPU from a single Python thread, which a datacenter GPU outruns:
 ``--workers N`` starts N copies of this script on the same output directory (spread over
@@ -455,9 +458,13 @@ def main():
     p.add_argument("--max-hours", type=float, default=0.0,
                    help="stop after this running time, frozen time excluded (games in flight "
                         "are dropped); 0 = no limit")
-    p.add_argument("--parallel-games", type=int, default=64)
-    p.add_argument("--sim-batch", type=int, default=16,
-                   help="leaves per search wave (the bot's --sim-batch); above 16 needs --wide-batch")
+    p.add_argument("--parallel-games", type=int, default=256,
+                   help="games in flight, all workers: a forward carries about parallel_games / "
+                        "workers / 2 * sim_batch positions -- size it to where the GPU's evals/s "
+                        "peak (make bench-forward; 128 rows on the RTX 5070 Ti)")
+    p.add_argument("--sim-batch", type=int, default=1,
+                   help="leaves per search wave: 1 = sequential search (+49 Elo over 16 at 800 "
+                        "sims); the bot sends 16; above 16 needs --wide-batch")
     p.add_argument("--wide-batch", action="store_true",
                    help="allow --sim-batch above 16, which weakens the search: at 64 leaves, 46%% "
                         "of the sims revisit a pending leaf and the best move matches sequential "

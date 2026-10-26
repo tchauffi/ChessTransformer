@@ -5,14 +5,21 @@
 #   setsid nohup scripts/rl_generation.sh >> logs/rl_generation.log 2>&1 &
 #
 # 1. Self-play, on the deployed bot's search (selfplay-core SelfPlayEngine: the tree reused
-#    move to move, 16-leaf waves), for SELFPLAY_HOURS of running time; unset, it is read from
+#    move to move, SIM_BATCH leaves per wave), for SELFPLAY_HOURS of running time; unset, it is read from
 #    $RL/selfplay_hours (default 8). The GPU is saturated, so more games per candidate means
 #    longer generations: cand11, trained on one 8 h generation, got worse on held-out games and
 #    lost (-31), while cand10 and cand12, on two, improved and tied.
 #    A datacenter GPU outruns one Python driver, so SELFPLAY_WORKERS processes (read from
 #    $RL/selfplay_workers, default 1) share the generation, spread over SELFPLAY_GPUS
 #    ($RL/selfplay_gpus, e.g. "0,1") when set, with PARALLEL games in flight between them
-#    ($RL/selfplay_parallel, default 128).
+#    ($RL/selfplay_parallel, default 256).
+#    SIM_BATCH (from 2026-10-26; $RL/sim_batch, default 1; the bot's 16 up to gen15): leaves
+#    each tree sends per wave. One leaf is the plain sequential search: at 800 sims the same
+#    network beat its own 16-leaf waves by +49 Elo (400 games, CI +32..+67) for the same GPU
+#    evaluations per position, the waves' virtual losses keeping their leaves shallower. The
+#    GPU batch then comes from the games: PARALLEL / SELFPLAY_WORKERS / 2 rows per forward,
+#    to size to where the GPU's evals/s peak (`make bench-forward`; 128 rows on the RTX
+#    5070 Ti, where 256 games at one leaf searched 157 positions/s vs 81 for 128 at 16).
 #    The champion plays itself with playout cap randomization: FULL_FRAC of
 #    moves are full SIMS searches with root Dirichlet noise -- the policy targets -- and
 #    the rest fast FAST_SIMS moves that only move the game on. Every position keeps the
@@ -95,7 +102,8 @@ SIMS="${SIMS:-800}"
 FAST_SIMS="${FAST_SIMS:-160}"
 FULL_FRAC="${FULL_FRAC:-$(cat "$RL/full_frac" 2>/dev/null || echo 0.25)}"
 CAP_TOTAL="${CAP_TOTAL:-all}"
-PARALLEL="${PARALLEL:-$(cat "$RL/selfplay_parallel" 2>/dev/null || echo 128)}"
+PARALLEL="${PARALLEL:-$(cat "$RL/selfplay_parallel" 2>/dev/null || echo 256)}"
+SIM_BATCH="${SIM_BATCH:-$(cat "$RL/sim_batch" 2>/dev/null || echo 1)}"
 SELFPLAY_WORKERS="${SELFPLAY_WORKERS:-$(cat "$RL/selfplay_workers" 2>/dev/null || echo 1)}"
 SELFPLAY_GPUS="${SELFPLAY_GPUS:-$(cat "$RL/selfplay_gpus" 2>/dev/null)}"
 # Search threads per self-play worker, and the gate's games in flight and threads: the home
@@ -204,13 +212,14 @@ log "=== $GEN: champion $CHAMP_NAME ==="
 
 # ── 1. self-play ─────────────────────────────────────────────────────────────
 if [[ ! -f "$SP/.selfplay_done" ]]; then
-  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, draw contempt $DRAW_CONTEMPT, book ${BOOK:-none}, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
+  log "self-play: ${SELFPLAY_HOURS} h, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, draw contempt $DRAW_CONTEMPT, $SIM_BATCH leaves per wave, book ${BOOK:-none}, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
   selfplay() {
     uv run python scripts/selfplay_rust.py --model "$CHAMP" --out "$SP" \
       --games 1000000 --max-hours "$SELFPLAY_HOURS" --parallel-games "$PARALLEL" \
       --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total "$CAP_TOTAL" \
       --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
-      --draw-contempt "$DRAW_CONTEMPT" --seed "$G" --workers "$SELFPLAY_WORKERS" --threads "$SELFPLAY_THREADS" \
+      --draw-contempt "$DRAW_CONTEMPT" --sim-batch "$SIM_BATCH" \
+      --seed "$G" --workers "$SELFPLAY_WORKERS" --threads "$SELFPLAY_THREADS" \
       ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} \
       ${BOOK:+--book "$BOOK" --book-skip "$BOOK_SKIP" --book-share "$BOOK_SHARE"} \
       $([[ "$FRESH_FULL" == 1 ]] && echo --fresh-full) "$@"
