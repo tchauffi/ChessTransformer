@@ -29,7 +29,12 @@
 #    tree reuse (~800 fresh). Unset, SIMS is read from $RL/sims (default 800); 4000 from gen17
 #    (2026-10-26), the gates' and the bot's depth: a policy trained on 800-sim targets went
 #    from 12 to 8 moves rated >= 0.5% in one generation, a narrowing that only costs at deep
-#    search (-5 Elo against the wider student at 800 sims, ~-40 at 4000). CAP_TOTAL=all counts the reused tree's warm visits toward
+#    search (-5 Elo against the wider student at 800 sims, ~-40 at 4000). Reverted to 800 the
+#    same day for C_PUCT ($RL/c_puct, default 1.0; 1.5 from gen17): Braun 2026 (arXiv
+#    2609.37447) teaches at 300-800 visits with c_puct 1.5 and its network still gains ~81 Elo
+#    per doubling of search up to 100k, so the wider exploration, not a 5x deeper and 5x
+#    slower teacher, keeps a sharp policy searching at depth. Self-play only: the gates and
+#    the bot keep the bot's 1.0 until a match says otherwise. CAP_TOTAL=all counts the reused tree's warm visits toward
 #    both budgets (fast: fast moves only; none: fresh sims on top of the reused tree, which
 #    cost 2.7x the old engine's evaluations per position in gen02's first half hour).
 #    Unset, FULL_FRAC is read from $RL/full_frac (default 0.25); 1 drops the fast moves, so
@@ -115,6 +120,7 @@ export LC_ALL=C
 RL="${RL:-data/rl}"
 SELFPLAY_HOURS="${SELFPLAY_HOURS:-$(cat "$RL/selfplay_hours" 2>/dev/null || echo 8)}"
 SIMS="${SIMS:-$(cat "$RL/sims" 2>/dev/null || echo 800)}"
+C_PUCT="${C_PUCT:-$(cat "$RL/c_puct" 2>/dev/null || echo 1.0)}"
 FAST_SIMS="${FAST_SIMS:-160}"
 FULL_FRAC="${FULL_FRAC:-$(cat "$RL/full_frac" 2>/dev/null || echo 0.25)}"
 CAP_TOTAL="${CAP_TOTAL:-all}"
@@ -232,7 +238,7 @@ log "=== $GEN: champion $CHAMP_NAME ==="
 # ── 1. self-play ─────────────────────────────────────────────────────────────
 if [[ ! -f "$SP/.selfplay_done" ]]; then
   if (( SELFPLAY_GAMES > 0 )); then BUDGET="$SELFPLAY_GAMES games"; else BUDGET="${SELFPLAY_HOURS} h"; fi
-  log "self-play: $BUDGET, ${SIMS}/${FAST_SIMS} sims, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, draw contempt $DRAW_CONTEMPT, temperature cutoff $TEMP_CUTOFF, $SIM_BATCH leaves per wave, book ${BOOK:-none}, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
+  log "self-play: $BUDGET, ${SIMS}/${FAST_SIMS} sims, c_puct $C_PUCT, ${FULL_FRAC} full, cap-total $CAP_TOTAL, forced playouts $FORCED_PLAYOUTS, fresh full trees $FRESH_FULL, draw contempt $DRAW_CONTEMPT, temperature cutoff $TEMP_CUTOFF, $SIM_BATCH leaves per wave, book ${BOOK:-none}, $PARALLEL games in flight, $SELFPLAY_WORKERS worker(s)${SELFPLAY_GPUS:+ on GPUs $SELFPLAY_GPUS}"
   selfplay() {
     # A games budget counts the finished games already in the file: a rerun plays the rest.
     local budget=(--games 1000000 --max-hours "$SELFPLAY_HOURS") played
@@ -246,6 +252,7 @@ if [[ ! -f "$SP/.selfplay_done" ]]; then
       --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total "$CAP_TOTAL" \
       --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
       --draw-contempt "$DRAW_CONTEMPT" --temp-cutoff "$TEMP_CUTOFF" --sim-batch "$SIM_BATCH" \
+      --c-puct "$C_PUCT" \
       --seed "$G" --workers "$SELFPLAY_WORKERS" --threads "$SELFPLAY_THREADS" \
       ${SELFPLAY_GPUS:+--gpus "$SELFPLAY_GPUS"} \
       ${BOOK:+--book "$BOOK" --book-skip "$BOOK_SKIP" --book-share "$BOOK_SHARE"} \
