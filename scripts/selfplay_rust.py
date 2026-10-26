@@ -142,6 +142,7 @@ class Forward:
                 own[k].copy_(t.to(own[k].device, own[k].dtype))
         if self.cuda:
             torch.cuda.synchronize(self.device)
+        self.weights += 1
 
     @torch.no_grad()
     def __call__(self, boards: np.ndarray, player: np.ndarray, castling: np.ndarray,
@@ -181,6 +182,7 @@ class Forward:
 
     verify_every = 50
     launched = 0
+    weights = 0  # bumped by reload(): a batch launched on older weights is not re-checked
 
     def _slot(self, slot: int, n: int, width: int) -> dict:
         st = self.slots.get(slot)
@@ -238,18 +240,18 @@ class Forward:
             out_v[s0:s0 + m].copy_(self.value_scalar(value[:m].float()).squeeze(-1), non_blocking=True)
         if st["event"] is not None:
             st["event"].record()
-        return slot, n, width, (boards, player, castling, ep, legal)
+        return slot, n, width, (boards, player, castling, ep, legal), self.weights
 
     def wait(self, handle) -> tuple[np.ndarray, np.ndarray]:
         """The batch's results, valid until the slot's next launch."""
-        slot, n, width, inputs = handle
+        slot, n, width, inputs, weights = handle
         st = self.slots[slot]
         if st["event"] is not None:
             st["event"].synchronize()
         logits = st["h_logits"][: n * width].view(n, width).numpy()
         values = st["h_values"][:n].numpy()
         self.launched += 1
-        if self.verify_every and self.launched % self.verify_every == 0:
+        if self.verify_every and self.launched % self.verify_every == 0 and weights == self.weights:
             self._verify(inputs, logits, values)
         return logits, values
 
@@ -677,8 +679,19 @@ def main():
     batch_rows = args.batch_rows or forward.buckets[-1]
     next_report = args.report_every
     next_reload = time.monotonic() + args.reload_every
+    # Continuous training stops self-play for its evaluations: on SIGTERM, flush the finished
+    # games' positions (games.jsonl already has them) and drop the games in flight.
+    stopping = False
+    if args.reload_from:
+        def on_term(*_):
+            nonlocal stopping
+            stopping = True
+        signal.signal(signal.SIGTERM, on_term)
     launches, rows = 0, 0
     while not (all(e.done() for e in engines) and all(h is None for h in inflight) and not out):
+        if stopping:
+            print(f"SIGTERM: stopping after {done_games} games", flush=True)
+            break
         now = time.monotonic()
         if now - last < 600:
             active += now - last

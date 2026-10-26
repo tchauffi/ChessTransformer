@@ -67,7 +67,7 @@ SELFPLAY_ARGS = --sims $$(cat $(RL)/sims 2>/dev/null || echo 800) --fast-sims 16
 	--sim-batch $$(cat $(RL)/sim_batch 2>/dev/null || echo 1) \
 	--book data/openings/book2k.json
 
-.PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop stop status backup push-inputs
+.PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop continuous stop status backup push-inputs
 
 help:  ## this list
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/:[^#]*## /\t/' | column -t -s $$'\t'
@@ -170,6 +170,11 @@ tune:  ## write WORKERS, PARALLEL, THREADS, GPUS (MATCH_*, GATE_GAMES, ANCHOR_GA
 
 mps:  ## start NVIDIA MPS, so several workers' kernels run on a GPU at once
 	nvidia-cuda-mps-control -d
+
+continuous:  ## continuous training (self-play + trainer + evaluations) until `make stop`; logs/rl_continuous*.log
+	mkdir -p logs
+	rm -f $(RL)/STOP
+	RL=$(RL) /bin/bash scripts/rl_continuous.sh >> logs/rl_continuous.log 2>&1
 
 loop:  ## generations back to back until `make stop` (inside tmux; logs/rl_generation.log)
 	mkdir -p logs
