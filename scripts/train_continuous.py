@@ -15,6 +15,10 @@ decay for every candidate and saw each position once.
 The targets are train_expert_iter.py's (visit counts at --policy-temp, WDL value on
 (1 - soft_mix) z + soft_mix root_v, human replay), from the same loss code.
 
+From scratch (a randomly initialised --base, no seed data, no human replay), --window-growth
+starts the window at 250k positions and grows it with the positions played, as the paper's
+grew from 0.6M to 20M, so the first games, played by a random network, leave it early.
+
 --state holds checkpoint.pt -- weights, EMA, optimizer, counters and the shards admitted --
 rewritten after every block, so a stop costs at most one block; SIGTERM saves first.
 --rollback-to <model dir> restarts from those weights with a fresh optimizer (what the
@@ -104,6 +108,18 @@ def make_batch(parts: list[tuple[Shard, np.ndarray]]):
             torch.from_numpy(policy))
 
 
+def window_cap(args, positions: int) -> int:
+    """The window's size once `positions` have entered it: --window-rows, or with --window-growth
+    KataGo's rule c (1 + b ((N / c)^a - 1) / a), c = 250k, a = 0.75, b = 0.4, capped by
+    --window-rows: 2.2M rows at 10M positions, 21M at 209M (the paper's run ended at 20M)."""
+    if not args.window_growth:
+        return args.window_rows
+    c, a, b = 250_000, 0.75, 0.4
+    if positions <= c:
+        return min(args.window_rows, c)
+    return min(args.window_rows, int(c * (1 + b * ((positions / c) ** a - 1) / a)))
+
+
 class Window:
     """The most recent shards, first in first out, up to max_rows training rows."""
 
@@ -178,6 +194,8 @@ def main():
     p.add_argument("--publish", required=True, help="published networks: step_NNNNNNN/ and latest")
     p.add_argument("--rollback-to", default=None, help="restart from this model dir's weights")
     p.add_argument("--window-rows", type=int, default=10_000_000)
+    p.add_argument("--window-growth", action="store_true",
+                   help="grow the window with the positions seen, up to --window-rows (a run from scratch)")
     p.add_argument("--reuse", type=float, default=4.0, help="presentations per new position")
     p.add_argument("--seed-reuse", type=float, default=0.0,
                    help="presentations owed to the --seed-data positions (0: they only fill the window)")
@@ -221,7 +239,8 @@ def main():
     signal.signal(signal.SIGINT, on_term)
 
     ck = torch.load(ck_path, map_location="cpu", weights_only=False) if ck_path.exists() else None
-    base = Path(ck["base"]) if ck else Path(args.base).resolve()
+    # The checkpoint's base is an absolute path: on another machine (a restored backup) it is --base.
+    base = Path(ck["base"]) if ck and Path(ck["base"]).exists() else Path(args.base).resolve()
     model = load_model(base, device)
     cfg_src = base / "model_config.json"
     fwd = torch.compile(model) if args.compile else model
@@ -251,14 +270,15 @@ def main():
         log(f"rolled back to {args.rollback_to}: fresh optimizer, counters kept")
 
     # The window: the seed directories, then every live shard admitted so far, in order.
-    window = Window(args.window_rows)
     t0 = time.time()
-    for d in args.seed_data:
-        for path in shard_paths(Path(d)):
-            s = Shard(path, args.policy_temp, args.heldout_frac)
-            window.add(s)
-            if not ck:
-                seed_rows += len(s.train)
+    seeds = [Shard(path, args.policy_temp, args.heldout_frac)
+             for d in args.seed_data for path in shard_paths(Path(d))]
+    if not ck:
+        seed_rows = sum(len(s.train) for s in seeds)
+    window = Window(window_cap(args, seed_rows + admitted))
+    for s in seeds:
+        window.add(s)
+    del seeds
     seen_set = set(seen)
     for name in seen:
         window.add(Shard(live.parent / name, args.policy_temp, args.heldout_frac))
@@ -348,6 +368,7 @@ def main():
     block_samples = args.block_steps * args.batch_size
     model.train()
     while not stopping:
+        window.max_rows = window_cap(args, seed_rows + admitted)  # grows with --window-growth
         for path in shard_paths(live):
             name = f"{live.name}/{path.name}"
             if name in seen_set:

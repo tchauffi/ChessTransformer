@@ -8,6 +8,7 @@
 #   make validate           check a generation's games, shards and training targets
 #   make loop               generations back to back until `make stop` (run it inside tmux)
 #   make continuous         continuous training instead, on every GPU, until `make stop`
+#   make scratch            the same for a new network from random weights (data/rl/scratch)
 #   make backup             upload what is new; CHECKPOINT=1 after `make stop` to move the
 #                           continuous rig: `make setup` + `make continuous` resume it elsewhere
 #   make status             the live status page (localhost:8765; reach it with ssh -L 8765:localhost:8765)
@@ -71,7 +72,7 @@ SELFPLAY_ARGS = --sims $$(cat $(RL)/sims 2>/dev/null || echo 800) --fast-sims 16
 	--sim-batch $$(cat $(RL)/sim_batch 2>/dev/null || echo 1) \
 	--book data/openings/book2k.json
 
-.PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop continuous stop status backup push-inputs
+.PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop continuous scratch stop status backup push-inputs
 
 help:  ## this list
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/:[^#]*## /\t/' | column -t -s $$'\t'
@@ -183,6 +184,21 @@ continuous:  ## continuous training until `make stop` (several GPUs: trainer on 
 	mkdir -p logs
 	rm -f $(RL)/STOP
 	RL=$(RL) /bin/bash scripts/rl_continuous.sh >> logs/rl_continuous.log 2>&1
+
+# From scratch, as in the paper: a random network with the champion's architecture, no seed games,
+# no human replay, a window grown from 250k, every move searched (SCRATCH_SIMS), the value on the
+# game result (soft mix 0.1), lr 5e-4; state in $(RL)/scratch, logs in logs/scratch/. One GPU
+# runs one rig: `make stop`, then `make continuous` resumes the other.
+SCRATCH_SIMS ?= 300
+scratch:  ## continuous training of a new network from scratch (data/rl/scratch) until `make stop`
+	mkdir -p logs/scratch
+	rm -f $(RL)/STOP
+	[[ -f $(RL)/scratch/best/model.safetensors ]] || \
+		.venv/bin/python scripts/init_random_model.py --like $(RL)/champion --out $(RL)/scratch/best
+	RL=$(RL) CONT=$(RL)/scratch LOGS=logs/scratch SEED_DATA= HUMAN_SHARDS= ANCHOR= \
+		SIMS=$(SCRATCH_SIMS) FULL_FRAC=1.0 SOFT_MIX=0.1 POLICY_TEMP=1.0 LR=5e-4 LR_EMBEDDING=5e-4 \
+		WINDOW_GROWTH=1 WINDOW_ROWS=20000000 \
+		/bin/bash scripts/rl_continuous.sh >> logs/scratch/rl_continuous.log 2>&1
 
 loop:  ## generations back to back until `make stop` (inside tmux; logs/rl_generation.log)
 	mkdir -p logs
