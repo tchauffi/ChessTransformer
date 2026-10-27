@@ -57,6 +57,8 @@ POLICY_TEMP="${POLICY_TEMP:-$(setting policy_temp 1.0)}"
 SOFT_MIX="${SOFT_MIX:-$(setting soft_mix 0.5)}"
 WINDOW_ROWS="${WINDOW_ROWS:-$(setting cont_window_rows 10000000)}"
 WINDOW_GROWTH="${WINDOW_GROWTH:-$(setting cont_window_growth 0)}"  # 1: from scratch (train_continuous.py)
+WINDOW_START="${WINDOW_START:-$(setting cont_window_start 250000)}"  # the grown window's first size
+MIN_ROWS="${MIN_ROWS:-$(setting cont_min_rows 200000)}"  # positions in before training starts
 REUSE="${REUSE:-$(setting cont_reuse 4)}"
 LR="${LR:-$(setting cont_lr 5e-5)}"
 LR_EMBEDDING="${LR_EMBEDDING:-$(setting cont_lr_embedding 2e-5)}"
@@ -138,7 +140,7 @@ start_trainer() {
     ${SEED_DATA:+--seed-data $SEED_DATA} --base "$BEST" --state "$C/trainer" --publish "$PUB" \
     --window-rows "$WINDOW_ROWS" --reuse "$REUSE" --lr "$LR" --lr-embedding "$LR_EMBEDDING" \
     --soft-mix "$SOFT_MIX" --policy-temp "$POLICY_TEMP" "${rb[@]}" \
-    $( ((WINDOW_GROWTH)) && echo --window-growth) \
+    $( ((WINDOW_GROWTH)) && echo --window-growth --window-start "$WINDOW_START") --min-rows "$MIN_ROWS" \
     ${HUMAN_SHARDS:+--human-shards "$HUMAN_SHARDS" --human-frac "$HUMAN_FRAC"} $COMPILE $TR_EXTRA \
     >> "$LOGS/rl_continuous_train.log" 2>&1 &
   TRAINER=$!
@@ -241,7 +243,7 @@ fi
 FAILS=0 ACCEPTED=0
 [[ -f $C/eval_state ]] && source "$C/eval_state"
 EVAL_S="$(awk -v h="$EVAL_HOURS" 'BEGIN { printf "%d", h * 3600 }')"
-log "continuous loop: self-play ${SIMS}/${FAST_SIMS} sims, c_puct $C_PUCT, $PARALLEL games in flight per GPU; trainer window $WINDOW_ROWS rows$( ((WINDOW_GROWTH)) && echo ", grown from 250k"), reuse $REUSE, lr $LR (embeddings $LR_EMBEDDING), soft mix $SOFT_MIX, policy temperature $POLICY_TEMP; evaluations every $EVAL_HOURS h, $EVAL_GAMES games, accept >= $ACCEPT"
+log "continuous loop: self-play ${SIMS}/${FAST_SIMS} sims, c_puct $C_PUCT, $PARALLEL games in flight per GPU; trainer window $WINDOW_ROWS rows$( ((WINDOW_GROWTH)) && echo ", grown from $WINDOW_START"), training from $MIN_ROWS positions, reuse $REUSE, lr $LR (embeddings $LR_EMBEDDING), soft mix $SOFT_MIX, policy temperature $POLICY_TEMP; evaluations every $EVAL_HOURS h, $EVAL_GAMES games, accept >= $ACCEPT"
 if (( NONSTOP )); then
   log "GPUs: trainer $TRAIN_GPU; self-play $SELFPLAY_GPUS ($WORKERS worker(s)); evaluations on $EVAL_GPU beside self-play and training"
 else

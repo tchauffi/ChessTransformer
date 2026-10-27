@@ -16,8 +16,11 @@ The targets are train_expert_iter.py's (visit counts at --policy-temp, WDL value
 (1 - soft_mix) z + soft_mix root_v, human replay), from the same loss code.
 
 From scratch (a randomly initialised --base, no seed data, no human replay), --window-growth
-starts the window at 250k positions and grows it with the positions played, as the paper's
-grew from 0.6M to 20M, so the first games, played by a random network, leave it early.
+starts the window at --window-start positions and grows it with the positions played, as the
+paper's grew from 0.6M to 20M, so the first games, played by a random network, leave it early.
+Start training (--min-rows) only once that many are in: a run from scratch that began at 200k
+positions memorised its first 1,700 games' results (held-out value loss 0.86 -> 1.07, about
+chance, while the training loss fell to 0.23).
 
 --state holds checkpoint.pt -- weights, EMA, optimizer, counters and the shards admitted --
 rewritten after every block, so a stop costs at most one block; SIGTERM saves first.
@@ -110,11 +113,12 @@ def make_batch(parts: list[tuple[Shard, np.ndarray]]):
 
 def window_cap(args, positions: int) -> int:
     """The window's size once `positions` have entered it: --window-rows, or with --window-growth
-    KataGo's rule c (1 + b ((N / c)^a - 1) / a), c = 250k, a = 0.75, b = 0.4, capped by
-    --window-rows: 2.2M rows at 10M positions, 21M at 209M (the paper's run ended at 20M)."""
+    KataGo's rule c (1 + b ((N / c)^a - 1) / a), c = --window-start, a = 0.75, b = 0.4, capped by
+    --window-rows. With c = 250k (KataGo's): 2.2M rows at 10M positions, 21M at 209M (the paper's
+    run ended at 20M); the paper started at 600k."""
     if not args.window_growth:
         return args.window_rows
-    c, a, b = 250_000, 0.75, 0.4
+    c, a, b = args.window_start, 0.75, 0.4
     if positions <= c:
         return min(args.window_rows, c)
     return min(args.window_rows, int(c * (1 + b * ((positions / c) ** a - 1) / a)))
@@ -196,6 +200,8 @@ def main():
     p.add_argument("--window-rows", type=int, default=10_000_000)
     p.add_argument("--window-growth", action="store_true",
                    help="grow the window with the positions seen, up to --window-rows (a run from scratch)")
+    p.add_argument("--window-start", type=int, default=250_000,
+                   help="with --window-growth, the window's size until that many positions have entered")
     p.add_argument("--reuse", type=float, default=4.0, help="presentations per new position")
     p.add_argument("--seed-reuse", type=float, default=0.0,
                    help="presentations owed to the --seed-data positions (0: they only fill the window)")

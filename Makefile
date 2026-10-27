@@ -186,8 +186,9 @@ continuous:  ## continuous training until `make stop` (several GPUs: trainer on 
 	RL=$(RL) /bin/bash scripts/rl_continuous.sh >> logs/rl_continuous.log 2>&1
 
 # From scratch, as in the paper: a random network with the champion's architecture, no seed games,
-# no human replay, a window grown from 250k, every move searched (SCRATCH_SIMS), the value on the
-# game result (soft mix 0.1), lr 5e-4; state in $(RL)/scratch, logs in logs/scratch/. One GPU
+# no human replay, a window grown from 600k positions and training from 600k (from 200k, the first
+# games' results were memorised), every move searched (SCRATCH_SIMS), the value on the game
+# result (soft mix 0.1), lr 5e-4; state in $(RL)/scratch, logs in logs/scratch/. One GPU
 # runs one rig: `make stop`, then `make continuous` resumes the other.
 SCRATCH_SIMS ?= 300
 scratch:  ## continuous training of a new network from scratch (data/rl/scratch) until `make stop`
@@ -197,7 +198,7 @@ scratch:  ## continuous training of a new network from scratch (data/rl/scratch)
 		.venv/bin/python scripts/init_random_model.py --like $(RL)/champion --out $(RL)/scratch/best
 	RL=$(RL) CONT=$(RL)/scratch LOGS=logs/scratch SEED_DATA= HUMAN_SHARDS= ANCHOR= \
 		SIMS=$(SCRATCH_SIMS) FULL_FRAC=1.0 SOFT_MIX=0.1 POLICY_TEMP=1.0 LR=5e-4 LR_EMBEDDING=5e-4 \
-		WINDOW_GROWTH=1 WINDOW_ROWS=20000000 \
+		WINDOW_GROWTH=1 WINDOW_START=600000 MIN_ROWS=600000 WINDOW_ROWS=20000000 \
 		/bin/bash scripts/rl_continuous.sh >> logs/scratch/rl_continuous.log 2>&1
 
 # The games viewer: the web demo's board over this machine's self-play games and their searches
