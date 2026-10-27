@@ -13,7 +13,8 @@
 #    send the trainer back to the accepted weights with a fresh optimizer. Every ANCHOR_EVERY
 #    acceptances the accepted network plays v2.1 (ANCHOR_GAMES), the absolute line.
 #
-# GPUs (one machine, ids as nvidia-smi numbers them). With more than one, the trainer takes
+# GPUs (one machine, ids as nvidia-smi numbers them, or the MIG instances' UUIDs when the GPUs
+# are partitioned: a process can use one instance). With more than one, the trainer takes
 # TRAIN_GPU ($RL/cont_train_gpu, default the first) to itself and self-play WORKERS_PER_GPU
 # processes ($RL/cont_workers_per_gpu, default 1) on each of SELFPLAY_GPUS ($RL/cont_selfplay_gpus,
 # default the others), PARALLEL games in flight per GPU ($RL/cont_parallel, default 256). Nothing
@@ -82,6 +83,8 @@ LOGS="${LOGS:-logs}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID  # CUDA's ids = nvidia-smi's
 if [[ -n ${CUDA_VISIBLE_DEVICES+x} ]]; then
   IFS=, read -ra GPUS <<< "$CUDA_VISIBLE_DEVICES"
+elif nvidia-smi -L 2>/dev/null | grep -q "UUID: MIG-"; then  # MIG: a process sees one instance, by UUID
+  read -ra GPUS <<< "$(nvidia-smi -L | grep -o 'UUID: MIG-[^)]*' | cut -d' ' -f2 | tr '\n' ' ')"
 else
   read -ra GPUS <<< "$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
 fi
