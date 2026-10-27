@@ -7,6 +7,9 @@
 #   make tune               this machine's self-play size, written to data/rl/ for the loop
 #   make validate           check a generation's games, shards and training targets
 #   make loop               generations back to back until `make stop` (run it inside tmux)
+#   make continuous         continuous training instead, on every GPU, until `make stop`
+#   make backup             upload what is new; CHECKPOINT=1 after `make stop` to move the
+#                           continuous rig: `make setup` + `make continuous` resume it elsewhere
 #   make status             the live status page (localhost:8765; reach it with ssh -L 8765:localhost:8765)
 #
 # The data comes from the private Hugging Face repos scripts/hf_sync.py fills after each gate:
@@ -57,7 +60,8 @@ WHEEL_TARGET ?= rust/target-wheel
 
 HF := uv run hf
 STATE := README.md history.tsv anchors.tsv selfplay_hours forced_playouts policy_target policy_temp \
-	fresh_full full_frac draw_contempt sim_batch temp_cutoff selfplay_games soft_mix sims c_puct rl_generation.log gates/*
+	fresh_full full_frac draw_contempt sim_batch temp_cutoff selfplay_games soft_mix sims c_puct \
+	cont_window_rows cont_reuse cont_lr cont_eval_hours cont_eval_games rl_generation.log gates/*
 # The loop's self-play settings (rl_generation.sh), for the benchmark.
 SELFPLAY_ARGS = --sims $$(cat $(RL)/sims 2>/dev/null || echo 800) --fast-sims 160 \
 	--c-puct $$(cat $(RL)/c_puct 2>/dev/null || echo 1.0) --full-frac $$(cat $(RL)/full_frac 2>/dev/null || echo 0.25) --cap-total all \
@@ -114,6 +118,10 @@ data:  ## download the champion, the games, the loop's state and the inputs; reb
 		pats=(); for g in $$gens; do pats+=("selfplay/$$g/*"); done
 		$(HF) download $(GAMES) --repo-type dataset --local-dir $(RL) --include "$${pats[@]}" --quiet >/dev/null
 	fi
+	# The continuous rig, when one was backed up: its accepted network, the trainer checkpoint
+	# (`make backup CHECKPOINT=1`), its games, evaluations and state; `make continuous` resumes it.
+	$(HF) download $(MODELS) --include "continuous/*" --local-dir $(RL) --quiet >/dev/null
+	$(HF) download $(GAMES) --repo-type dataset --include "continuous/*" --local-dir $(RL) --quiet >/dev/null
 	$(HF) download $(INPUTS) --repo-type dataset --local-dir $(DATA) \
 		--include $(foreach d,$(INPUT_DIRS),"$(d)/*") --quiet >/dev/null
 	# Every generation history.tsv records is finished: mark it so, as the loop left it.
@@ -191,8 +199,8 @@ stop:  ## let the loop finish the current generation (its gate and backup includ
 status:  ## the live status page on HOST:8765 (PAUSE=22-8 for a machine paused at night)
 	uv run python scripts/rl_status.py --host $(HOST) --pause $(PAUSE)
 
-backup:  ## upload new champions, games and the loop's state now (the loop does it after each gate)
-	uv run python scripts/hf_sync.py
+backup:  ## upload new champions, games, the loops' state now (CHECKPOINT=1: the continuous trainer's too, to move)
+	uv run python scripts/hf_sync.py $(if $(CHECKPOINT),--checkpoint)
 
 push-inputs:  ## once, from a machine that has them: the opening book and the human games
 	uv run python scripts/hf_sync.py --only inputs

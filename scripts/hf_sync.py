@@ -17,6 +17,12 @@ logs/rl_generation.log,
 so the repo mirrors data/rl/ and `make data` rebuilds a machine from it. The generation in progress and a gate still
 being played are left for the next run.
 
+The continuous rig (scripts/rl_continuous.sh), under continuous/ in both repos: its accepted
+network (and with --checkpoint the trainer's checkpoint) in the model repo, its games, the
+shards not there yet, its evaluations and state in the games repo. To move it to another
+machine: `make stop` here, wait for it to end, `make backup CHECKPOINT=1`; there `make setup`
+and `make continuous` resume it where it stopped.
+
 Inputs (`--only inputs`, once), to the dataset repo tchauffi/chesstransformer-inputs,
 which may be public: CC0, like the Lichess games they come from. The gates' opening book
 data/openings/ and the human games every candidate replays, data/shards/elite_k32_v2/.
@@ -30,6 +36,7 @@ Runs queue on a lock, and whatever is already on the hub is skipped.
     .venv/bin/python scripts/hf_sync.py                    # champions and games
     .venv/bin/python scripts/hf_sync.py --only games
     .venv/bin/python scripts/hf_sync.py --dry-run          # list what would be uploaded
+    .venv/bin/python scripts/hf_sync.py --only continuous --checkpoint  # the rig, to resume elsewhere
     .venv/bin/python scripts/hf_sync.py --only inputs      # the book and the human games
 
 Download:  hf download tchauffi/chesstransformer-rl --include "gen14/*" --local-dir .
@@ -76,7 +83,8 @@ INPUTS_REPO = "tchauffi/chesstransformer-inputs"
 # The loop's state; data/rl/selfplay_workers, _gpus and _parallel belong to the machine.
 STATE_FILES = ("history.tsv", "anchors.tsv", "selfplay_hours", "forced_playouts", "policy_target",
                "policy_temp", "fresh_full", "full_frac", "draw_contempt", "sim_batch", "temp_cutoff",
-               "selfplay_games", "soft_mix", "sims", "c_puct")
+               "selfplay_games", "soft_mix", "sims", "c_puct", "cont_window_rows", "cont_reuse",
+               "cont_lr", "cont_eval_hours", "cont_eval_games")
 INPUTS = ("openings", "shards/elite_k32_v2")
 CHAMPION_FILES = ("model.safetensors", "model_config.json", "model.onnx", "expert_iter_meta.json",
                   "SOURCE")
@@ -331,6 +339,66 @@ def sync_games(api: HfApi, rows: list[dict], dry_run: bool) -> None:
           flush=True)
 
 
+# ── continuous training ───────────────────────────────────────────────────────
+
+CONT = RL / "continuous"
+CONT_STATE = ("history.tsv", "anchors.tsv", "eval_state", "last_eval")
+
+
+def snapshot(path: Path) -> bytes:
+    """A file the rig may be rewriting (os.replace) or appending to, read once; an appended
+    log up to its last complete line."""
+    data = path.read_bytes()
+    return data[:data.rfind(b"\n") + 1] if path.suffix == ".jsonl" else data
+
+
+def sync_continuous(api: HfApi, dry_run: bool, checkpoint: bool) -> None:
+    """The continuous rig (scripts/rl_continuous.sh) under continuous/ in both repos: its
+    accepted network, and with `checkpoint` the trainer's checkpoint (rewritten every block),
+    to the model repo; its games (only the shards not there yet), evaluations and state to the
+    games repo. With the checkpoint, taken after the rig stopped, `make data` and `make
+    continuous` resume it on another machine where it stopped."""
+    if not (CONT / "best/model.safetensors").exists():
+        return
+    if not dry_run:
+        private_repo(api, MODEL_REPO, "model")
+    games = set() if dry_run else private_repo(api, GAMES_REPO, "dataset")
+    if "continuous/history.tsv" in games:  # one writer: refuse a hub ahead of this machine
+        hub = Path(api.hf_hub_download(GAMES_REPO, "continuous/history.tsv", repo_type="dataset"))
+        hub_rows = hub.read_text().splitlines()
+        ours = (CONT / "history.tsv").read_text().splitlines() if (CONT / "history.tsv").exists() else []
+        if ours[:len(hub_rows)] != hub_rows:
+            sys.exit("the hub's continuous/history.tsv is not a prefix of this machine's: another "
+                     "machine runs the continuous rig, so this one does not overwrite its backup")
+    ops = [CommitOperationAdd(f"continuous/best/{f.name}", snapshot(f))
+           for f in sorted((CONT / "best").iterdir()) if f.is_file()]
+    ck = CONT / "trainer/checkpoint.pt"
+    what = f"accepted network {(CONT / 'best/SOURCE').read_text().strip()}"
+    if checkpoint and ck.exists():
+        ops.append(CommitOperationAdd("continuous/trainer/checkpoint.pt", snapshot(ck)))
+        what += f" and the trainer checkpoint ({ck.stat().st_size / 1e6:.0f} MB)"
+    print(f"continuous: {what}", flush=True)
+    if not dry_run:
+        api.create_commit(MODEL_REPO, ops, commit_message=f"Continuous rig: {what}")
+    live = CONT / "selfplay"
+    shards = [f for f in sorted(live.glob("positions_*.npz")) if f"continuous/selfplay/{f.name}" not in games]
+    size = sum(f.stat().st_size for f in shards) / 1e6
+    n = sum(1 for _ in open(live / "games.jsonl")) if (live / "games.jsonl").exists() else 0
+    print(f"continuous: {n:,} games, {len(shards)} new shards ({size:.0f} MB), evaluations and state",
+          flush=True)
+    if dry_run:
+        return
+    ops = [CommitOperationAdd(f"continuous/selfplay/{f.name}", str(f)) for f in shards]  # never rewritten
+    ops += [CommitOperationAdd(f"continuous/selfplay/{f}", snapshot(live / f))
+            for f in ("games.jsonl", "generation_config.json") if (live / f).exists()]
+    ops += [CommitOperationAdd(f"continuous/evals/{f.name}", snapshot(f))
+            for f in sorted((CONT / "evals").glob("*")) if f.is_file()]
+    ops += [CommitOperationAdd(f"continuous/{f}", snapshot(CONT / f)) for f in CONT_STATE if (CONT / f).exists()]
+    api.create_commit(GAMES_REPO, ops, repo_type="dataset",
+                      commit_message=f"Continuous rig: {n:,} games, {len(shards)} new shards")
+    print("continuous: on the hub", flush=True)
+
+
 INPUTS_README = f"""---
 license: cc0-1.0
 pretty_name: ChessTransformer human games and opening book
@@ -444,8 +512,10 @@ def sync_inputs(api: HfApi, dry_run: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--only", choices=("champions", "games", "inputs"),
+    p.add_argument("--only", choices=("champions", "games", "continuous", "inputs"),
                    help="one part; inputs (static) only ever run this way")
+    p.add_argument("--checkpoint", action="store_true",
+                   help="also the continuous trainer's checkpoint: after `make stop`, to move machines")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -460,10 +530,12 @@ def main() -> None:
         gens = ", ".join(line.split("\t")[0] for line in ahead)
         sys.exit(f"the hub has {gens}, which this machine's history.tsv lacks: another machine "
                  "runs the loop, so this one does not overwrite its backup")
-    if args.only != "games":
+    if args.only in (None, "champions"):
         sync_champions(api, rows, args.dry_run)
-    if args.only != "champions":
+    if args.only in (None, "games"):
         sync_games(api, rows, args.dry_run)
+    if args.only in (None, "continuous"):
+        sync_continuous(api, args.dry_run, args.checkpoint)
 
 
 if __name__ == "__main__":
