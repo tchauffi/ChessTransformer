@@ -403,9 +403,18 @@ def run_workers(args: argparse.Namespace, id_offset: int) -> None:
             elif line.strip():
                 print(f"[w{k}] {line}", flush=True)
     finally:
+        # The workers flush on SIGTERM (--reload-from) and print through these pipes: read them to
+        # the end, and let no second SIGTERM (systemd signals every process) cut that short.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         for proc in procs:
             if proc.poll() is None:
                 proc.terminate()
+        while running:
+            k, line = lines.get()
+            if line is None:
+                running -= 1
+            elif line.strip() and not PROGRESS.match(line):
+                print(f"[w{k}] {line}", flush=True)
         for proc in procs:
             proc.wait()
     done = [d for d in done if d]

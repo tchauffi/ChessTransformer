@@ -284,11 +284,11 @@ def main():
         for t in ref.parameters():
             t.requires_grad_(False)
 
-    def publish() -> str:
+    def publish(suffix: str = "") -> str:
         swap_ema(model, ema)
         state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         swap_ema(model, ema)
-        name = f"step_{step:07d}"
+        name = f"step_{step:07d}{suffix}"
         tmp = pub_dir / f".{name}.tmp"
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir()
@@ -340,7 +340,9 @@ def main():
         swap_ema(model, ema)
         return " ".join(f"{k} {v / n:.4f}" for k, v in tot.items()) + f" on {n} held-out positions"
 
-    if not (pub_dir / "latest").exists():
+    if args.rollback_to:  # a new name, or self-play would keep this step's rejected weights
+        log(f"published {publish('_rollback')} (the rolled-back weights)")
+    elif not (pub_dir / "latest").exists():
         log(f"published {publish()} (the base network)")
 
     block_samples = args.block_steps * args.batch_size

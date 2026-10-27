@@ -171,7 +171,7 @@ tune:  ## write WORKERS, PARALLEL, THREADS, GPUS (MATCH_*, GATE_GAMES, ANCHOR_GA
 mps:  ## start NVIDIA MPS, so several workers' kernels run on a GPU at once
 	nvidia-cuda-mps-control -d
 
-continuous:  ## continuous training (self-play + trainer + evaluations) until `make stop`; logs/rl_continuous*.log
+continuous:  ## continuous training until `make stop` (several GPUs: trainer on the first, self-play on the rest); logs/rl_continuous*.log
 	mkdir -p logs
 	rm -f $(RL)/STOP
 	RL=$(RL) /bin/bash scripts/rl_continuous.sh >> logs/rl_continuous.log 2>&1
