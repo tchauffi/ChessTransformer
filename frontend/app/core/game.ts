@@ -28,7 +28,8 @@ export interface SearchNode {
 export interface SearchInfo {
   sims: number;
   visits: number;
-  elapsedMs: number;
+  /** Unknown for a recorded game's search (the games viewer). */
+  elapsedMs?: number;
   /** Plies from the searched position: mean simulation, most-visited line, deepest path. */
   depth?: { mean: number; mainLine: number; max: number };
   tree: SearchNode[];

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
 import { Chess, type Color, type PieceSymbol, type Square } from 'chess.js';
-import { Chessboard, defaultArrowOptions, type Arrow, type ChessboardOptions } from 'react-chessboard';
+import { Chessboard, type Arrow, type ChessboardOptions } from 'react-chessboard';
 
 import { BotAvatar } from './Avatars';
 import EvalBar from './EvalBar';
@@ -44,26 +44,12 @@ import {
   TIME_CONTROLS,
   timeControlById,
 } from '../core/chess';
+import { BOARD_LOOK, CHECK, DOT, RING, TINT } from '../core/board';
 import { DRAW_OFFER_GAP, evalAt, GameController } from '../core/game';
 import { useStoredState } from '../core/hooks';
 
 // An empty NEXT_PUBLIC_API_URL means same origin (the Space serves the API and the page together).
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:5001';
-
-// Board palette: sand and deep teal, with brass for move highlights and coral for
-// premoves and annotations.
-const BOARD = { light: '#e9e1cc', dark: '#5d8a84' };
-const TINT = {
-  last: 'rgba(247, 206, 84, 0.5)',
-  selected: 'rgba(247, 206, 84, 0.75)',
-  premove: 'rgba(214, 86, 74, 0.6)',
-  mark: 'rgba(226, 92, 68, 0.85)',
-};
-const DOT = 'radial-gradient(circle, rgba(18, 38, 33, 0.22) 21%, transparent 22.5%)';
-const RING = 'radial-gradient(circle, transparent 71%, rgba(18, 38, 33, 0.24) 72.5%)';
-const CHECK =
-  'radial-gradient(circle, rgba(236, 62, 46, 0.95) 0%, rgba(236, 62, 46, 0.6) 34%, rgba(236, 62, 46, 0) 72%)';
-const NOTATION_SIZE = 'clamp(9px, 1.55vmin, 13px)';
 
 interface PendingPromotion {
   from: Square;
@@ -464,6 +450,7 @@ export default function ChessGame() {
   const tcLabel = TIME_CONTROLS.find((t) => t.value === snap.timeControl)?.label ?? 'No clock';
 
   const boardOptions: ChessboardOptions = {
+    ...BOARD_LOOK,
     id: 'ct-board',
     position: preview?.position ?? boardPosition,
     boardOrientation: orientation,
@@ -474,27 +461,11 @@ export default function ChessGame() {
       : squareStyles,
     arrows: preview?.arrows ?? [],
     allowDrawingArrows: !preview,
-    darkSquareStyle: { backgroundColor: BOARD.dark },
-    lightSquareStyle: { backgroundColor: BOARD.light },
-    darkSquareNotationStyle: { color: BOARD.light, fontWeight: 600 },
-    lightSquareNotationStyle: { color: BOARD.dark, fontWeight: 600 },
-    alphaNotationStyle: { fontSize: NOTATION_SIZE, position: 'absolute', bottom: 1, right: 3, userSelect: 'none' },
-    numericNotationStyle: { fontSize: NOTATION_SIZE, position: 'absolute', top: 2, left: 3, userSelect: 'none' },
     dropSquareStyle: { boxShadow: 'inset 0 0 0 3px rgba(255, 255, 255, 0.7)' },
     draggingPieceStyle: { transform: 'scale(1.12)' },
     draggingPieceGhostStyle: { opacity: 0.3 },
-    boardStyle: { borderRadius: 4, boxShadow: '0 6px 24px rgba(0, 0, 0, 0.35)' },
-    animationDurationInMs: 170,
     allowDragging: phase === 'playing' && isLive && !preview,
     canDragPiece: ({ piece }) => piece.pieceType[0] === playerColor && !promotion && !autoplay,
-    arrowOptions: {
-      ...defaultArrowOptions,
-      color: '#f0a830',
-      secondaryColor: '#3fbf8f',
-      tertiaryColor: '#e0574b',
-      opacity: 0.82,
-      activeOpacity: 0.6,
-    },
     onPieceDrag: ({ square }) => square && setSelected(square as Square),
     onPieceDrop: ({ sourceSquare, targetSquare }) => dropRef.current(sourceSquare, targetSquare),
     onSquareClick: ({ square }) => onSquareClick(square as Square),
@@ -733,7 +704,7 @@ function PanelButton({
   );
 }
 
-function NavButton({
+export function NavButton({
   onClick,
   disabled,
   label,

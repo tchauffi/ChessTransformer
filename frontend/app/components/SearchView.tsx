@@ -11,6 +11,7 @@ interface Branch {
   san: string;
   color: Color;
   visits: number;
+  prior: number;
   q: number;
   path: string[];
   children: Branch[];
@@ -28,6 +29,7 @@ function annotate(fen: string, nodes: SearchNode[], path: string[] = []): Branch
         san: m.san,
         color: m.color,
         visits: n.visits,
+        prior: n.prior,
         q: n.q,
         path: p,
         children: annotate(g.fen(), n.children, p),
@@ -91,9 +93,11 @@ interface Props {
   /** Path being previewed on the board, if any. */
   active: string[] | null;
   onPreview: (path: string[] | null, pin?: boolean) => void;
+  /** Also show each move's prior from the network (the games viewer). */
+  showPrior?: boolean;
 }
 
-export default function SearchView({ search, fen, played, active, onPreview }: Props) {
+export default function SearchView({ search, fen, played, active, onPreview, showPrior }: Props) {
   const roots = useMemo(() => annotate(fen, search.tree), [fen, search.tree]);
   const { placed, rootY, height } = useMemo(() => layout(roots), [roots]);
   const total = Math.max(1, search.visits);
@@ -120,8 +124,10 @@ export default function SearchView({ search, fen, played, active, onPreview }: P
         ) : (
           'Weighed'
         )}{' '}
-        {search.visits.toLocaleString()} positions in {(search.elapsedMs / 1000).toFixed(1)} s. Bars show each
-        move&apos;s share of the search; hover or tap one to replay its line on the board.
+        {search.visits.toLocaleString()} positions
+        {search.elapsedMs != null ? ` in ${(search.elapsedMs / 1000).toFixed(1)} s` : ''}. Bars show each move&apos;s
+        share of the search{showPrior ? ', the faint figure the share the network gave it before searching' : ''};
+        hover or tap one to replay its line on the board.
       </p>
       {search.depth ? (
         <p className="px-4 pt-1.5 text-sm leading-snug text-muted">
@@ -155,6 +161,9 @@ export default function SearchView({ search, fen, played, active, onPreview }: P
                     />
                   </span>
                   <span className="w-9 shrink-0 text-right tabular-nums text-muted">{Math.round(share * 100)}%</span>
+                  {showPrior ? (
+                    <span className="w-9 shrink-0 text-right tabular-nums text-faint">{Math.round(r.prior * 100)}%</span>
+                  ) : null}
                   <span className="w-11 shrink-0 text-right font-medium tabular-nums text-fg">{formatEval(white)}</span>
                 </span>
                 {line.length ? (

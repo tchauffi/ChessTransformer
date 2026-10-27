@@ -72,7 +72,7 @@ SELFPLAY_ARGS = --sims $$(cat $(RL)/sims 2>/dev/null || echo 800) --fast-sims 16
 	--sim-batch $$(cat $(RL)/sim_batch 2>/dev/null || echo 1) \
 	--book data/openings/book2k.json
 
-.PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop continuous scratch stop status backup push-inputs
+.PHONY: help setup tools env engine data check bench bench-forward validate tune mps loop continuous scratch viewer stop status backup push-inputs
 
 help:  ## this list
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/:[^#]*## /\t/' | column -t -s $$'\t'
@@ -199,6 +199,14 @@ scratch:  ## continuous training of a new network from scratch (data/rl/scratch)
 		SIMS=$(SCRATCH_SIMS) FULL_FRAC=1.0 SOFT_MIX=0.1 POLICY_TEMP=1.0 LR=5e-4 LR_EMBEDDING=5e-4 \
 		WINDOW_GROWTH=1 WINDOW_ROWS=20000000 \
 		/bin/bash scripts/rl_continuous.sh >> logs/scratch/rl_continuous.log 2>&1
+
+# The games viewer: the web demo's board over this machine's self-play games and their searches
+# (scripts/games_viewer.py); HOST=0.0.0.0 to open it from the network.
+VIEWER_PORT ?= 8766
+viewer:  ## build the self-play games viewer and serve it on HOST:VIEWER_PORT/games
+	(cd frontend && { [[ -d node_modules ]] || npm ci --no-audit --no-fund; } \
+		&& NEXT_OUTPUT=export NEXT_PUBLIC_GAMES_VIEWER=1 NEXT_PUBLIC_API_URL= npx next build)
+	.venv/bin/python scripts/games_viewer.py --host $(HOST) --port $(VIEWER_PORT)
 
 loop:  ## generations back to back until `make stop` (inside tmux; logs/rl_generation.log)
 	mkdir -p logs
