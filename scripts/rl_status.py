@@ -78,6 +78,15 @@ STEP = re.compile(r"^\s+step (\d+)/(\d+) \|")
 TRAINING = re.compile(r"^training \S*/cand(\d+) from (\S+) on ")
 POSITIONS = re.compile(r"^Positions: ([\d,]+) over ([\d,]+) games")
 
+SCRATCH = RL / "scratch"
+SCRATCH_LOGS = ROOT / "logs/scratch"
+SCRATCH_STEP = re.compile(
+    r"^step (\d+) \| \S+ \| trained ([\d,]+) of budget [\d,]+ \| window ([\d,]+) rows, (\d+) shards"
+    r" \| admitted ([\d,]+) \| policy ([\d.]+) value ([\d.]+) kl [\d.]+ \| ([\d,]+) samples/s")
+SCRATCH_HELD = re.compile(r"^\s+held out \(EMA\): policy ([\d.]+) value ([\d.]+) sign_acc ([\d.]+)")
+SCRATCH_EVERY = re.compile(r"evaluations every ([\d.]+) h, (\d+) games, accept >= ([\d.]+)")
+SCRATCH_POINTS = 240  # chart points kept
+
 
 # ── running time (the loop is frozen 22:00-08:00) ─────────────────────────────
 
@@ -313,6 +322,90 @@ def last_stage_durations(lines: list[str]) -> tuple[float | None, float | None]:
     return train, gate
 
 
+def read_tail(path: Path, tail: int = LOG_TAIL) -> list[str]:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail))
+            return f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def scratch() -> dict | None:
+    """The continuous run from a random network (make scratch): trainer, self-play, evaluations."""
+    if not SCRATCH.exists():
+        return None
+    num = lambda x: int(x.replace(",", ""))
+    steps: list[dict] = []
+    for line in read_tail(SCRATCH_LOGS / "rl_continuous_train.log"):
+        t, msg = stamp(line)
+        m = SCRATCH_STEP.match(msg) if t else None
+        if m:
+            steps.append({"time": t, "step": int(m[1]), "trained": num(m[2]), "window": num(m[3]),
+                          "shards": int(m[4]), "admitted": num(m[5]), "policy": float(m[6]),
+                          "value": float(m[7]), "rate": num(m[8])})
+            continue
+        m = SCRATCH_HELD.match(msg) if t else None
+        if m and steps and "held_policy" not in steps[-1]:
+            steps[-1].update(held_policy=float(m[1]), held_value=float(m[2]), sign_acc=float(m[3]))
+    progress = None
+    for line in reversed(read_tail(SCRATCH_LOGS / "rl_continuous_selfplay.log", 1 << 16)):
+        m = PROGRESS.match(line)
+        if m:
+            progress = dict(zip(("games", "positions", "rate"), map(int, m.groups())))
+            break
+    loop = [stamp(x) for x in read_tail(SCRATCH_LOGS / "rl_continuous.log", 1 << 20)]
+    loop = [(t, msg) for t, msg in loop if t]
+    started = every = None
+    evaluating = None
+    anchor = None
+    for t, msg in loop:
+        if msg.startswith("continuous loop:"):
+            started = anchor = t
+            m = SCRATCH_EVERY.search(msg)
+            if m:
+                every = {"hours": float(m[1]), "games": int(m[2]), "accept": float(m[3])}
+            evaluating = None
+        elif msg.startswith("evaluating "):
+            evaluating = t
+        elif " vs accepted:" in msg or msg.startswith("no new publication"):
+            anchor, evaluating = t, None
+        elif msg.startswith("STOP found"):
+            anchor, started = None, None
+    evals = []
+    try:
+        with open(SCRATCH / "history.tsv") as f:
+            for r in csv.DictReader(f, delimiter="\t"):
+                evals.append({"time": r["time"], "candidate": r["candidate"],
+                              "score": float(r["score"]), "games": int(r["games"]),
+                              "elo": float(r["elo"]), "lo": float(r["lo"]), "hi": float(r["hi"]),
+                              "decision": r["decision"]})
+    except (OSError, KeyError, ValueError):
+        pass
+    now = datetime.now().replace(microsecond=0)
+    next_eval = None
+    if anchor and every and not evaluating:
+        need = every["hours"] * 3600
+        resume = anchor.replace(hour=RESUME_HOUR, minute=0, second=0)
+        if PAUSED_NIGHTLY and _paused(anchor) and anchor < resume and not loop_state()["frozen"]:
+            # started by hand before the resume timer: that early stretch ran too
+            early = (resume - anchor).total_seconds()
+            next_eval = anchor + timedelta(seconds=need) if early >= need else add_running(resume, need - early)
+        else:
+            next_eval = add_running(anchor, need)
+    last = steps[-1] if steps else None
+    keep = steps[:: max(1, len(steps) // SCRATCH_POINTS + 1)] + ([last] if last else [])
+    accepted = SCRATCH / "best" / "SOURCE"
+    try:
+        accepted = accepted.read_text().strip()
+    except OSError:
+        accepted = None
+    return {"last": last, "curve": [x for x in keep if "held_policy" in x],
+            "selfplay": progress, "every": every, "started": started, "evaluating": evaluating,
+            "next_eval": next_eval, "evals": evals, "accepted": accepted}
+
+
 def status() -> dict:
     now = datetime.now().replace(microsecond=0)
     lines = read_log()
@@ -410,7 +503,7 @@ def status() -> dict:
         "now": now, "loop": loop_state(), "champion": champion, "current": now_s,
         "history": rows, "ladder": ladder(rows, g), "gpu": gpu(), "disk": disk,
         "selfplay": {k: cfg.get(k) for k in ("sims", "fast_sims", "full_frac", "parallel_games")},
-        "last_entry": last_entry,
+        "last_entry": last_entry, "scratch": scratch(),
     }
 
 
@@ -577,6 +670,75 @@ def render_strength(s: dict) -> str:
         'opponents will see.</p></section>')
 
 
+def spark(points: list[tuple[float, float]], label: str, unit: str, digits: int) -> str:
+    """A small line chart as inline SVG, with a hover label per point."""
+    if len(points) < 2:
+        return f'<div class="chart"><p class="label">{esc(label)}</p><p class="sub">Not enough steps yet</p></div>'
+    W, H, l, r, t, b = 320, 120, 40, 8, 8, 20
+    xs, ys = [p[0] for p in points], [p[1] for p in points]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    pad = (y1 - y0) * 0.1 or 0.01
+    y0, y1 = y0 - pad, y1 + pad
+    px = lambda x: l + (x - x0) / ((x1 - x0) or 1) * (W - l - r)
+    py = lambda y: t + (1 - (y - y0) / (y1 - y0)) * (H - t - b)
+    path = " ".join(f"{px(x):.1f},{py(y):.1f}" for x, y in points)
+    grid = "".join(
+        f'<line x1="{l}" x2="{W - r}" y1="{py(v):.1f}" y2="{py(v):.1f}" stroke="var(--grid)"/>'
+        f'<text x="{l - 4}" y="{py(v) + 4:.1f}" text-anchor="end" fill="var(--muted)" font-size="10">{v:.{digits}f}</text>'
+        for v in (y0 + (y1 - y0) * k / 3 for k in range(4)))
+    dots = "".join(
+        f'<circle cx="{px(x):.1f}" cy="{py(y):.1f}" r="6" fill="transparent" '
+        f'data-tip="step {x:,.0f}: {y:.{digits + 1}f}{esc(unit)}"/>'
+        for x, y in points[:: max(1, len(points) // 60)])
+    ends = (f'<text x="{l}" y="{H - 5}" fill="var(--muted)" font-size="10">{x0:,.0f}</text>'
+            f'<text x="{W - r}" y="{H - 5}" text-anchor="end" fill="var(--muted)" font-size="10">'
+            f'step {x1:,.0f}</text>')
+    return (f'<div class="chart"><p class="label">{esc(label)} <span class="muted">{ys[-1]:.{digits + 1}f}{esc(unit)}</span></p>'
+            f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{esc(label)}">{grid}{ends}'
+            f'<polyline points="{path}" fill="none" stroke="var(--s1)" stroke-width="2" '
+            f'stroke-linejoin="round"/>{dots}</svg></div>')
+
+
+def render_scratch(s: dict) -> str:
+    sc, now = s.get("scratch"), s["now"]
+    if not sc or not sc["last"]:
+        return ""
+    last, sp, every = sc["last"], sc["selfplay"], sc["every"]
+    tiles = [("Training step", f'{last["step"]:,}', f'{last["trained"] / 1e6:.1f}M samples seen, '
+              f'{last["rate"]:,} samples/s'),
+             ("Window", f'{last["window"]:,}', f'rows in {last["shards"]} shards, {last["admitted"]:,} admitted')]
+    if sp:
+        tiles.append(("Self-play", f'{sp["games"]:,} games',
+                      f'{sp["positions"]:,} positions, {sp["rate"]:,} games/h'))
+    nxt = f'running since {sc["evaluating"]:%H:%M}' if sc["evaluating"] else when(sc["next_eval"], now)
+    tiles.append(("Next evaluation", esc(nxt),
+                  f'every {every["hours"]:g} h of running time, {every["games"]} games, '
+                  f'accept at {every["accept"]:.2f}' if every else ""))
+    if "held_policy" in last:
+        tiles.append(("Held-out policy", f'{last["held_policy"]:.3f}',
+                      f'cross-entropy; value sign accuracy {last["sign_acc"]:.1%}'))
+    curve = sc["curve"]
+    charts = (spark([(x["step"], x["held_policy"]) for x in curve], "Held-out policy cross-entropy", "", 2)
+              + spark([(x["step"], x["sign_acc"] * 100) for x in curve], "Held-out value sign accuracy", "%", 1)
+              + spark([(x["step"], x["value"]) for x in curve], "Training value loss", "", 2))
+    rows = "".join(
+        f'<tr class="{"promoted" if e["decision"] == "accepted" else "rejected"}"><th>{esc(e["candidate"])}</th>'
+        f'<td>{esc(e["time"][:16])}</td><td class="num">{signed(e["elo"])} <span class="muted">('
+        f'{signed(e["lo"])} to {signed(e["hi"])})</span></td><td class="num">{e["games"]}</td>'
+        f'<td>{esc(e["decision"])}</td></tr>' for e in reversed(sc["evals"]))
+    table = ('<div class="scroll"><table><thead><tr><th>Candidate</th><th>Played</th>'
+             '<th class="num">Elo vs accepted (95%)</th><th class="num">Games</th><th>Outcome</th></tr></thead>'
+             f'<tbody>{rows}</tbody></table></div>' if rows else
+             '<p class="sub">No evaluation has finished yet.</p>')
+    acc = f' Accepted network: {esc(sc["accepted"])}.' if sc["accepted"] else ""
+    cards = "".join(f'<div class="tile"><p class="label">{k}</p><p class="value">{v}</p><p class="sub">{sub}</p></div>'
+                    for k, v, sub in tiles)
+    return ('<section class="card"><h2>Scratch run <span class="muted">random network, continuous '
+            f'training</span></h2><div class="tiles">{cards}</div><div class="charts">{charts}</div>'
+            f'<h3>Evaluations</h3>{table}<p class="caption">Each evaluation plays the latest published '
+            f'network against the accepted one.{acc}</p></section>')
+
+
 def render_table(s: dict) -> str:
     c, now = s["current"], s["now"]
     out = []
@@ -623,7 +785,7 @@ def render(s: dict) -> str:
         f'<main id="page"><header><div><h1>RL training</h1>'
         f'<p class="sub">Updated {s["now"]:%H:%M:%S}, refreshes every minute'
         f'<span id="stale" hidden> (not reachable)</span></p></div>{render_state(s)}</header>'
-        f'{render_tiles(s)}{render_now(s)}{render_strength(s)}{render_table(s)}'
+        f'{render_scratch(s)}{render_tiles(s)}{render_now(s)}{render_strength(s)}{render_table(s)}'
         f'<footer><p>{esc("; ".join(setup))}.</p><p class="mono">Last log entry: {last}</p></footer></main>')
     return HEAD + page + '<div id="tip" role="tooltip" hidden></div><script>' + SCRIPT + "</script></body></html>"
 
@@ -649,6 +811,9 @@ header{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:space-between;al
 .state{margin:0;padding:6px 12px;border-radius:999px;background:var(--surface);border:1px solid var(--border);font-weight:600;font-size:14px}
 .state .icon{margin-right:8px;font-size:12px}.state.running .icon{color:var(--good)}
 .state.paused .icon{color:var(--muted)}.state.stopped .icon{color:var(--critical)}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:8px}
+.chart svg{width:100%;height:auto;display:block}.chart .label{margin:0 0 2px;font-size:13px;color:var(--ink-2)}
+h3{font-size:15px;margin:12px 0 6px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:12px}
 .tile,.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
 .card{margin-bottom:12px}
