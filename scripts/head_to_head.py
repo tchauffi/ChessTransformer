@@ -137,7 +137,7 @@ def start_board(opening: str) -> chess.Board:
     return board
 
 
-def play(white, white_nodes, black, black_nodes, opening: str, max_plies: int):
+def play(white, white_limit, black, black_limit, opening: str, max_plies: int):
     """Returns (result, plies on the move stack, fewest men on the board at any point).
 
     ``max_plies`` counts the move stack, so for the built-in lines it is the game's
@@ -145,8 +145,8 @@ def play(white, white_nodes, black, black_nodes, opening: str, max_plies: int):
     board = start_board(opening)
     min_men = len(board.piece_map())
     while not game_over(board) and len(board.move_stack) < max_plies:
-        eng, nodes = (white, white_nodes) if board.turn == chess.WHITE else (black, black_nodes)
-        board.push(eng.play(board, chess.engine.Limit(nodes=nodes)).move)
+        eng, limit = (white, white_limit) if board.turn == chess.WHITE else (black, black_limit)
+        board.push(eng.play(board, limit).move)
         min_men = min(min_men, len(board.piece_map()))
     result = board.result() if board.is_game_over() else "1/2-1/2"
     return result, len(board.move_stack), min_men
@@ -219,6 +219,14 @@ def parse_args() -> argparse.Namespace:
                    help="leaves per NN wave (ct-bot default 16). Larger batches feed the GPU "
                         "better but change search behaviour -- more collisions per wave -- so "
                         "leave unset when the match is meant to mirror production search.")
+    p.add_argument("--stockfish-b", default=None,
+                   help="side B is this Stockfish binary instead of ct-bot, limited to --sf-elo "
+                        "(UCI_LimitStrength, which Stockfish calibrates to the CCRL Blitz list, "
+                        "1320..3190): an outside anchor for a network's rating")
+    p.add_argument("--sf-elo", type=int, default=1500, help="UCI_Elo of the Stockfish side")
+    p.add_argument("--sf-time", type=float, default=0.5,
+                   help="Stockfish seconds per move. Time-limited, unlike ct-bot, so keep "
+                        "--workers below the core count or contention weakens it.")
     args = p.parse_args()
     if args.book is not None:
         args.lines = [o["fen"] for o in json.loads(args.book.read_text())["openings"]]
@@ -227,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     if not 1 <= args.openings <= len(args.lines):
         p.error(f"--openings must be in 1..{len(args.lines)}")
     args.label_a = args.label_a or f"A@{args.nodes_a}"
-    args.label_b = args.label_b or f"B@{args.nodes_b}"
+    args.label_b = args.label_b or (f"SF{args.sf_elo}" if args.stockfish_b else f"B@{args.nodes_b}")
     return args
 
 
@@ -247,19 +255,27 @@ def main() -> None:
                 out += [flag, str(val)]
         return out
 
+    # (label, command, per-move limit, UCI options set after the handshake)
     A = (la, [args.bot_a or args.bot, "uci", "--model", args.model_a, *common,
               *search_flags(args.cpuct_a, args.fpu_a, args.prior_temp_a, args.syzygy_a)],
-         args.nodes_a)
-    B = (lb, [args.bot_b or args.bot, "uci", "--model", args.model_b, *common,
-              *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b, args.syzygy_b)],
-         args.nodes_b)
+         chess.engine.Limit(nodes=args.nodes_a), {})
+    if args.stockfish_b:
+        B = (lb, [args.stockfish_b], chess.engine.Limit(time=args.sf_time),
+             {"UCI_LimitStrength": True, "UCI_Elo": args.sf_elo, "Threads": 1, "Hash": 16})
+    else:
+        B = (lb, [args.bot_b or args.bot, "uci", "--model", args.model_b, *common,
+                  *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b, args.syzygy_b)],
+             chess.engine.Limit(nodes=args.nodes_b), {})
     book = args.lines[: args.openings]
 
     jobs = [(i, op, a_white) for i, op in enumerate(book) for a_white in (True, False)]
     workers = max(1, min(args.workers, len(jobs)))
 
     print(f"{la}: {args.bot_a or args.bot} {args.model_a} @ {args.nodes_a} nodes")
-    print(f"{lb}: {args.bot_b or args.bot} {args.model_b} @ {args.nodes_b} nodes")
+    if args.stockfish_b:
+        print(f"{lb}: {args.stockfish_b} at UCI_Elo {args.sf_elo}, {args.sf_time} s a move")
+    else:
+        print(f"{lb}: {args.bot_b or args.bot} {args.model_b} @ {args.nodes_b} nodes")
     print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)\n", flush=True)
 
     lock = threading.Lock()
@@ -273,16 +289,17 @@ def main() -> None:
         """Play a slice of the job list with a private pair of engine processes."""
         ea = chess.engine.SimpleEngine.popen_uci(A[1])
         eb = chess.engine.SimpleEngine.popen_uci(B[1])
+        eb.configure(B[3])
         out = []
         try:
             for idx, op, a_white in shard:
                 if stop.is_set():
                     break
                 if a_white:
-                    white, wn, black, bn = ea, A[2], eb, B[2]
+                    white, wl, black, bl = ea, A[2], eb, B[2]
                 else:
-                    white, wn, black, bn = eb, B[2], ea, A[2]
-                r, plies, min_men = play(white, wn, black, bn, op, args.max_plies)
+                    white, wl, black, bl = eb, B[2], ea, A[2]
+                r, plies, min_men = play(white, wl, black, bl, op, args.max_plies)
                 s = 0.5 if r == "1/2-1/2" else (1.0 if (r == "1-0") == a_white else 0.0)
                 tag = "=" if s == 0.5 else ("+" if s == 1.0 else "-")
                 out.append(s)
