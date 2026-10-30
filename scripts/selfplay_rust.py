@@ -38,15 +38,18 @@ Usage
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import contextlib
 import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -74,7 +77,8 @@ class Forward:
     """Batched bf16 forward with bucketed static shapes (compile-friendly)."""
 
     def __init__(self, model_dir: str, device: str, use_ema: bool, compile_model: bool,
-                 buckets: tuple[int, ...] = _BUCKETS, compile_mode: str = COMPILE_MODES[0]):
+                 buckets: tuple[int, ...] = _BUCKETS, compile_mode: str = COMPILE_MODES[0],
+                 trt: bool = False):
         self.device = device
         # Any CUDA device ("cuda", "cuda:2"): several Forwards can share one process, each
         # on its own card (gpu_match --gpus).
@@ -89,7 +93,11 @@ class Forward:
             self.model.load_state_dict(ema, strict=False)
             self.model = self.model.bfloat16()
             print(f"EMA weights loaded ({len(ema)} tensors)")
-        if compile_model and self.cuda:
+        self.trt = trt
+        if trt:
+            assert self.cuda and not use_ema, "--trt needs CUDA and no --ema (the engine is built from the checkpoint)"
+            self._trt_start(model_dir)
+        elif compile_model and self.cuda:
             self.model = torch.compile(self.model, mode=compile_mode)
         self.bufs = {}
         self.slots = {}  # async staging buffers, one set per in-flight batch
@@ -121,12 +129,74 @@ class Forward:
             )
         return self.bufs[bucket]
 
+    # ── TensorRT engine (--trt) ───────────────────────────────────────────────
+    #
+    # An engine is tied to the weights it was built from, so reload() builds a new one in a
+    # subprocess (scripts/trt_forward.py: ONNX export + build, ~1 min) while the old engine keeps
+    # serving; _trt_poll() swaps it in between two launches. The swap waits for the stream so the
+    # old engine is not freed under batches still in flight.
+
+    def _trt_build(self, model_dir: str) -> tuple:
+        """Snapshot model_dir (the trainer prunes old publications) and start building from it."""
+        self._trt_count += 1
+        snap = Path(self._trt_dir) / f"snap{self._trt_count % 2}"
+        shutil.rmtree(snap, ignore_errors=True)
+        shutil.copytree(model_dir, snap)
+        engine = Path(self._trt_dir) / f"{self._trt_count}.engine"
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).with_name("trt_forward.py")),
+                                 "build", str(snap), str(engine)], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        return proc, model_dir, engine
+
+    def _trt_start(self, model_dir: str) -> None:
+        from trt_forward import TrtModel
+        self._trt_dir = tempfile.mkdtemp(prefix="ct-trt-")
+        atexit.register(shutil.rmtree, self._trt_dir, ignore_errors=True)
+        self._trt_count = 0
+        self._trt_built = os.path.realpath(model_dir)
+        self._trt_target = self._trt_built
+        self._trt_job = None
+        proc, _, engine = self._trt_build(model_dir)
+        out = proc.communicate()[0]
+        if proc.returncode != 0:
+            raise RuntimeError(f"TensorRT engine build failed:\n{out}")
+        print(out.strip().splitlines()[-1], flush=True)
+        self.value_scalar = lambda v: v  # the engine already emits the scalar value
+        with self._on():
+            self.model = TrtModel(engine)
+
+    def _trt_poll(self) -> None:
+        job = self._trt_job
+        if job is not None and job[0].poll() is not None:
+            proc, target, engine = job
+            self._trt_job = None
+            out = proc.communicate()[0]
+            if proc.returncode != 0:
+                print(f"TensorRT rebuild for {Path(target).name} failed, keeping the old engine:\n{out}", flush=True)
+            else:
+                from trt_forward import TrtModel
+                model = TrtModel(engine)
+                with torch.no_grad():
+                    for b in self.buckets:  # first run of each shape outside the timed path
+                        model(*self._buffers(b))
+                torch.cuda.synchronize(self.device)
+                self.model = model
+                self.weights += 1
+                print(f"TensorRT engine swapped to {Path(target).name}", flush=True)
+            self._trt_built = target
+        if self._trt_job is None and self._trt_target != self._trt_built:
+            self._trt_job = self._trt_build(self._trt_target)
+
     @torch.no_grad()
     def reload(self, model_dir: str) -> None:
         """Load another checkpoint of the same network into this Forward, in place: the
         compiled graphs read the parameters at their addresses, so they run the new weights
         without a recompile (continuous training publishes every few minutes). Batches in
-        flight finish on the old weights first."""
+        flight finish on the old weights first. With --trt the engine is rebuilt in the
+        background instead and swapped in when ready."""
+        if self.trt:
+            self._trt_target = os.path.realpath(model_dir)
+            return
         from safetensors.torch import load_file
         state = load_file(str(Path(model_dir) / "model.safetensors"))
         mod = getattr(self.model, "_orig_mod", self.model)
@@ -157,6 +227,8 @@ class Forward:
             return self._call(n, bucket, boards, player, castling, ep)
 
     def _call(self, n, bucket, boards, player, castling, ep):
+        if self.trt:
+            self._trt_poll()
         bt, pl, ca, e = self._buffers(bucket)
         bt.zero_(); pl.zero_(); ca.zero_(); e.zero_()
         bt[:n] = torch.from_numpy(boards.astype(np.int64)).to(self.device)
@@ -215,6 +287,8 @@ class Forward:
             return self._launch(slot, boards, player, castling, ep, legal)
 
     def _launch(self, slot, boards, player, castling, ep, legal):
+        if self.trt:
+            self._trt_poll()
         n, width = len(player), legal.shape[1]
         st = self._slot(slot, n, width)
         for h, d, a in zip(st["h_in"], st["d_in"], (boards, player, castling, ep)):
@@ -553,6 +627,10 @@ def main():
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--compile-mode", choices=COMPILE_MODES, default=COMPILE_MODES[0],
                    help="torch.compile mode of the forward (CUDA)")
+    p.add_argument("--trt", action="store_true",
+                   help="evaluate with a TensorRT FP16 engine (RMSNorm squares in FP32) instead of "
+                        "torch.compile bf16: ~1.12x forward on the RTX 5070 Ti; --reload-from "
+                        "rebuilds the engine in the background (scripts/trt_forward.py)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--workers", type=int, default=1,
                    help="processes on the same --out, each feeding the GPU from its own thread")
@@ -621,7 +699,7 @@ def main():
     }
     openings = selfplay_openings(args)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile,
-                      compile_mode=args.compile_mode)
+                      compile_mode=args.compile_mode, trt=args.trt)
     forward.verify_every = args.verify_every
     writer = ShardWriter(out_dir, flush_positions=args.flush_positions,
                          prefix="positions_" if n_w == 1 else f"positions_w{w}_")
