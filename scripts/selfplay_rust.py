@@ -165,7 +165,11 @@ class Forward:
         with self._on():
             self.model = TrtModel(engine)
 
+    _verifying = False  # _verify recomputes on the weights the batch ran on: no swap in between
+
     def _trt_poll(self) -> None:
+        if self._verifying:
+            return
         job = self._trt_job
         if job is not None and job[0].poll() is not None:
             proc, target, engine = job
@@ -331,7 +335,11 @@ class Forward:
 
     def _verify(self, inputs, logits: np.ndarray, values: np.ndarray):
         boards, player, castling, ep, legal = inputs
-        full, ref_v = self(boards, player, castling, ep)
+        self._verifying = True
+        try:
+            full, ref_v = self(boards, player, castling, ep)
+        finally:
+            self._verifying = False
         full = np.concatenate([full.reshape(len(full), 64 * 73), np.zeros((len(full), 1), np.float32)], 1)
         ref = np.take_along_axis(full, legal.astype(np.int64), axis=1)
         if not (np.allclose(logits, ref, rtol=0, atol=1e-2) and np.allclose(values, ref_v, rtol=0, atol=1e-3)):
