@@ -9,8 +9,8 @@
 #   make loop               generations back to back until `make stop` (run it inside tmux)
 #   make continuous         continuous training instead, on every GPU, until `make stop`
 #   make scratch            the same for a new network from random weights (data/rl/scratch)
-#   make backup             upload what is new; CHECKPOINT=1 after `make stop` to move the
-#                           continuous rig: `make setup` + `make continuous` resume it elsewhere
+#   make backup             upload what is new, both rigs included; CHECKPOINT=1 adds their trainer
+#                           checkpoints: `make setup` + `make continuous` (or scratch) resume elsewhere
 #   make status             the live status page (localhost:8765; reach it with ssh -L 8765:localhost:8765)
 #
 # The data comes from the private Hugging Face repos scripts/hf_sync.py fills after each gate:
@@ -119,10 +119,13 @@ data:  ## download the champion, the games, the loop's state and the inputs; reb
 		pats=(); for g in $$gens; do pats+=("selfplay/$$g/*"); done
 		$(HF) download $(GAMES) --repo-type dataset --local-dir $(RL) --include "$${pats[@]}" --quiet >/dev/null
 	fi
-	# The continuous rig, when one was backed up: its accepted network, the trainer checkpoint
-	# (`make backup CHECKPOINT=1`), its games, evaluations and state; `make continuous` resumes it.
-	$(HF) download $(MODELS) --include "continuous/*" --local-dir $(RL) --quiet >/dev/null
-	$(HF) download $(GAMES) --repo-type dataset --include "continuous/*" --local-dir $(RL) --quiet >/dev/null
+	# The rigs, when they were backed up: each one's accepted network, trainer checkpoint
+	# (`make backup CHECKPOINT=1`), games, evaluations and state; `make continuous` and
+	# `make scratch` resume them.
+	for rig in continuous scratch; do
+		$(HF) download $(MODELS) --include "$$rig/*" --local-dir $(RL) --quiet >/dev/null
+		$(HF) download $(GAMES) --repo-type dataset --include "$$rig/*" --local-dir $(RL) --quiet >/dev/null
+	done
 	$(HF) download $(INPUTS) --repo-type dataset --local-dir $(DATA) \
 		--include $(foreach d,$(INPUT_DIRS),"$(d)/*") --quiet >/dev/null
 	# Every generation history.tsv records is finished: mark it so, as the loop left it.
@@ -188,17 +191,20 @@ continuous:  ## continuous training until `make stop` (several GPUs: trainer on 
 # From scratch, as in the paper: a random network with the champion's architecture, no seed games,
 # no human replay, a window grown from 600k positions and training from 600k (from 200k, the first
 # games' results were memorised), every move searched (SCRATCH_SIMS), the value on the game
-# result (soft mix 0.1), lr 5e-4; state in $(RL)/scratch, logs in logs/scratch/. One GPU
-# runs one rig: `make stop`, then `make continuous` resumes the other.
+# result (soft mix 0.1), lr SCRATCH_LR; state in $(RL)/scratch, logs in logs/scratch/. One GPU
+# runs one rig: `make stop`, then `make continuous` resumes the other. A learning-rate drop is a
+# restart: `make stop`, then `make scratch SCRATCH_LR=1.5e-4` (the trainer resumes at that rate).
 SCRATCH_SIMS ?= 300
 SCRATCH_START ?= 600000
+SCRATCH_LR ?= 5e-4
+SCRATCH_LR_EMBEDDING ?= $(SCRATCH_LR)
 scratch:  ## continuous training of a new network from scratch (data/rl/scratch) until `make stop`
 	mkdir -p logs/scratch
 	rm -f $(RL)/STOP
 	[[ -f $(RL)/scratch/best/model.safetensors ]] || \
 		.venv/bin/python scripts/init_random_model.py --like $(RL)/champion --out $(RL)/scratch/best
 	RL=$(RL) CONT=$(RL)/scratch LOGS=logs/scratch SEED_DATA= HUMAN_SHARDS= ANCHOR= \
-		SIMS=$(SCRATCH_SIMS) FULL_FRAC=1.0 SOFT_MIX=0.1 POLICY_TEMP=1.0 LR=5e-4 LR_EMBEDDING=5e-4 \
+		SIMS=$(SCRATCH_SIMS) FULL_FRAC=1.0 SOFT_MIX=0.1 POLICY_TEMP=1.0 LR=$(SCRATCH_LR) LR_EMBEDDING=$(SCRATCH_LR_EMBEDDING) \
 		WINDOW_GROWTH=1 WINDOW_START=$(SCRATCH_START) MIN_ROWS=$(SCRATCH_START) WINDOW_ROWS=20000000 \
 		/bin/bash scripts/rl_continuous.sh >> logs/scratch/rl_continuous.log 2>&1
 
@@ -225,7 +231,7 @@ stop:  ## let the loop finish the current generation (its gate and backup includ
 status:  ## the live status page on HOST:8765 (PAUSE=22-8 for a machine paused at night)
 	uv run python scripts/rl_status.py --host $(HOST) --pause $(PAUSE)
 
-backup:  ## upload new champions, games, the loops' state now (CHECKPOINT=1: the continuous trainer's too, to move)
+backup:  ## upload new champions, games, the loops' and rigs' state now (CHECKPOINT=1: the rigs' trainers too)
 	uv run python scripts/hf_sync.py $(if $(CHECKPOINT),--checkpoint)
 
 push-inputs:  ## once, from a machine that has them: the opening book and the human games

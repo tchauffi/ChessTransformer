@@ -23,7 +23,9 @@ positions memorised its first 1,700 games' results (held-out value loss 0.86 -> 
 chance, while the training loss fell to 0.23).
 
 --state holds checkpoint.pt -- weights, EMA, optimizer, counters and the shards admitted --
-rewritten after every block, so a stop costs at most one block; SIGTERM saves first.
+rewritten after every block, so a stop costs at most one block; SIGTERM saves first. A resume
+keeps the optimizer's moments but takes --lr and --lr-embedding from the command line (logged
+when they differ from the checkpoint's), so a learning-rate drop is a restart at the new rate.
 --rollback-to <model dir> restarts from those weights with a fresh optimizer (what the
 orchestrator does after two failed evaluations). Games whose id hashes into --heldout-frac are
 never trained on; their positions give the held-out line logged at every publication.
@@ -266,6 +268,17 @@ def main():
         seen = ck["seen"]
         rng.bit_generator.state = ck["rng"]
         log(f"resumed at step {step}: {trained:,} samples trained, {admitted:,} positions admitted")
+        # --lr and --lr-embedding win over the checkpoint: its optimizer and schedule (LambdaLR
+        # saves base_lrs) would otherwise keep the rate it was saved with, so a restart with a
+        # new LR silently trained on at the old one. Adam's moments are kept.
+        lrs = [g["lr"] for g in param_groups(model, args.lr, args.lr_embedding, args.weight_decay)]
+        if [float(b) for b in sched.base_lrs] != lrs:
+            log(f"lr {'/'.join(f'{b:.3g}' for b in sched.base_lrs)} -> "
+                f"{'/'.join(f'{b:.3g}' for b in lrs)} (embeddings/weights/no-decay, from the command line)")
+            warm = sched.lr_lambdas[0](sched.last_epoch)
+            sched.base_lrs = lrs
+            for g, lr in zip(opt.param_groups, lrs):
+                g["initial_lr"], g["lr"] = lr, lr * warm
     if args.rollback_to:
         state = load_file(str(Path(args.rollback_to) / "model.safetensors"))
         model.load_state_dict(state)
@@ -437,7 +450,7 @@ def main():
         log(f"step {step} | {name} | trained {trained:,} of budget {budget:,.0f} | window {window.rows:,} "
             f"rows, {len(window.shards)} shards | admitted {admitted:,} | "
             + " ".join(f"{k} {v / done:.4f}" for k, v in run.items() if k in ("policy", "value", "kl", "human"))
-            + f" | {done * args.batch_size / took:,.0f} samples/s")
+            + f" | {done * args.batch_size / took:,.0f} samples/s | lr {opt.param_groups[1]['lr']:.3g}")
         log(f"  held out (EMA): {held_line()}")
     checkpoint()
     log(f"stopped at step {step}: checkpoint saved")

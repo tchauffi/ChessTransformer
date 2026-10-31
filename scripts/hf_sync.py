@@ -17,11 +17,13 @@ logs/rl_generation.log,
 so the repo mirrors data/rl/ and `make data` rebuilds a machine from it. The generation in progress and a gate still
 being played are left for the next run.
 
-The continuous rig (scripts/rl_continuous.sh), under continuous/ in both repos: its accepted
-network (and with --checkpoint the trainer's checkpoint) in the model repo, its games, the
-shards not there yet, its evaluations and state in the games repo. To move it to another
-machine: `make stop` here, wait for it to end, `make backup CHECKPOINT=1`; there `make setup`
-and `make continuous` resume it where it stopped.
+The rigs scripts/rl_continuous.sh runs, each under its directory's name in both repos:
+continuous/ (`make continuous`, data/rl/continuous) and scratch/ (`make scratch`, the network
+from random weights, data/rl/scratch). Their accepted network (and with --checkpoint the
+trainer's checkpoint) in the model repo, their games, the shards not there yet, their
+evaluations and state in the games repo. To move one to another machine: `make stop` here, wait
+for it to end, `make backup CHECKPOINT=1`; there `make setup` and `make continuous` (or `make
+scratch`) resume it where it stopped.
 
 Inputs (`--only inputs`, once), to the dataset repo tchauffi/chesstransformer-inputs,
 which may be public: CC0, like the Lichess games they come from. The gates' opening book
@@ -36,7 +38,8 @@ Runs queue on a lock, and whatever is already on the hub is skipped.
     .venv/bin/python scripts/hf_sync.py                    # champions and games
     .venv/bin/python scripts/hf_sync.py --only games
     .venv/bin/python scripts/hf_sync.py --dry-run          # list what would be uploaded
-    .venv/bin/python scripts/hf_sync.py --only continuous --checkpoint  # the rig, to resume elsewhere
+    .venv/bin/python scripts/hf_sync.py --only continuous --checkpoint  # a rig, to resume elsewhere
+    .venv/bin/python scripts/hf_sync.py --only scratch --checkpoint
     .venv/bin/python scripts/hf_sync.py --only inputs      # the book and the human games
 
 Download:  hf download tchauffi/chesstransformer-rl --include "gen14/*" --local-dir .
@@ -341,8 +344,9 @@ def sync_games(api: HfApi, rows: list[dict], dry_run: bool) -> None:
 
 # ── continuous training ───────────────────────────────────────────────────────
 
-CONT = RL / "continuous"
+RIGS = ("continuous", "scratch")  # data/rl/<rig>, mirrored under <rig>/ in both repos
 CONT_STATE = ("history.tsv", "anchors.tsv", "eval_state", "last_eval")
+SHARDS_PER_COMMIT = 400  # a first upload of thousands of shards keeps what it sent if cut short
 
 
 def snapshot(path: Path) -> bytes:
@@ -352,51 +356,58 @@ def snapshot(path: Path) -> bytes:
     return data[:data.rfind(b"\n") + 1] if path.suffix == ".jsonl" else data
 
 
-def sync_continuous(api: HfApi, dry_run: bool, checkpoint: bool) -> None:
-    """The continuous rig (scripts/rl_continuous.sh) under continuous/ in both repos: its
-    accepted network, and with `checkpoint` the trainer's checkpoint (rewritten every block),
-    to the model repo; its games (only the shards not there yet), evaluations and state to the
-    games repo. With the checkpoint, taken after the rig stopped, `make data` and `make
-    continuous` resume it on another machine where it stopped."""
-    if not (CONT / "best/model.safetensors").exists():
+def sync_rig(api: HfApi, rig: str, dry_run: bool, checkpoint: bool) -> None:
+    """A continuous rig (scripts/rl_continuous.sh with CONT=data/rl/<rig>) under <rig>/ in both
+    repos: its accepted network, and with `checkpoint` the trainer's checkpoint (rewritten
+    every block, atomically), to the model repo; its games (only the shards not there yet),
+    evaluations and state to the games repo. With the checkpoint, `make data` and `make
+    continuous` (`make scratch`) resume it on another machine where it stopped."""
+    cont = RL / rig
+    if not (cont / "best/model.safetensors").exists():
         return
     if not dry_run:
         private_repo(api, MODEL_REPO, "model")
     games = set() if dry_run else private_repo(api, GAMES_REPO, "dataset")
-    if "continuous/history.tsv" in games:  # one writer: refuse a hub ahead of this machine
-        hub = Path(api.hf_hub_download(GAMES_REPO, "continuous/history.tsv", repo_type="dataset"))
+    if f"{rig}/history.tsv" in games:  # one writer: refuse a hub ahead of this machine
+        hub = Path(api.hf_hub_download(GAMES_REPO, f"{rig}/history.tsv", repo_type="dataset"))
         hub_rows = hub.read_text().splitlines()
-        ours = (CONT / "history.tsv").read_text().splitlines() if (CONT / "history.tsv").exists() else []
+        ours = (cont / "history.tsv").read_text().splitlines() if (cont / "history.tsv").exists() else []
         if ours[:len(hub_rows)] != hub_rows:
-            sys.exit("the hub's continuous/history.tsv is not a prefix of this machine's: another "
-                     "machine runs the continuous rig, so this one does not overwrite its backup")
-    ops = [CommitOperationAdd(f"continuous/best/{f.name}", snapshot(f))
-           for f in sorted((CONT / "best").iterdir()) if f.is_file()]
-    ck = CONT / "trainer/checkpoint.pt"
-    what = f"accepted network {(CONT / 'best/SOURCE').read_text().strip()}"
+            sys.exit(f"the hub's {rig}/history.tsv is not a prefix of this machine's: another "
+                     f"machine runs the {rig} rig, so this one does not overwrite its backup")
+    ops = [CommitOperationAdd(f"{rig}/best/{f.name}", snapshot(f))
+           for f in sorted((cont / "best").iterdir()) if f.is_file()]
+    ck = cont / "trainer/checkpoint.pt"
+    source = cont / "best/SOURCE"
+    what = f"accepted network {source.read_text().strip() if source.exists() else '(initial)'}"
     if checkpoint and ck.exists():
-        ops.append(CommitOperationAdd("continuous/trainer/checkpoint.pt", snapshot(ck)))
+        ops.append(CommitOperationAdd(f"{rig}/trainer/checkpoint.pt", snapshot(ck)))
         what += f" and the trainer checkpoint ({ck.stat().st_size / 1e6:.0f} MB)"
-    print(f"continuous: {what}", flush=True)
+    print(f"{rig}: {what}", flush=True)
     if not dry_run:
-        api.create_commit(MODEL_REPO, ops, commit_message=f"Continuous rig: {what}")
-    live = CONT / "selfplay"
-    shards = [f for f in sorted(live.glob("positions_*.npz")) if f"continuous/selfplay/{f.name}" not in games]
+        api.create_commit(MODEL_REPO, ops, commit_message=f"{rig.capitalize()} rig: {what}")
+    live = cont / "selfplay"
+    shards = [f for f in sorted(live.glob("positions_*.npz")) if f"{rig}/selfplay/{f.name}" not in games]
     size = sum(f.stat().st_size for f in shards) / 1e6
     n = sum(1 for _ in open(live / "games.jsonl")) if (live / "games.jsonl").exists() else 0
-    print(f"continuous: {n:,} games, {len(shards)} new shards ({size:.0f} MB), evaluations and state",
+    print(f"{rig}: {n:,} games, {len(shards)} new shards ({size:.0f} MB), evaluations and state",
           flush=True)
     if dry_run:
         return
-    ops = [CommitOperationAdd(f"continuous/selfplay/{f.name}", str(f)) for f in shards]  # never rewritten
-    ops += [CommitOperationAdd(f"continuous/selfplay/{f}", snapshot(live / f))
-            for f in ("games.jsonl", "generation_config.json") if (live / f).exists()]
-    ops += [CommitOperationAdd(f"continuous/evals/{f.name}", snapshot(f))
-            for f in sorted((CONT / "evals").glob("*")) if f.is_file()]
-    ops += [CommitOperationAdd(f"continuous/{f}", snapshot(CONT / f)) for f in CONT_STATE if (CONT / f).exists()]
+    # The shards first, never rewritten, in chunks; then the index and state, which name them.
+    for i in range(0, len(shards), SHARDS_PER_COMMIT):
+        part = shards[i:i + SHARDS_PER_COMMIT]
+        api.create_commit(GAMES_REPO, [CommitOperationAdd(f"{rig}/selfplay/{f.name}", str(f)) for f in part],
+                          repo_type="dataset", commit_message=f"{rig.capitalize()} rig: {len(part)} shards")
+        print(f"{rig}: shards {i + len(part)}/{len(shards)} on the hub", flush=True)
+    ops = [CommitOperationAdd(f"{rig}/selfplay/{f}", snapshot(live / f))
+           for f in ("games.jsonl", "generation_config.json") if (live / f).exists()]
+    ops += [CommitOperationAdd(f"{rig}/evals/{f.name}", snapshot(f))
+            for f in sorted((cont / "evals").glob("*")) if f.is_file()]
+    ops += [CommitOperationAdd(f"{rig}/{f}", snapshot(cont / f)) for f in CONT_STATE if (cont / f).exists()]
     api.create_commit(GAMES_REPO, ops, repo_type="dataset",
-                      commit_message=f"Continuous rig: {n:,} games, {len(shards)} new shards")
-    print("continuous: on the hub", flush=True)
+                      commit_message=f"{rig.capitalize()} rig: {n:,} games, {len(shards)} new shards")
+    print(f"{rig}: on the hub", flush=True)
 
 
 INPUTS_README = f"""---
@@ -512,10 +523,10 @@ def sync_inputs(api: HfApi, dry_run: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--only", choices=("champions", "games", "continuous", "inputs"),
+    p.add_argument("--only", choices=("champions", "games", *RIGS, "inputs"),
                    help="one part; inputs (static) only ever run this way")
     p.add_argument("--checkpoint", action="store_true",
-                   help="also the continuous trainer's checkpoint: after `make stop`, to move machines")
+                   help="also the rigs' trainer checkpoints: to resume them on another machine")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -534,8 +545,9 @@ def main() -> None:
         sync_champions(api, rows, args.dry_run)
     if args.only in (None, "games"):
         sync_games(api, rows, args.dry_run)
-    if args.only in (None, "continuous"):
-        sync_continuous(api, args.dry_run, args.checkpoint)
+    for rig in RIGS:
+        if args.only in (None, rig):
+            sync_rig(api, rig, args.dry_run, args.checkpoint)
 
 
 if __name__ == "__main__":
