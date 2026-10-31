@@ -85,6 +85,7 @@ SCRATCH_STEP = re.compile(
     r" \| admitted ([\d,]+) \| policy ([\d.]+) value ([\d.]+) kl [\d.]+ \| ([\d,]+) samples/s")
 SCRATCH_HELD = re.compile(r"^\s+held out \(EMA\): policy ([\d.]+) value ([\d.]+) sign_acc ([\d.]+)")
 SCRATCH_EVERY = re.compile(r"evaluations every ([\d.]+) h, (\d+) games, accept >= ([\d.]+)")
+SCRATCH_EVAL = re.compile(r"^evaluating (\S+) against the accepted network \((\S+)\), (\d+) games")
 SCRATCH_POINTS = 240  # chart points kept
 
 
@@ -332,6 +333,40 @@ def read_tail(path: Path, tail: int = LOG_TAIL) -> list[str]:
         return []
 
 
+def selfplay_backend(out_dir: Path) -> str | None:
+    """'TensorRT FP16' or 'torch bf16' for the self-play process writing to out_dir, None if none runs."""
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if any(a.endswith(b"selfplay_rust.py") for a in argv) and b"--worker" not in argv:
+            out = argv[argv.index(b"--out") + 1].decode() if b"--out" in argv else ""
+            if out and Path(out).name == out_dir.name:
+                return "TensorRT FP16" if b"--trt" in argv else "torch bf16"
+    return None
+
+
+def scratch_eval_live(name: str, best: str, total: int) -> dict:
+    """The evaluation in progress: games finished so far, candidate's score and W/D/L."""
+    w = d = l = 0
+    try:
+        with open(SCRATCH / "evals" / f"{name}_vs_best.jsonl") as f:
+            for line in f:
+                try:
+                    x = json.loads(line)["score_a"]
+                except (ValueError, KeyError):
+                    continue
+                w, d, l = w + (x == 1.0), d + (x == 0.5), l + (x == 0.0)
+    except OSError:
+        pass
+    n = w + d + l
+    return {"candidate": name, "best": best, "total": total, "games": n, "wins": w, "draws": d,
+            "losses": l, "score": (w + d / 2) / n if n else None}
+
+
 def scratch() -> dict | None:
     """The continuous run from a random network (make scratch): trainer, self-play, evaluations."""
     if not SCRATCH.exists():
@@ -350,15 +385,23 @@ def scratch() -> dict | None:
         if m and steps and "held_policy" not in steps[-1]:
             steps[-1].update(held_policy=float(m[1]), held_value=float(m[2]), sign_acc=float(m[3]))
     progress = None
+    swapped = None  # the publication TensorRT last rebuilt its engine for
     for line in reversed(read_tail(SCRATCH_LOGS / "rl_continuous_selfplay.log", 1 << 16)):
+        if swapped is None and line.startswith("TensorRT engine swapped to "):
+            swapped = line.split()[-1]
+        elif swapped is None and line.startswith("engine built in "):
+            swapped = ""  # this process's first engine: no swap since it started
         m = PROGRESS.match(line)
-        if m:
+        if m and progress is None:
             progress = dict(zip(("games", "positions", "rate"), map(int, m.groups())))
+        if progress and swapped:
             break
+    if progress:
+        progress.update(backend=selfplay_backend(SCRATCH / "selfplay"), swapped=swapped)
     loop = [stamp(x) for x in read_tail(SCRATCH_LOGS / "rl_continuous.log", 1 << 20)]
     loop = [(t, msg) for t, msg in loop if t]
     started = every = None
-    evaluating = None
+    evaluating = live = None
     anchor = None
     for t, msg in loop:
         if msg.startswith("continuous loop:"):
@@ -369,8 +412,9 @@ def scratch() -> dict | None:
             evaluating = None
         elif msg.startswith("evaluating "):
             evaluating = t
+            live = SCRATCH_EVAL.match(msg)
         elif " vs accepted:" in msg or msg.startswith("no new publication"):
-            anchor, evaluating = t, None
+            anchor, evaluating, live = t, None, None
         elif msg.startswith("STOP found"):
             anchor, started = None, None
     evals = []
@@ -403,7 +447,8 @@ def scratch() -> dict | None:
         accepted = None
     return {"last": last, "curve": [x for x in keep if "held_policy" in x],
             "selfplay": progress, "every": every, "started": started, "evaluating": evaluating,
-            "next_eval": next_eval, "evals": evals, "accepted": accepted}
+            "next_eval": next_eval, "evals": evals, "accepted": accepted,
+            "eval_live": scratch_eval_live(live[1], live[2], int(live[3])) if evaluating and live else None}
 
 
 def status() -> dict:
@@ -708,12 +753,23 @@ def render_scratch(s: dict) -> str:
               f'{last["rate"]:,} samples/s'),
              ("Window", f'{last["window"]:,}', f'rows in {last["shards"]} shards, {last["admitted"]:,} admitted')]
     if sp:
+        backend = sp.get("backend") or "not running"
+        if sp.get("backend") == "TensorRT FP16" and sp.get("swapped"):
+            backend += f', engine of {esc(sp["swapped"])}'
         tiles.append(("Self-play", f'{sp["games"]:,} games',
-                      f'{sp["positions"]:,} positions, {sp["rate"]:,} games/h'))
-    nxt = f'running since {sc["evaluating"]:%H:%M}' if sc["evaluating"] else when(sc["next_eval"], now)
-    tiles.append(("Next evaluation", esc(nxt),
-                  f'every {every["hours"]:g} h of running time, {every["games"]} games, '
-                  f'accept at {every["accept"]:.2f}' if every else ""))
+                      f'{sp["positions"]:,} positions, {sp["rate"]:,} games/h; {backend}'))
+    live = sc.get("eval_live")
+    if live:
+        score = f'{live["score"]:.1%}' if live["score"] is not None else "&ndash;"
+        tiles.append((f'Evaluating {esc(live["candidate"])}', score,
+                      f'{live["games"]}/{live["total"]} games vs {esc(live["best"])}: {live["wins"]}W '
+                      f'{live["draws"]}D {live["losses"]}L since {sc["evaluating"]:%H:%M}; short games '
+                      f'finish first, so the score usually falls as the long ones come in'))
+    else:
+        nxt = f'running since {sc["evaluating"]:%H:%M}' if sc["evaluating"] else when(sc["next_eval"], now)
+        tiles.append(("Next evaluation", esc(nxt),
+                      f'every {every["hours"]:g} h of running time, {every["games"]} games, '
+                      f'accept at {every["accept"]:.2f}' if every else ""))
     if "held_policy" in last:
         tiles.append(("Held-out policy", f'{last["held_policy"]:.3f}',
                       f'cross-entropy; value sign accuracy {last["sign_acc"]:.1%}'))
