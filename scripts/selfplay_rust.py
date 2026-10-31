@@ -134,7 +134,8 @@ class Forward:
     # An engine is tied to the weights it was built from, so reload() builds a new one in a
     # subprocess (scripts/trt_forward.py: ONNX export + build, ~1 min) while the old engine keeps
     # serving; _trt_poll() swaps it in between two launches. The swap waits for the stream so the
-    # old engine is not freed under batches still in flight.
+    # old engine is not freed under batches still in flight. TrtModel reads its engine file whole,
+    # so the replaced one (~30 MB a publication) is deleted at once rather than at exit.
 
     def _trt_build(self, model_dir: str) -> tuple:
         """Snapshot model_dir (the trainer prunes old publications) and start building from it."""
@@ -164,6 +165,7 @@ class Forward:
         self.value_scalar = lambda v: v  # the engine already emits the scalar value
         with self._on():
             self.model = TrtModel(engine)
+        self._trt_engine = engine
 
     _verifying = False  # _verify recomputes on the weights the batch ran on: no swap in between
 
@@ -177,6 +179,7 @@ class Forward:
             out = proc.communicate()[0]
             if proc.returncode != 0:
                 print(f"TensorRT rebuild for {Path(target).name} failed, keeping the old engine:\n{out}", flush=True)
+                engine.unlink(missing_ok=True)
             else:
                 from trt_forward import TrtModel
                 model = TrtModel(engine)
@@ -186,6 +189,8 @@ class Forward:
                 torch.cuda.synchronize(self.device)
                 self.model = model
                 self.weights += 1
+                self._trt_engine.unlink(missing_ok=True)
+                self._trt_engine = engine
                 print(f"TensorRT engine swapped to {Path(target).name}", flush=True)
             self._trt_built = target
         if self._trt_job is None and self._trt_target != self._trt_built:
