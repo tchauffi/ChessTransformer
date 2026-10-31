@@ -106,6 +106,10 @@ struct Config {
     /// Measure the tree's depth after every search (`SelfPlayRules::depth_stats`).
     #[serde(default)]
     depth_stats: bool,
+    /// Syzygy directories, ':'-separated: a game ends at its first position they
+    /// settle, with their result (`SelfPlayGame::with_tablebase`). Empty: none.
+    #[serde(default)]
+    syzygy: String,
 }
 fn d_games() -> usize { 128 }
 fn d_batch() -> usize { 16 }
@@ -126,6 +130,7 @@ fn d_contempt_ramp() -> f64 { 0.3 }
 #[pyclass]
 pub struct SelfPlayEngine {
     rules: SelfPlayRules,
+    tables: Option<chess_core::search::Tables>,
     num_parallel_games: usize,
     threads: usize,
     openings: Vec<Chess>,
@@ -198,7 +203,8 @@ impl SelfPlayEngine {
     fn spawn(&mut self) -> SelfPlayGame {
         let oi = self.rng.gen_range(0..self.openings.len());
         let seed = self.rng.gen();
-        let g = SelfPlayGame::new(self.started, oi, self.openings[oi].clone(), &self.rules, seed);
+        let g = SelfPlayGame::new(self.started, oi, self.openings[oi].clone(), &self.rules, seed)
+            .with_tablebase(self.tables.clone());
         self.started += 1;
         g
     }
@@ -344,8 +350,11 @@ impl SelfPlayEngine {
             twofold_history: c.twofold_history, draw_contempt: c.draw_contempt,
             contempt_ramp: c.contempt_ramp, depth_stats: c.depth_stats,
         };
+        let tables = chess_core::search::load_tablebase(&c.syzygy)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:#}")))?;
         let mut e = SelfPlayEngine {
             rules,
+            tables,
             num_parallel_games: c.num_parallel_games.min(target.max(1)),
             threads: c.threads,
             openings: parsed,

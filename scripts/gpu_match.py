@@ -14,7 +14,10 @@ forward. What differs from lichess: no clock (every move is cap-bound, as
 2), and bf16 torch numerics instead of the int8 ONNX graph.
 
 Games: openings from the book, each played twice with colours swapped; draw by
-threefold / 50-move / insufficient material, or at --max-plies; no resignation.
+threefold / 50-move / insufficient material, or at --max-plies; no resignation. With
+--syzygy a game ends at its first position the tables settle, with their result (end
+"tablebase", cutechess-cli's -tb), instead of running to a rule draw or the ply cap when
+the winning side does not convert.
 The games file has head_to_head.py's columns (idx, start, a_white, result,
 score_a, plies), so every scorer of gate files reads it unchanged.
 
@@ -116,6 +119,9 @@ def main() -> None:
         p.add_argument(f"--twofold-history-{side}", action="store_true",
                        help="this net searches with the two-fold rule over the game history")
     p.add_argument("--max-plies", type=int, default=200)
+    p.add_argument("--syzygy", default="",
+                   help="Syzygy table directories, ':'-separated: adjudicate a game at its first "
+                        "position they settle (default none)")
     p.add_argument("--parallel-games", type=int, default=128, help="games in flight, all halves")
     p.add_argument("--engines", type=int, default=2,
                    help="engine halves taking turns on each GPU (2 = the CPU searches one while "
@@ -162,6 +168,7 @@ def main() -> None:
         "num_parallel_games": max(1, args.parallel_games // k_eng),
         "threads": args.threads,
         "tt_cap": args.tt_cap,
+        **({"syzygy": args.syzygy} if args.syzygy else {}),  # a build without it refuses the key
     }
     search = {}
     for side in ("a", "b"):
@@ -187,7 +194,8 @@ def main() -> None:
           f"{args.openings} openings x 2 colours = {n_games} games, {args.max_sims} sims/move "
           f"+ {args.ponder_max_sims} ponder, {min(args.parallel_games, n_games)} at once"
           f"{f' on {len(devices)} GPUs' if len(devices) > 1 else ''}"
-          f"{', SPRT' if args.sprt else ''}\n", flush=True)
+          f"{', SPRT' if args.sprt else ''}"
+          f"{f', tablebase adjudication ({args.syzygy})' if args.syzygy else ''}\n", flush=True)
 
     games_out = args.games_out.open("a") if args.games_out else None
     results: dict[tuple[int, bool], float] = {}

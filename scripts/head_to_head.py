@@ -30,6 +30,7 @@ from pathlib import Path
 
 import chess
 import chess.engine
+import chess.syzygy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -137,19 +138,51 @@ def start_board(opening: str) -> chess.Board:
     return board
 
 
-def play(white, white_limit, black, black_limit, opening: str, max_plies: int):
-    """Returns (result, plies on the move stack, fewest men on the board at any point).
+def tablebase_result(tb: chess.syzygy.Tablebase, board: chess.Board) -> str | None:
+    """The tables' result for a position they cover, under the 50-move rule from its own
+    clock (cursed wins and blessed losses are draws), as chess_core::search::tablebase_result;
+    None when they do not settle it: too many men, castling rights, a missing table, or a
+    win the clock may still spoil (DTZ rounding), and the game plays on."""
+    # Positions the tables cover, as the Rust side: python-chess would also settle a bigger
+    # one whose side to move captures into a won table, a verdict chess_core never gives.
+    if len(board.piece_map()) > max((len(name) - 1 for name in tb.wdl), default=0) or board.castling_rights:
+        return None
+    wdl = tb.get_wdl(board)
+    if wdl is None:
+        return None
+    if abs(wdl) < 2:
+        return "1/2-1/2"
+    if board.halfmove_clock:
+        dtz = tb.get_dtz(board)
+        if dtz is None or board.halfmove_clock + abs(dtz) > 99:
+            return None
+    return "1-0" if (wdl > 0) == (board.turn == chess.WHITE) else "0-1"
+
+
+def play(white, white_limit, black, black_limit, opening: str, max_plies: int,
+         tb: chess.syzygy.Tablebase | None = None):
+    """Returns (result, plies on the move stack, fewest men on the board at any point, how
+    it ended: terminal / tablebase / max_plies, the final FEN).
 
     ``max_plies`` counts the move stack, so for the built-in lines it is the game's
-    ply count (as before) and for a FEN start it is the plies played from that FEN."""
+    ply count (as before) and for a FEN start it is the plies played from that FEN.
+    With ``tb`` the game ends at its first position the tables settle, with their result."""
     board = start_board(opening)
     min_men = len(board.piece_map())
-    while not game_over(board) and len(board.move_stack) < max_plies:
+    tb_result = tablebase_result(tb, board) if tb else None
+    while tb_result is None and not game_over(board) and len(board.move_stack) < max_plies:
         eng, limit = (white, white_limit) if board.turn == chess.WHITE else (black, black_limit)
         board.push(eng.play(board, limit).move)
         min_men = min(min_men, len(board.piece_map()))
-    result = board.result() if board.is_game_over() else "1/2-1/2"
-    return result, len(board.move_stack), min_men
+        if tb and not game_over(board):
+            tb_result = tablebase_result(tb, board)
+    if tb_result is not None:
+        result, end = tb_result, "tablebase"
+    elif board.is_game_over():
+        result, end = board.result(), "terminal"
+    else:
+        result, end = "1/2-1/2", "terminal" if game_over(board) else "max_plies"
+    return result, len(board.move_stack), min_men, end, board.fen()
 
 
 def elo(score: float) -> float:
@@ -215,6 +248,11 @@ def parse_args() -> argparse.Namespace:
         p.add_argument(f"--syzygy-{side}", default=None,
                        help=f"Syzygy tablebase dir(s) for side {side.upper()}, ':'-separated "
                             "(default: none)")
+    p.add_argument("--adjudicate-syzygy", default=None,
+                   help="Syzygy table dir(s), ':'-separated: a game ends at its first position "
+                        "the tables settle, with their result, for both sides alike (cutechess-cli "
+                        "-tb), instead of running to a rule draw or --max-plies when the winning "
+                        "side does not convert. --syzygy-a/-b give an engine the tables to search with.")
     p.add_argument("--sim-batch", type=int, default=None,
                    help="leaves per NN wave (ct-bot default 16). Larger batches feed the GPU "
                         "better but change search behaviour -- more collisions per wave -- so "
@@ -276,7 +314,9 @@ def main() -> None:
         print(f"{lb}: {args.stockfish_b} at UCI_Elo {args.sf_elo}, {args.sf_time} s a move")
     else:
         print(f"{lb}: {args.bot_b or args.bot} {args.model_b} @ {args.nodes_b} nodes")
-    print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)\n", flush=True)
+    print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)"
+          f"{f', tablebase adjudication ({args.adjudicate_syzygy})' if args.adjudicate_syzygy else ''}\n",
+          flush=True)
 
     lock = threading.Lock()
     stop = threading.Event()
@@ -290,6 +330,11 @@ def main() -> None:
         ea = chess.engine.SimpleEngine.popen_uci(A[1])
         eb = chess.engine.SimpleEngine.popen_uci(B[1])
         eb.configure(B[3])
+        tb = None  # one handle per worker thread
+        if args.adjudicate_syzygy:
+            tb = chess.syzygy.Tablebase()
+            for d in args.adjudicate_syzygy.split(":"):
+                tb.add_directory(d)
         out = []
         try:
             for idx, op, a_white in shard:
@@ -299,7 +344,7 @@ def main() -> None:
                     white, wl, black, bl = ea, A[2], eb, B[2]
                 else:
                     white, wl, black, bl = eb, B[2], ea, A[2]
-                r, plies, min_men = play(white, wl, black, bl, op, args.max_plies)
+                r, plies, min_men, end, fen = play(white, wl, black, bl, op, args.max_plies, tb)
                 s = 0.5 if r == "1/2-1/2" else (1.0 if (r == "1-0") == a_white else 0.0)
                 tag = "=" if s == 0.5 else ("+" if s == 1.0 else "-")
                 out.append(s)
@@ -311,7 +356,8 @@ def main() -> None:
                     if games_out:
                         games_out.write(json.dumps({
                             "idx": idx, "start": op, "a_white": a_white, "result": r,
-                            "score_a": s, "plies": plies, "min_men": min_men}) + "\n")
+                            "score_a": s, "plies": plies, "min_men": min_men, "end": end,
+                            "fen": fen}) + "\n")
                         games_out.flush()
                     if args.sprt and not stop.is_set():
                         pairs = pair_up(complete_prefix(results))
@@ -326,6 +372,8 @@ def main() -> None:
         finally:
             ea.quit()
             eb.quit()
+            if tb:
+                tb.close()
         return out
 
     shards = [jobs[i::workers] for i in range(workers)]

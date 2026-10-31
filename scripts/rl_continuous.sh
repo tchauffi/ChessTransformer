@@ -13,6 +13,10 @@
 #    send the trainer back to the accepted weights with a fresh optimizer. Every ANCHOR_EVERY
 #    acceptances the accepted network plays v2.1 (ANCHOR_GAMES), the absolute line.
 #
+# With SYZYGY ($RL/syzygy: Syzygy table directories, ':'-separated) a self-play game or an
+# evaluation game ends at its first position the tables settle, with their result, instead of
+# being played on to a rule draw or the ply cap by a network that does not convert it.
+#
 # GPUs (one machine, ids as nvidia-smi numbers them, or the MIG instances' UUIDs when the GPUs
 # are partitioned: a process can use one instance). With more than one, the trainer takes
 # TRAIN_GPU ($RL/cont_train_gpu, default the first) to itself and self-play WORKERS_PER_GPU
@@ -51,6 +55,7 @@ FORCED_PLAYOUTS="${FORCED_PLAYOUTS:-$(setting forced_playouts 0)}"
 DRAW_CONTEMPT="${DRAW_CONTEMPT:-$(setting draw_contempt 0.2)}"
 TEMP_CUTOFF="${TEMP_CUTOFF:-$(setting temp_cutoff 0.05)}"
 SIM_BATCH="${SIM_BATCH:-$(setting sim_batch 1)}"
+SYZYGY="${SYZYGY-$(setting syzygy "")}"  # tablebase adjudication, empty = none
 PARALLEL="${PARALLEL:-$(setting cont_parallel 256)}"  # per self-play GPU
 THREADS="${THREADS:-$(setting selfplay_threads 6)}"  # per self-play process
 POLICY_TEMP="${POLICY_TEMP:-$(setting policy_temp 1.0)}"
@@ -116,6 +121,11 @@ fi
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
+if [[ -n $SYZYGY ]] && ! compgen -G "${SYZYGY%%:*}/*.rtbw" >/dev/null; then
+  log "no Syzygy tables in $SYZYGY (SYZYGY / $RL/syzygy)"
+  exit 1
+fi
+
 # match <model A> <model B> <label A> <label B> <games out> <games>: the gate's match (the bot's
 # search and move flow, both colours of the book's first openings), retried uncompiled once.
 match() {
@@ -126,7 +136,7 @@ match() {
     env ${EVAL_GPU:+CUDA_VISIBLE_DEVICES=$EVAL_GPU} "$PY" scripts/gpu_match.py --model-a "$a" --model-b "$b" \
       --label-a "$la" --label-b "$lb" --openings $((n / 2)) --max-sims "$MATCH_SIMS" \
       --ponder-max-sims "$PONDER_SIMS" --parallel-games "$MATCH_PARALLEL" --threads "$MATCH_THREADS" \
-      --games-out "$out" $MATCH_EXTRA $extra | tail -14 && { touch "$out.done"; return 0; }
+      ${SYZYGY:+--syzygy "$SYZYGY"} --games-out "$out" $MATCH_EXTRA $extra | tail -14 && { touch "$out.done"; return 0; }
     log "match failed${extra:+ ($extra)}"
   done
   return 1
@@ -154,7 +164,7 @@ start_actor() {  # each worker gets one GPU of --gpus (selfplay_rust.py's run_wo
     --sims "$SIMS" --fast-sims "$FAST_SIMS" --full-frac "$FULL_FRAC" --cap-total all \
     --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
     --draw-contempt "$DRAW_CONTEMPT" --temp-cutoff "$TEMP_CUTOFF" --sim-batch "$SIM_BATCH" \
-    --c-puct "$C_PUCT" --fresh-full --seed 1 \
+    --c-puct "$C_PUCT" --fresh-full --seed 1 ${SYZYGY:+--syzygy "$SYZYGY"} \
     ${BOOK:+--book "$BOOK" --book-skip "$BOOK_SKIP" --book-share "$BOOK_SHARE"} $SP_EXTRA \
     >> "$LOGS/rl_continuous_selfplay.log" 2>&1 &
   ACTOR=$!
@@ -243,7 +253,7 @@ fi
 FAILS=0 ACCEPTED=0
 [[ -f $C/eval_state ]] && source "$C/eval_state"
 EVAL_S="$(awk -v h="$EVAL_HOURS" 'BEGIN { printf "%d", h * 3600 }')"
-log "continuous loop: self-play ${SIMS}/${FAST_SIMS} sims, c_puct $C_PUCT, $PARALLEL games in flight per GPU; trainer window $WINDOW_ROWS rows$( ((WINDOW_GROWTH)) && echo ", grown from $WINDOW_START"), training from $MIN_ROWS positions, reuse $REUSE, lr $LR (embeddings $LR_EMBEDDING), soft mix $SOFT_MIX, policy temperature $POLICY_TEMP; evaluations every $EVAL_HOURS h, $EVAL_GAMES games, accept >= $ACCEPT"
+log "continuous loop: self-play ${SIMS}/${FAST_SIMS} sims, c_puct $C_PUCT, $PARALLEL games in flight per GPU; trainer window $WINDOW_ROWS rows$( ((WINDOW_GROWTH)) && echo ", grown from $WINDOW_START"), training from $MIN_ROWS positions, reuse $REUSE, lr $LR (embeddings $LR_EMBEDDING), soft mix $SOFT_MIX, policy temperature $POLICY_TEMP; evaluations every $EVAL_HOURS h, $EVAL_GAMES games, accept >= $ACCEPT${SYZYGY:+; tablebase adjudication ($SYZYGY)}"
 if (( NONSTOP )); then
   log "GPUs: trainer $TRAIN_GPU; self-play $SELFPLAY_GPUS ($WORKERS worker(s)); evaluations on $EVAL_GPU beside self-play and training"
 else

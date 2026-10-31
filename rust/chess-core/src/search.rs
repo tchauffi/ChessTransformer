@@ -73,6 +73,10 @@ pub struct SearchParams {
     /// outright and a drawn/lost one restricts the search to result-preserving
     /// moves (root probing needs the DTZ tables too).
     pub syzygy: Option<Arc<Tablebase<Chess>>>,
+    /// Probe the tables at a covered root too (the bot). Self-play turns it off: a root
+    /// move played from the tables has no visits to record, and a restricted root no
+    /// longer holds every legal move.
+    pub syzygy_root: bool,
 }
 
 impl Default for SearchParams {
@@ -92,6 +96,7 @@ impl Default for SearchParams {
             draw_contempt: 0.0,
             contempt_ramp: 0.3,
             syzygy: None,
+            syzygy_root: true,
         }
     }
 }
@@ -828,7 +833,7 @@ impl<E: Evaluator> Search<E> {
     }
 
     fn root_tablebase(&self) -> RootTb {
-        let Some(tb) = &self.params.syzygy else {
+        let Some(tb) = self.params.syzygy.as_ref().filter(|_| self.params.syzygy_root) else {
             return RootTb::Off;
         };
         if self.pos.board().occupied().count() > tb.max_pieces() {
@@ -992,6 +997,43 @@ impl<E: Evaluator> Search<E> {
 }
 
 /// Flat logit index of each move, in order.
+/// Loaded Syzygy tables, shared by every game and thread.
+pub type Tables = std::sync::Arc<Tablebase<Chess>>;
+
+/// Syzygy tables from a ':'-separated list of directories (the UCI `SyzygyPath`
+/// convention); empty means none, and a directory without tables is an error.
+pub fn load_tablebase(paths: &str) -> Result<Option<Tables>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut tb = Tablebase::new();
+    let mut n = 0;
+    for dir in paths.split(':').filter(|d| !d.is_empty()) {
+        n += tb.add_directory(dir).map_err(|e| anyhow::anyhow!("syzygy path {dir}: {e}"))?;
+    }
+    anyhow::ensure!(n > 0, "no Syzygy tables in {paths}");
+    Ok(Some(std::sync::Arc::new(tb)))
+}
+
+/// A game's result by the tables, White's POV (+1 White wins), once its position is
+/// one they cover: what tablebase adjudication ends the game with. The verdict is
+/// under the 50-move rule from the position's own clock, so cursed wins and blessed
+/// losses are draws; one the clock leaves ambiguous (DTZ rounding), castling rights
+/// or a missing table give none, and the game plays on. The first position the
+/// tables cover follows a capture (clock 0), where the verdict is never ambiguous.
+pub fn tablebase_result(tb: &Tablebase<Chess>, pos: &Chess) -> Option<f32> {
+    if pos.board().occupied().count() > tb.max_pieces() {
+        return None;
+    }
+    let stm = match tb.probe_wdl(pos).ok()? {
+        AmbiguousWdl::Win => 1.0,
+        AmbiguousWdl::Loss => -1.0,
+        AmbiguousWdl::Draw | AmbiguousWdl::CursedWin | AmbiguousWdl::BlessedLoss => return Some(0.0),
+        AmbiguousWdl::MaybeWin | AmbiguousWdl::MaybeLoss => return None,
+    };
+    Some(if pos.turn() == shakmaty::Color::White { stm } else { -stm })
+}
+
 pub fn legal_indices(moves: &[Move]) -> Vec<u16> {
     moves
         .iter()
@@ -1478,6 +1520,20 @@ mod tests {
 
     #[test]
     #[ignore = "needs SYZYGY_PATH"]
+    fn tablebase_result_is_whites_pov_under_the_fifty_move_rule() {
+        let tb = syzygy();
+        let krk = "8/2K5/8/8/4k3/8/8/6R1"; // KRvK, DTZ 25
+        assert_eq!(tablebase_result(&tb, &pos(&format!("{krk} w - - 0 1"))), Some(1.0));
+        assert_eq!(tablebase_result(&tb, &pos(&format!("{krk} b - - 0 1"))), Some(1.0));
+        assert_eq!(tablebase_result(&tb, &pos("8/2k5/8/8/4K3/8/8/6r1 w - - 0 1")), Some(-1.0));
+        assert_eq!(tablebase_result(&tb, &pos("8/7r/8/8/3K4/8/3k4/4R3 w - - 0 1")), Some(0.0));
+        // 90 halfmoves gone: the clock runs out before the mate, so never a White win.
+        assert_ne!(tablebase_result(&tb, &pos(&format!("{krk} w - - 90 46"))), Some(1.0));
+        assert_eq!(tablebase_result(&tb, &Chess::default()), None);
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
     fn tablebase_win_at_root_plays_without_search() {
         let p = pos("8/2K5/8/8/4k3/8/8/6R1 w - - 0 1"); // KRvK, DTZ 25
         let mut s = Search::new(UniformEval, tb_params());
@@ -1485,6 +1541,17 @@ mod tests {
         let r = s.go(800, None, &AtomicBool::new(false)).unwrap();
         assert_eq!((r.sims, r.tb_hits), (0, 1), "should not search a won TB root");
         assert_eq!(wdl_after(&syzygy(), &p, &r.best), AmbiguousWdl::Loss);
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
+    fn leaf_only_tablebases_search_a_covered_root() {
+        let p = pos("8/2K5/8/8/4k3/8/8/6R1 w - - 0 1"); // KRvK
+        let mut s = Search::new(UniformEval, SearchParams { syzygy_root: false, ..tb_params() });
+        s.set_position(p.clone(), &[]);
+        let r = s.go(400, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(r.sims, 400, "a leaf-only search still searches the root");
+        assert_eq!(s.root_stats().len(), p.legal_moves().len(), "every legal move stays at the root");
     }
 
     #[test]
@@ -1507,10 +1574,10 @@ mod tests {
     #[test]
     #[ignore = "needs SYZYGY_PATH"]
     fn tablebase_scores_captures_into_covered_endgames() {
-        // 5 pieces at the root (beyond 3-4-piece tables): searched normally,
-        // but Kxd2/Qxd2 land in KQvKR and must be scored from the tables.
+        // 5 pieces at the root, searched (leaf probing only, so 5-piece tables do
+        // not answer the root), but Kxd2/Qxd2 land in KQvKR: scored from the tables.
         let p = pos("8/8/8/3k4/8/2r5/3p4/3QK3 w - - 0 1");
-        let mut s = Search::new(UniformEval, tb_params());
+        let mut s = Search::new(UniformEval, SearchParams { syzygy_root: false, ..tb_params() });
         s.set_position(p, &[]);
         let r = s.go(400, None, &AtomicBool::new(false)).unwrap();
         assert!(r.sims == 400 && r.tb_hits > 0, "sims {} tb hits {}", r.sims, r.tb_hits);

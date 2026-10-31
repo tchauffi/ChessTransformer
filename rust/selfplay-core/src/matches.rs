@@ -100,6 +100,10 @@ struct MatchConfig {
     twofold_history_a: bool,
     #[serde(default)]
     twofold_history_b: bool,
+    /// Syzygy directories, ':'-separated: a game ends at its first position they
+    /// settle, with their result (`MatchGame::with_tablebase`). Empty: none.
+    #[serde(default)]
+    syzygy: String,
 }
 fn d_sims() -> u32 { 4000 }
 fn d_ponder() -> u32 { 2000 }
@@ -117,6 +121,7 @@ fn d_threads() -> usize { 8 }
 pub struct MatchEngine {
     cfg: MatchConfig,
     rules: MatchRules,
+    tables: Option<chess_core::search::Tables>,
     params: SideParams,
     fens: Vec<String>,
     starts: Vec<Chess>,
@@ -140,7 +145,8 @@ impl MatchEngine {
         while self.games.len() < self.cfg.num_parallel_games && self.started < self.fens.len() {
             let i = self.started;
             self.started += 1;
-            self.games.push(MatchGame::new(i, self.starts[i].clone(), self.a_white[i], self.params));
+            self.games.push(MatchGame::new(i, self.starts[i].clone(), self.a_white[i], self.params)
+                .with_tablebase(self.tables.clone()));
         }
     }
 
@@ -211,8 +217,10 @@ impl MatchEngine {
             rule_state: [cfg.rule_state_a, cfg.rule_state_b],
             twofold_history: [cfg.twofold_history_a, cfg.twofold_history_b],
         };
+        let tables = chess_core::search::load_tablebase(&cfg.syzygy)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:#}")))?;
         let mut m = MatchEngine {
-            cfg, rules, params, fens, starts, a_white, games: Vec::new(), started: 0,
+            cfg, rules, tables, params, fens, starts, a_white, games: Vec::new(), started: 0,
             completed: 0, finished: Vec::new(), owners: Vec::new(), legal_lens: Vec::new(),
             legal_width: 1, rule50: Vec::new(), repetition: Vec::new(),
         };

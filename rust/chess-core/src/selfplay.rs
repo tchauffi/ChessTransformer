@@ -21,7 +21,13 @@
 //! * move temperature for the first `temp_plies` half-moves (the bot's own
 //!   sampler, seeded), over the moves within `temp_cutoff` of the best Q when set;
 //! * resignation once the root value stays past `resign_threshold` for
-//!   `resign_plies` plies, except in a `no_resign_frac` share of games.
+//!   `resign_plies` plies, except in a `no_resign_frac` share of games;
+//! * tablebase adjudication (`with_tablebase`): the game ends at its first position
+//!   the Syzygy tables settle, with their result, instead of being played on to a
+//!   rule draw or the ply cap by a network that may not convert it. The search
+//!   probes them at its leaves as well (not at the root, which is never covered
+//!   once the game would have ended there): positions the tables own are neither
+//!   recorded nor left to a value head that no longer trains on them.
 //!
 //! A record is the position before the move, the search's root value and the
 //! root visit counts -- warm visits from the reused tree included, as Lc0
@@ -29,13 +35,16 @@
 //! raw visits, Q) and the network's raw value: what a completed-Q (Gumbel) policy
 //! target needs, for fast searches as well as full ones.
 
+use std::sync::Arc;
+
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use shakmaty::{CastlingMode, Chess, Color, Move, Position};
+use shakmaty_syzygy::Tablebase;
 
 use crate::encoding::{action_plane, encode_position, halfmove, move_coords, rule_state, terminal_value, zobrist,
                       NUM_PLANES};
-use crate::search::{EvalOutput, EvalRequest, Job, NoEval, RootNoise, Search, SearchParams, Step};
+use crate::search::{tablebase_result, EvalOutput, EvalRequest, Job, NoEval, RootNoise, Search, SearchParams, Step};
 
 #[derive(Clone, Copy)]
 pub struct SelfPlayRules {
@@ -151,6 +160,7 @@ pub struct SelfPlayGame {
     records: Vec<Record>,
     end: Option<(f32, &'static str)>,
     tally: [SearchTally; 2],
+    tb: Option<Arc<Tablebase<Chess>>>,
 }
 
 impl SelfPlayGame {
@@ -196,9 +206,26 @@ impl SelfPlayGame {
             records: Vec::new(),
             end: None,
             tally: [SearchTally::default(); 2],
+            tb: None,
         };
         g.check_end(rules);
         g
+    }
+
+    /// Adjudicate the game by these tables and search with them at the leaves
+    /// (None: play every game out, the network valuing every position).
+    pub fn with_tablebase(mut self, tb: Option<Arc<Tablebase<Chess>>>) -> Self {
+        self.search.params.syzygy = tb.clone();
+        self.search.params.syzygy_root = false;
+        self.tb = tb;
+        if self.end.is_none() {
+            self.end = self.tablebase_end();
+        }
+        self
+    }
+
+    fn tablebase_end(&self) -> Option<(f32, &'static str)> {
+        tablebase_result(self.tb.as_deref()?, &self.pos).map(|z| (z, "tablebase"))
     }
 
     /// The game's searches so far, [fast, full].
@@ -383,6 +410,8 @@ impl SelfPlayGame {
                 0.0
             };
             Some((z, "terminal"))
+        } else if let Some(end) = self.tablebase_end() {
+            Some(end)
         } else if self.resign_allowed && self.resign_streak >= rules.resign_plies {
             Some((self.resign_sign as f32, "resign"))
         } else if self.moves.len() as u32 >= rules.max_plies {
@@ -445,6 +474,44 @@ mod tests {
             }
         }
         g
+    }
+
+    /// White in check by an unguarded queen, Kxb2 the only legal move: 5 men, then 4.
+    const FORCED_CAPTURE: &str = "7k/7p/8/8/8/8/1q5P/K7 w - - 0 1";
+
+    fn tables() -> Option<crate::search::Tables> {
+        let path = std::env::var("SYZYGY_PATH").expect("set SYZYGY_PATH to run tablebase tests");
+        crate::search::load_tablebase(&path).unwrap()
+    }
+
+    fn played(start: Chess, tb: Option<crate::search::Tables>) -> SelfPlayGame {
+        let r = rules();
+        let mut g = SelfPlayGame::new(0, 0, start, &r, 7).with_tablebase(tb);
+        while g.end().is_none() {
+            g.advance(&r);
+            if let Some(reqs) = g.pending() {
+                let outs = reqs.iter().map(hash_out).collect();
+                g.resolve(outs);
+            }
+        }
+        g
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
+    fn tablebases_end_the_game_at_their_first_position_with_their_result() {
+        let start: Chess = FORCED_CAPTURE.parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap();
+        let tb = tables();
+        let g = played(start.clone(), tb.clone());
+        let (z, reason) = g.end().unwrap();
+        assert_eq!(reason, "tablebase");
+        // At the start with 5-man tables, else right after the forced capture.
+        assert!(g.moves_uci() == ["a1b2"] || g.moves_uci().is_empty(), "{:?}", g.moves_uci());
+        assert_eq!(Some(z), tablebase_result(tb.as_deref().unwrap(), &g.pos));
+        assert!(g.search.params.syzygy.is_some() && !g.search.params.syzygy_root);
+        let untabled = played(start, None);
+        assert_ne!(untabled.end().unwrap().1, "tablebase");
+        assert!(untabled.moves_uci().len() > 1);
     }
 
     /// The bot's own flow through go() with the same draws as `SelfPlayGame`

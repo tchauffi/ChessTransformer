@@ -629,6 +629,10 @@ def main():
     p.add_argument("--resign-plies", type=int, default=6)
     p.add_argument("--no-resign-frac", type=float, default=0.1)
     p.add_argument("--max-plies", type=int, default=300)
+    p.add_argument("--syzygy", default="",
+                   help="Syzygy table directories, ':'-separated: a game ends at its first position "
+                        "they settle, with their result (end \"tablebase\"), rather than being played "
+                        "on by a network that may not convert it; default none")
     p.add_argument("--tt-cap", type=int, default=2_000_000)
     p.add_argument("--flush-positions", type=int, default=10_000)
     p.add_argument("--seed", type=int, default=0)
@@ -654,6 +658,8 @@ def main():
         p.error("--book-share must be in [0, 1]")
     if args.queued and args.legacy_engine:
         p.error("--queued needs the default engine")
+    if args.syzygy and args.legacy_engine:
+        p.error("--syzygy needs the default engine")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -704,6 +710,7 @@ def main():
         "draw_contempt": args.draw_contempt,
         "contempt_ramp": args.contempt_ramp,
         "depth_stats": args.depth_stats,
+        **({"syzygy": args.syzygy} if args.syzygy else {}),  # a build without it refuses the key
     }
     openings = selfplay_openings(args)
     forward = Forward(args.model, args.device, args.ema, not args.no_compile,

@@ -15,13 +15,19 @@
 //! * the opponent's move stops our ponder after its current wave.
 //!
 //! Both sides advance one wave per round: two engines thinking and pondering
-//! concurrently on equal hardware.
+//! concurrently on equal hardware. With `with_tablebase` the game ends at its first
+//! position the Syzygy tables settle, with their result (cutechess-cli's `-tb`), and
+//! both sides search with them as ct-bot `--syzygy-path` does.
+
+use std::sync::Arc;
 
 use crate::encoding::{terminal_value, zobrist};
 use crate::search::{
-    effective_sims, ponder_budget, EvalOutput, EvalRequest, Job, NoEval, Search, SearchParams, Step,
+    effective_sims, ponder_budget, tablebase_result, EvalOutput, EvalRequest, Job, NoEval, Search,
+    SearchParams, Step,
 };
 use shakmaty::{CastlingMode, Chess, Color, Move, Position};
+use shakmaty_syzygy::Tablebase;
 
 /// Search settings of one side (ct-bot flags).
 #[derive(Clone, Copy)]
@@ -88,6 +94,7 @@ pub struct MatchGame {
     history: Vec<u64>,
     sides: [Side; 2], // 0 = network A, 1 = network B
     end: Option<(f32, &'static str)>,
+    tb: Option<Arc<Tablebase<Chess>>>,
 }
 
 impl MatchGame {
@@ -109,6 +116,7 @@ impl MatchGame {
             moves_uci: Vec::new(),
             sides: [side(0), side(1)],
             end: None,
+            tb: None,
         };
         g.check_end(0);
         if g.end.is_none() {
@@ -116,6 +124,23 @@ impl MatchGame {
             g.sides[s].must_move = true;
         }
         g
+    }
+
+    /// Adjudicate the game by these tables and give both sides' searches them, as
+    /// ct-bot `--syzygy-path` (None: play every game out, without tables).
+    pub fn with_tablebase(mut self, tb: Option<Arc<Tablebase<Chess>>>) -> Self {
+        for side in &mut self.sides {
+            side.search.params.syzygy = tb.clone();
+        }
+        self.tb = tb;
+        if self.end.is_none() {
+            self.end = self.tablebase_end();
+        }
+        self
+    }
+
+    fn tablebase_end(&self) -> Option<(f32, &'static str)> {
+        tablebase_result(self.tb.as_deref()?, &self.pos).map(|z| (z, "tablebase"))
     }
 
     /// (z from white's POV, reason) once the game is over.
@@ -153,6 +178,8 @@ impl MatchGame {
                 0.0
             };
             self.end = Some((z, "terminal"));
+        } else if let Some(end) = self.tablebase_end() {
+            self.end = Some(end);
         } else if max_plies > 0 && self.moves.len() as u32 >= max_plies {
             self.end = Some((0.0, "max_plies"));
         }
@@ -308,6 +335,30 @@ mod tests {
             c_puct: [1.0; 2], fpu: [0.2; 2], prior_temp: [1.0; 2], sim_batch: [sim_batch; 2], tt_cap: 2_000_000,
             rule_state: [false, false], twofold_history: [false, false],
         }
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
+    fn tablebases_end_a_match_game_at_their_first_position() {
+        let path = std::env::var("SYZYGY_PATH").expect("set SYZYGY_PATH to run tablebase tests");
+        let tb = crate::search::load_tablebase(&path).unwrap();
+        let rules = MatchRules { sims: 64, ponder_sims: 16, total_cap: 64 + 4000, max_plies: 40 };
+        // White in check by an unguarded queen, Kxb2 the only legal move: 5 men, then 4.
+        let start = pos("7k/7p/8/8/8/8/1q5P/K7 w - - 0 1");
+        let mut g = MatchGame::new(0, start, true, params(16)).with_tablebase(tb.clone());
+        while g.end().is_none() {
+            g.advance(&rules);
+            for s in 0..2 {
+                if let Some(reqs) = g.pending(s) {
+                    let outs = reqs.iter().map(|r| hash_out(SALTS[s], r)).collect();
+                    g.resolve(s, outs);
+                }
+            }
+        }
+        let (z, reason) = g.end().unwrap();
+        assert_eq!(reason, "tablebase");
+        assert!(g.moves_uci() == ["a1b2"] || g.moves_uci().is_empty(), "{:?}", g.moves_uci());
+        assert_eq!(Some(z), crate::search::tablebase_result(tb.as_deref().unwrap(), &g.pos));
     }
 
     /// The batched driver, one game.
