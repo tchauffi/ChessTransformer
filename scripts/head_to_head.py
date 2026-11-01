@@ -162,12 +162,14 @@ def tablebase_result(tb: chess.syzygy.Tablebase, board: chess.Board) -> str | No
 def play(white, white_limit, black, black_limit, opening: str, max_plies: int,
          tb: chess.syzygy.Tablebase | None = None):
     """Returns (result, plies on the move stack, fewest men on the board at any point, how
-    it ended: terminal / tablebase / max_plies, the final FEN).
+    it ended: terminal / tablebase / max_plies, the final FEN, the moves as a dict: the
+    start FEN, every move in UCI from it, and how many of them the opening line played).
 
     ``max_plies`` counts the move stack, so for the built-in lines it is the game's
     ply count (as before) and for a FEN start it is the plies played from that FEN.
     With ``tb`` the game ends at its first position the tables settle, with their result."""
     board = start_board(opening)
+    book_plies = len(board.move_stack)
     min_men = len(board.piece_map())
     tb_result = tablebase_result(tb, board) if tb else None
     while tb_result is None and not game_over(board) and len(board.move_stack) < max_plies:
@@ -182,11 +184,32 @@ def play(white, white_limit, black, black_limit, opening: str, max_plies: int,
         result, end = board.result(), "terminal"
     else:
         result, end = "1/2-1/2", "terminal" if game_over(board) else "max_plies"
-    return result, len(board.move_stack), min_men, end, board.fen()
+    record = {"start_fen": board.root().fen(), "book_plies": book_plies,
+              "moves": [m.uci() for m in board.move_stack]}
+    return result, len(board.move_stack), min_men, end, board.fen(), record
 
 
 def elo(score: float) -> float:
     return -400 * math.log10(1 / score - 1)
+
+
+def report_blunders(args: argparse.Namespace, records: list[dict], la: str, lb: str) -> None:
+    """--blunder-nodes: every move of this run's games scored by a full-strength Stockfish,
+    blunders and mistakes per side (scripts/blunder_report.py); every scored move goes to
+    <games-out>.blunders.json."""
+    from blunder_report import analyse_records, format_summary, header, summarise
+
+    stockfish = args.blunder_stockfish or args.stockfish_b or "/usr/games/stockfish"
+    print("\n" + header(args.blunder_nodes), flush=True)
+    games = analyse_records(records, stockfish, args.blunder_nodes,
+                            args.blunder_workers or args.workers)
+    report = summarise(games)
+    print(format_summary(report, la, lb))
+    if args.games_out:
+        out = args.games_out.with_suffix(".blunders.json")
+        out.write_text(json.dumps({"nodes": args.blunder_nodes, "summary": report,
+                                   "games": games}, indent=1))
+        print(f"  every scored move: {out}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -211,7 +234,17 @@ def parse_args() -> argparse.Namespace:
                         "entry's FEN. Default: the built-in lines above.")
     p.add_argument("--games-out", type=Path, default=None,
                    help="append one JSON line per game (start, colours, result, plies, "
-                        "fewest men reached)")
+                        "fewest men reached, how it ended, final FEN, every move)")
+    p.add_argument("--blunder-nodes", type=int, default=0,
+                   help="after the match, score every move of its games with a full-strength "
+                        "Stockfish at this many nodes a position and report blunders and "
+                        "mistakes per side (scripts/blunder_report.py; 200000 is ~0.2 s a "
+                        "position). 0 = off")
+    p.add_argument("--blunder-stockfish", default=None,
+                   help="Stockfish for --blunder-nodes (default --stockfish-b, else "
+                        "/usr/games/stockfish); it plays at full strength")
+    p.add_argument("--blunder-workers", type=int, default=None,
+                   help="Stockfish processes for --blunder-nodes, one thread each (default --workers)")
     p.add_argument("--sprt", action="store_true",
                    help="stop as soon as the paired SPRT decides H0 vs H1; games already in "
                         "flight finish, half-played pairs are dropped from the score")
@@ -323,6 +356,7 @@ def main() -> None:
     decided = {}  # SPRT state at the moment it stopped the match
     done = [0]
     results: dict[tuple[int, bool], float] = {}
+    records: list[dict] = []  # every game of this run, for --blunder-nodes
     games_out = args.games_out.open("a") if args.games_out else None
 
     def run_shard(shard):
@@ -344,7 +378,8 @@ def main() -> None:
                     white, wl, black, bl = ea, A[2], eb, B[2]
                 else:
                     white, wl, black, bl = eb, B[2], ea, A[2]
-                r, plies, min_men, end, fen = play(white, wl, black, bl, op, args.max_plies, tb)
+                r, plies, min_men, end, fen, moves = play(white, wl, black, bl, op,
+                                                          args.max_plies, tb)
                 s = 0.5 if r == "1/2-1/2" else (1.0 if (r == "1-0") == a_white else 0.0)
                 tag = "=" if s == 0.5 else ("+" if s == 1.0 else "-")
                 out.append(s)
@@ -353,11 +388,12 @@ def main() -> None:
                     done[0] += 1
                     print(f"[{done[0]:3}/{len(jobs)}] {la if a_white else lb:10}=W  "
                           f"{op[:11]:11} -> {r:7} ({la} {tag})", flush=True)
+                    rec = {"idx": idx, "start": op, "a_white": a_white, "result": r,
+                           "score_a": s, "plies": plies, "min_men": min_men, "end": end,
+                           "fen": fen, **moves}
+                    records.append(rec)
                     if games_out:
-                        games_out.write(json.dumps({
-                            "idx": idx, "start": op, "a_white": a_white, "result": r,
-                            "score_a": s, "plies": plies, "min_men": min_men, "end": end,
-                            "fen": fen}) + "\n")
+                        games_out.write(json.dumps(rec) + "\n")
                         games_out.flush()
                     if args.sprt and not stop.is_set():
                         pairs = pair_up(complete_prefix(results))
@@ -404,6 +440,8 @@ def main() -> None:
     print(f"\n{la} vs {lb}: {wa}W {d}D {wb}L / {n}  |  {la} score {score:.3f}")
     if not 0.0 < score < 1.0:
         print(f"{la} - {lb} = decisive")
+        if args.blunder_nodes > 0:
+            report_blunders(args, records, la, lb)
         return
 
     # 95% CI from the per-game score variance (draws count as 0.5, so this is the
@@ -415,6 +453,8 @@ def main() -> None:
           f"(95% CI {elo(lo):+.0f} .. {elo(hi):+.0f}, +/-{1.96 * se * 100:.1f}pp on score)")
     if lo < 0.5 < hi:
         print(f"NOT SIGNIFICANT: the interval spans 0 Elo. {n} games cannot separate these two.")
+    if args.blunder_nodes > 0:
+        report_blunders(args, records, la, lb)
 
 
 if __name__ == "__main__":
