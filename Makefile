@@ -195,12 +195,14 @@ continuous:  ## continuous training until `make stop` (several GPUs: trainer on 
 # runs one rig: `make stop`, then `make continuous` resumes the other. A learning-rate drop is a
 # restart: `make stop`, then `make scratch SCRATCH_LR=1.5e-4` (the trainer resumes at that rate).
 # Games end at their first position the Syzygy tables settle (SCRATCH_SYZYGY, default data/syzygy
-# when it holds tables; empty: play every game out).
+# when it holds tables; empty: play every game out), except a SCRATCH_TB_PLAYOUT share of
+# them, which play on past it so the network keeps training on those endgames.
 SCRATCH_SIMS ?= 300
 SCRATCH_START ?= 600000
 SCRATCH_LR ?= 5e-4
 SCRATCH_LR_EMBEDDING ?= $(SCRATCH_LR)
 SCRATCH_SYZYGY ?= $(if $(wildcard data/syzygy/*.rtbw),data/syzygy)
+SCRATCH_TB_PLAYOUT ?= 0.1
 scratch:  ## continuous training of a new network from scratch (data/rl/scratch) until `make stop`
 	mkdir -p logs/scratch
 	rm -f $(RL)/STOP
@@ -209,7 +211,8 @@ scratch:  ## continuous training of a new network from scratch (data/rl/scratch)
 	RL=$(RL) CONT=$(RL)/scratch LOGS=logs/scratch SEED_DATA= HUMAN_SHARDS= ANCHOR= \
 		SIMS=$(SCRATCH_SIMS) FULL_FRAC=1.0 SOFT_MIX=0.1 POLICY_TEMP=1.0 LR=$(SCRATCH_LR) LR_EMBEDDING=$(SCRATCH_LR_EMBEDDING) \
 		WINDOW_GROWTH=1 WINDOW_START=$(SCRATCH_START) MIN_ROWS=$(SCRATCH_START) WINDOW_ROWS=20000000 \
-		SYZYGY=$(SCRATCH_SYZYGY) /bin/bash scripts/rl_continuous.sh >> logs/scratch/rl_continuous.log 2>&1
+		SYZYGY=$(SCRATCH_SYZYGY) TB_PLAYOUT_FRAC=$(SCRATCH_TB_PLAYOUT) \
+		/bin/bash scripts/rl_continuous.sh >> logs/scratch/rl_continuous.log 2>&1
 
 # The games viewer: the web demo's board over this machine's self-play games and their searches
 # (scripts/games_viewer.py); HOST=0.0.0.0 to open it from the network.

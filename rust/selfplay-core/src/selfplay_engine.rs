@@ -106,6 +106,10 @@ struct Config {
     /// Measure the tree's depth after every search (`SelfPlayRules::depth_stats`).
     #[serde(default)]
     depth_stats: bool,
+    /// The share of games that play on past the tables' first verdict, keeping it as
+    /// their result (`SelfPlayRules::tb_playout_frac`; 0 = none).
+    #[serde(default)]
+    tb_playout_frac: f64,
     /// Syzygy directories, ':'-separated: a game ends at its first position they
     /// settle, with their result (`SelfPlayGame::with_tablebase`). Empty: none.
     #[serde(default)]
@@ -349,6 +353,7 @@ impl SelfPlayEngine {
             rule_state: c.rule_state, forced_playouts: c.forced_playouts, fresh_full: c.fresh_full,
             twofold_history: c.twofold_history, draw_contempt: c.draw_contempt,
             contempt_ramp: c.contempt_ramp, depth_stats: c.depth_stats,
+            tb_playout_frac: c.tb_playout_frac,
         };
         let tables = chess_core::search::load_tablebase(&c.syzygy)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:#}")))?;

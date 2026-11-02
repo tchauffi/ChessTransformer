@@ -27,7 +27,13 @@
 //!   rule draw or the ply cap by a network that may not convert it. The search
 //!   probes them at its leaves as well (not at the root, which is never covered
 //!   once the game would have ended there): positions the tables own are neither
-//!   recorded nor left to a value head that no longer trains on them.
+//!   recorded nor left to a value head that no longer trains on them;
+//! * tablebase play-out (`tb_playout_frac`): that share of games plays on past the
+//!   tables' first verdict instead, so the network keeps training on the endgames
+//!   the tables own (11% of the positions before adjudication). The search still
+//!   probes the tables at its leaves, the games never resign, and their result is
+//!   the tables' first verdict, as when adjudicated: a won endgame the search fails
+//!   to convert by the 50-move rule is still labelled won.
 //!
 //! A record is the position before the move, the search's root value and the
 //! root visit counts -- warm visits from the reused tree included, as Lc0
@@ -89,6 +95,10 @@ pub struct SelfPlayRules {
     /// Measure the tree's depth after every search (`SearchTally`); a walk of the
     /// whole tree per move, so off outside benchmarks.
     pub depth_stats: bool,
+    /// The share of games that play on past the tables' first verdict (module doc).
+    /// They come out of the same draw as `no_resign_frac` and never resign, so at
+    /// equal shares they are the same games; 0 leaves every game as before.
+    pub tb_playout_frac: f64,
 }
 
 /// A game's searches summed, per kind (`SelfPlayGame::tally`): what the self-play
@@ -161,6 +171,10 @@ pub struct SelfPlayGame {
     end: Option<(f32, &'static str)>,
     tally: [SearchTally; 2],
     tb: Option<Arc<Tablebase<Chess>>>,
+    /// Plays on past the tables' first verdict (`SelfPlayRules::tb_playout_frac`).
+    tb_playout: bool,
+    /// That verdict, white's POV, once a play-out game reached it: the game's result.
+    tb_verdict: Option<f32>,
 }
 
 impl SelfPlayGame {
@@ -186,7 +200,10 @@ impl SelfPlayGame {
         };
         let mut search = Search::new(NoEval, params);
         search.seed_rng(rng.gen());
-        let resign_allowed = rng.gen::<f64>() >= rules.no_resign_frac;
+        // One draw for both, so a zero play-out share keeps every game as it was.
+        let u = rng.gen::<f64>();
+        let resign_allowed = u >= rules.no_resign_frac.max(rules.tb_playout_frac);
+        let tb_playout = u < rules.tb_playout_frac;
         let mut g = SelfPlayGame {
             id,
             opening,
@@ -207,6 +224,8 @@ impl SelfPlayGame {
             end: None,
             tally: [SearchTally::default(); 2],
             tb: None,
+            tb_playout,
+            tb_verdict: None,
         };
         g.check_end(rules);
         g
@@ -219,13 +238,32 @@ impl SelfPlayGame {
         self.search.params.syzygy_root = false;
         self.tb = tb;
         if self.end.is_none() {
-            self.end = self.tablebase_end();
+            self.end = self.tablebase_check();
         }
         self
     }
 
     fn tablebase_end(&self) -> Option<(f32, &'static str)> {
         tablebase_result(self.tb.as_deref()?, &self.pos).map(|z| (z, "tablebase"))
+    }
+
+    /// The tables' end of the game here, if they settle the position. A play-out game
+    /// keeps their first verdict as its result instead and plays on.
+    fn tablebase_check(&mut self) -> Option<(f32, &'static str)> {
+        if self.tb_verdict.is_some() {
+            return None;
+        }
+        let end = self.tablebase_end()?;
+        if self.tb_playout {
+            self.tb_verdict = Some(end.0);
+            return None;
+        }
+        Some(end)
+    }
+
+    /// Whether the game plays on past the tables' first verdict.
+    pub fn tb_playout(&self) -> bool {
+        self.tb_playout
     }
 
     /// The game's searches so far, [fast, full].
@@ -410,7 +448,7 @@ impl SelfPlayGame {
                 0.0
             };
             Some((z, "terminal"))
-        } else if let Some(end) = self.tablebase_end() {
+        } else if let Some(end) = self.tablebase_check() {
             Some(end)
         } else if self.resign_allowed && self.resign_streak >= rules.resign_plies {
             Some((self.resign_sign as f32, "resign"))
@@ -419,6 +457,10 @@ impl SelfPlayGame {
         } else {
             None
         };
+        // A played-out game keeps the tables' verdict; the reason says whether play reached it.
+        if let (Some((z, _)), Some(v)) = (self.end, self.tb_verdict) {
+            self.end = Some((v, if z == v { "tablebase_playout" } else { "tablebase_playout_spoiled" }));
+        }
     }
 }
 
@@ -455,7 +497,7 @@ mod tests {
             no_resign_frac: 0.1, max_plies: 40, sim_batch: 16, c_puct: 1.0, fpu: 0.2,
             prior_temp: 1.0, tt_cap: 2_000_000, cap_total_full: false, cap_total_fast: false,
             rule_state: false, forced_playouts: 0.0, fresh_full: false, twofold_history: false,
-            draw_contempt: 0.0, contempt_ramp: 0.3, depth_stats: false,
+            draw_contempt: 0.0, contempt_ramp: 0.3, depth_stats: false, tb_playout_frac: 0.0,
         }
     }
 
@@ -512,6 +554,56 @@ mod tests {
         let untabled = played(start, None);
         assert_ne!(untabled.end().unwrap().1, "tablebase");
         assert!(untabled.moves_uci().len() > 1);
+    }
+
+    #[test]
+    #[ignore = "needs SYZYGY_PATH"]
+    fn playout_games_play_the_tables_out_and_keep_their_verdict() {
+        let start: Chess = FORCED_CAPTURE.parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap();
+        let tb = tables();
+        let r = SelfPlayRules { tb_playout_frac: 1.0, ..rules() };
+        let mut g = SelfPlayGame::new(0, 0, start.clone(), &r, 7).with_tablebase(tb.clone());
+        assert!(g.tb_playout() && !g.resign_allowed());
+        while g.end().is_none() {
+            g.advance(&r);
+            if let Some(reqs) = g.pending() {
+                let outs = reqs.iter().map(hash_out).collect();
+                g.resolve(outs);
+            }
+        }
+        let (z, reason) = g.end().unwrap();
+        assert!(reason.starts_with("tablebase_playout"), "{reason}");
+        // Played on past the verdict, every position recorded, the search still on the tables.
+        assert!(g.moves_uci().len() > 2, "{:?}", g.moves_uci());
+        assert_eq!(g.records().len(), g.moves_uci().len());
+        assert!(g.search.params.syzygy.is_some() && !g.search.params.syzygy_root);
+        // The result is the verdict at the first position the tables settle.
+        let t = tb.as_deref().unwrap();
+        let verdict = tablebase_result(t, &start).unwrap_or_else(|| {
+            let mut p = start.clone();
+            p.play_unchecked(&g.moves[0]);
+            tablebase_result(t, &p).expect("4 men after the forced capture")
+        });
+        assert_eq!(z, verdict);
+    }
+
+    #[test]
+    fn playout_share_comes_from_the_resign_draw() {
+        let off = rules();
+        let on = SelfPlayRules { tb_playout_frac: 0.25, ..rules() };
+        let mut n = 0;
+        for seed in 0..400 {
+            let (a, b) = (SelfPlayGame::new(0, 0, start(), &off, seed), SelfPlayGame::new(0, 0, start(), &on, seed));
+            assert!(!a.tb_playout() && a.tb_verdict.is_none());
+            if b.tb_playout() {
+                n += 1;
+                assert!(!b.resign_allowed());
+            } else {
+                // Its draw is past both shares: it resigns as it did before.
+                assert!(a.resign_allowed() && b.resign_allowed());
+            }
+        }
+        assert!((60..=140).contains(&n), "{n} play-out games of 400 at 0.25");
     }
 
     /// The bot's own flow through go() with the same draws as `SelfPlayGame`

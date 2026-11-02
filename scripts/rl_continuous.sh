@@ -16,6 +16,8 @@
 # With SYZYGY ($RL/syzygy: Syzygy table directories, ':'-separated) a self-play game or an
 # evaluation game ends at its first position the tables settle, with their result, instead of
 # being played on to a rule draw or the ply cap by a network that does not convert it.
+# TB_PLAYOUT_FRAC ($RL/tb_playout_frac, default 0) of the self-play games play on past that
+# position instead, keeping the tables' result, so the network still trains on those endgames.
 #
 # GPUs (one machine, ids as nvidia-smi numbers them, or the MIG instances' UUIDs when the GPUs
 # are partitioned: a process can use one instance). With more than one, the trainer takes
@@ -56,6 +58,7 @@ DRAW_CONTEMPT="${DRAW_CONTEMPT:-$(setting draw_contempt 0.2)}"
 TEMP_CUTOFF="${TEMP_CUTOFF:-$(setting temp_cutoff 0.05)}"
 SIM_BATCH="${SIM_BATCH:-$(setting sim_batch 1)}"
 SYZYGY="${SYZYGY-$(setting syzygy "")}"  # tablebase adjudication, empty = none
+TB_PLAYOUT_FRAC="${TB_PLAYOUT_FRAC:-$(setting tb_playout_frac 0)}"  # games playing the tables out
 PARALLEL="${PARALLEL:-$(setting cont_parallel 256)}"  # per self-play GPU
 THREADS="${THREADS:-$(setting selfplay_threads 6)}"  # per self-play process
 POLICY_TEMP="${POLICY_TEMP:-$(setting policy_temp 1.0)}"
@@ -165,6 +168,7 @@ start_actor() {  # each worker gets one GPU of --gpus (selfplay_rust.py's run_wo
     --dirichlet-alpha 0.3 --dirichlet-eps 0.25 --forced-playouts "$FORCED_PLAYOUTS" \
     --draw-contempt "$DRAW_CONTEMPT" --temp-cutoff "$TEMP_CUTOFF" --sim-batch "$SIM_BATCH" \
     --c-puct "$C_PUCT" --fresh-full --seed 1 ${SYZYGY:+--syzygy "$SYZYGY"} \
+    $([[ -n $SYZYGY && $TB_PLAYOUT_FRAC != 0 ]] && echo --tb-playout-frac "$TB_PLAYOUT_FRAC") \
     ${BOOK:+--book "$BOOK" --book-skip "$BOOK_SKIP" --book-share "$BOOK_SHARE"} $SP_EXTRA \
     >> "$LOGS/rl_continuous_selfplay.log" 2>&1 &
   ACTOR=$!
@@ -253,7 +257,7 @@ fi
 FAILS=0 ACCEPTED=0
 [[ -f $C/eval_state ]] && source "$C/eval_state"
 EVAL_S="$(awk -v h="$EVAL_HOURS" 'BEGIN { printf "%d", h * 3600 }')"
-log "continuous loop: self-play ${SIMS}/${FAST_SIMS} sims, c_puct $C_PUCT, $PARALLEL games in flight per GPU; trainer window $WINDOW_ROWS rows$( ((WINDOW_GROWTH)) && echo ", grown from $WINDOW_START"), training from $MIN_ROWS positions, reuse $REUSE, lr $LR (embeddings $LR_EMBEDDING), soft mix $SOFT_MIX, policy temperature $POLICY_TEMP; evaluations every $EVAL_HOURS h, $EVAL_GAMES games, accept >= $ACCEPT${SYZYGY:+; tablebase adjudication ($SYZYGY)}"
+log "continuous loop: self-play ${SIMS}/${FAST_SIMS} sims, c_puct $C_PUCT, $PARALLEL games in flight per GPU; trainer window $WINDOW_ROWS rows$( ((WINDOW_GROWTH)) && echo ", grown from $WINDOW_START"), training from $MIN_ROWS positions, reuse $REUSE, lr $LR (embeddings $LR_EMBEDDING), soft mix $SOFT_MIX, policy temperature $POLICY_TEMP; evaluations every $EVAL_HOURS h, $EVAL_GAMES games, accept >= $ACCEPT${SYZYGY:+; tablebase adjudication ($SYZYGY), played out in $TB_PLAYOUT_FRAC of self-play games}"
 if (( NONSTOP )); then
   log "GPUs: trainer $TRAIN_GPU; self-play $SELFPLAY_GPUS ($WORKERS worker(s)); evaluations on $EVAL_GPU beside self-play and training"
 else
