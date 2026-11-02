@@ -21,13 +21,27 @@ similar strength -- raise --openings before reading anything into a small gap.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import chess
 import chess.engine
+import chess.syzygy
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from chesstransformer.evaluation.sprt import (  # noqa: E402
+    complete_prefix,
+    format_report,
+    pair_up,
+    sprt_decision,
+    sprt_llr,
+    summarize,
+)
 
 BASE = "data/models/pos2move_v2.1/model.int8.onnx"  # base (non-EMA) int8
 
@@ -105,24 +119,107 @@ OPENINGS = [
 ]
 
 
-def play(white, white_nodes, black, black_nodes, opening: str, max_plies: int) -> str:
+def game_over(board: chess.Board) -> bool:
+    """Automatic endings, plus the draws either side may claim because they have
+    already happened (a third occurrence, the 50-move counter at 100) -- the same
+    rule as engine_match.py. Not ``claim_draw=True``: that also ends the game when
+    the side to move merely *could* claim with its next move, which a winning side
+    never would (see elo_gauntlet.py), so it scored won games as draws."""
+    return board.is_game_over() or board.is_repetition(3) or board.halfmove_clock >= 100
+
+
+def start_board(opening: str) -> chess.Board:
+    """A built-in line is UCI moves from the start position; a --book entry is a FEN."""
+    if "/" in opening:
+        return chess.Board(opening)
     board = chess.Board()
     for uci in opening.split():
         board.push(chess.Move.from_uci(uci))
-    while not board.is_game_over(claim_draw=True) and board.ply() < max_plies:
-        eng, nodes = (white, white_nodes) if board.turn == chess.WHITE else (black, black_nodes)
-        board.push(eng.play(board, chess.engine.Limit(nodes=nodes)).move)
-    return board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "1/2-1/2"
+    return board
+
+
+def tablebase_result(tb: chess.syzygy.Tablebase, board: chess.Board) -> str | None:
+    """The tables' result for a position they cover, under the 50-move rule from its own
+    clock (cursed wins and blessed losses are draws), as chess_core::search::tablebase_result;
+    None when they do not settle it: too many men, castling rights, a missing table, or a
+    win the clock may still spoil (DTZ rounding), and the game plays on."""
+    # Positions the tables cover, as the Rust side: python-chess would also settle a bigger
+    # one whose side to move captures into a won table, a verdict chess_core never gives.
+    if len(board.piece_map()) > max((len(name) - 1 for name in tb.wdl), default=0) or board.castling_rights:
+        return None
+    wdl = tb.get_wdl(board)
+    if wdl is None:
+        return None
+    if abs(wdl) < 2:
+        return "1/2-1/2"
+    if board.halfmove_clock:
+        dtz = tb.get_dtz(board)
+        if dtz is None or board.halfmove_clock + abs(dtz) > 99:
+            return None
+    return "1-0" if (wdl > 0) == (board.turn == chess.WHITE) else "0-1"
+
+
+def play(white, white_limit, black, black_limit, opening: str, max_plies: int,
+         tb: chess.syzygy.Tablebase | None = None):
+    """Returns (result, plies on the move stack, fewest men on the board at any point, how
+    it ended: terminal / tablebase / max_plies, the final FEN, the moves as a dict: the
+    start FEN, every move in UCI from it, and how many of them the opening line played).
+
+    ``max_plies`` counts the move stack, so for the built-in lines it is the game's
+    ply count (as before) and for a FEN start it is the plies played from that FEN.
+    With ``tb`` the game ends at its first position the tables settle, with their result."""
+    board = start_board(opening)
+    book_plies = len(board.move_stack)
+    min_men = len(board.piece_map())
+    tb_result = tablebase_result(tb, board) if tb else None
+    while tb_result is None and not game_over(board) and len(board.move_stack) < max_plies:
+        eng, limit = (white, white_limit) if board.turn == chess.WHITE else (black, black_limit)
+        board.push(eng.play(board, limit).move)
+        min_men = min(min_men, len(board.piece_map()))
+        if tb and not game_over(board):
+            tb_result = tablebase_result(tb, board)
+    if tb_result is not None:
+        result, end = tb_result, "tablebase"
+    elif board.is_game_over():
+        result, end = board.result(), "terminal"
+    else:
+        result, end = "1/2-1/2", "terminal" if game_over(board) else "max_plies"
+    record = {"start_fen": board.root().fen(), "book_plies": book_plies,
+              "moves": [m.uci() for m in board.move_stack]}
+    return result, len(board.move_stack), min_men, end, board.fen(), record
 
 
 def elo(score: float) -> float:
     return -400 * math.log10(1 / score - 1)
 
 
+def report_blunders(args: argparse.Namespace, records: list[dict], la: str, lb: str) -> None:
+    """--blunder-nodes: every move of this run's games scored by a full-strength Stockfish,
+    blunders and mistakes per side (scripts/blunder_report.py); every scored move goes to
+    <games-out>.blunders.json."""
+    from blunder_report import analyse_records, format_summary, header, summarise
+
+    stockfish = args.blunder_stockfish or args.stockfish_b or "/usr/games/stockfish"
+    print("\n" + header(args.blunder_nodes), flush=True)
+    games = analyse_records(records, stockfish, args.blunder_nodes,
+                            args.blunder_workers or args.workers)
+    report = summarise(games)
+    print(format_summary(report, la, lb))
+    if args.games_out:
+        out = args.games_out.with_suffix(".blunders.json")
+        out.write_text(json.dumps({"nodes": args.blunder_nodes, "summary": report,
+                                   "games": games}, indent=1))
+        print(f"  every scored move: {out}")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bot", default="rust/target/release/ct-bot")
+    p.add_argument("--bot-a", default=None,
+                   help="ct-bot binary for side A (default --bot). Point A and B at two builds "
+                        "to gate a search change with the model held fixed.")
+    p.add_argument("--bot-b", default=None, help="ct-bot binary for side B (default --bot)")
     p.add_argument("--model-a", default=BASE, help="ONNX model for side A")
     p.add_argument("--model-b", default=BASE, help="ONNX model for side B")
     p.add_argument("--nodes-a", type=int, default=3600, help="MCTS node budget, side A")
@@ -130,8 +227,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-a", default=None, help="display name for side A")
     p.add_argument("--label-b", default=None, help="display name for side B")
     p.add_argument("--openings", type=int, default=8,
-                   help=f"opening lines to use, from the front of the book (max {len(OPENINGS)}). "
-                        "Each is played twice, colours swapped.")
+                   help=f"opening lines to use, from the front of the book (built-in max "
+                        f"{len(OPENINGS)}). Each is played twice, colours swapped.")
+    p.add_argument("--book", type=Path, default=None,
+                   help="JSON book from scripts/build_opening_book.py; games start from each "
+                        "entry's FEN. Default: the built-in lines above.")
+    p.add_argument("--games-out", type=Path, default=None,
+                   help="append one JSON line per game (start, colours, result, plies, "
+                        "fewest men reached, how it ended, final FEN, every move)")
+    p.add_argument("--blunder-nodes", type=int, default=0,
+                   help="after the match, score every move of its games with a full-strength "
+                        "Stockfish at this many nodes a position and report blunders and "
+                        "mistakes per side (scripts/blunder_report.py; 200000 is ~0.2 s a "
+                        "position). 0 = off")
+    p.add_argument("--blunder-stockfish", default=None,
+                   help="Stockfish for --blunder-nodes (default --stockfish-b, else "
+                        "/usr/games/stockfish); it plays at full strength")
+    p.add_argument("--blunder-workers", type=int, default=None,
+                   help="Stockfish processes for --blunder-nodes, one thread each (default --workers)")
+    p.add_argument("--sprt", action="store_true",
+                   help="stop as soon as the paired SPRT decides H0 vs H1; games already in "
+                        "flight finish, half-played pairs are dropped from the score")
+    p.add_argument("--elo0", type=float, default=0.0, help="SPRT null hypothesis")
+    p.add_argument("--elo1", type=float, default=15.0,
+                   help="SPRT alternative: the smallest gain worth promoting")
+    p.add_argument("--alpha", type=float, default=0.05)
+    p.add_argument("--beta", type=float, default=0.05)
+    p.add_argument("--min-pairs", type=int, default=20,
+                   help="never stop before this many completed pairs")
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--workers", type=int, default=1,
                    help="game-pairs to play concurrently, each with its own engine pair. "
@@ -155,15 +278,35 @@ def parse_args() -> argparse.Namespace:
                        help=f"first-play-urgency penalty for side {side.upper()} (default 0.2)")
         p.add_argument(f"--prior-temp-{side}", type=float, default=None,
                        help=f"policy-prior softmax temperature for side {side.upper()} (default 1.0)")
+        p.add_argument(f"--syzygy-{side}", default=None,
+                       help=f"Syzygy tablebase dir(s) for side {side.upper()}, ':'-separated "
+                            "(default: none)")
+    p.add_argument("--adjudicate-syzygy", default=None,
+                   help="Syzygy table dir(s), ':'-separated: a game ends at its first position "
+                        "the tables settle, with their result, for both sides alike (cutechess-cli "
+                        "-tb), instead of running to a rule draw or --max-plies when the winning "
+                        "side does not convert. --syzygy-a/-b give an engine the tables to search with.")
     p.add_argument("--sim-batch", type=int, default=None,
                    help="leaves per NN wave (ct-bot default 16). Larger batches feed the GPU "
                         "better but change search behaviour -- more collisions per wave -- so "
                         "leave unset when the match is meant to mirror production search.")
+    p.add_argument("--stockfish-b", default=None,
+                   help="side B is this Stockfish binary instead of ct-bot, limited to --sf-elo "
+                        "(UCI_LimitStrength, which Stockfish calibrates to the CCRL Blitz list, "
+                        "1320..3190): an outside anchor for a network's rating")
+    p.add_argument("--sf-elo", type=int, default=1500, help="UCI_Elo of the Stockfish side")
+    p.add_argument("--sf-time", type=float, default=0.5,
+                   help="Stockfish seconds per move. Time-limited, unlike ct-bot, so keep "
+                        "--workers below the core count or contention weakens it.")
     args = p.parse_args()
-    if not 1 <= args.openings <= len(OPENINGS):
-        p.error(f"--openings must be in 1..{len(OPENINGS)}")
+    if args.book is not None:
+        args.lines = [o["fen"] for o in json.loads(args.book.read_text())["openings"]]
+    else:
+        args.lines = OPENINGS
+    if not 1 <= args.openings <= len(args.lines):
+        p.error(f"--openings must be in 1..{len(args.lines)}")
     args.label_a = args.label_a or f"A@{args.nodes_a}"
-    args.label_b = args.label_b or f"B@{args.nodes_b}"
+    args.label_b = args.label_b or (f"SF{args.sf_elo}" if args.stockfish_b else f"B@{args.nodes_b}")
     return args
 
 
@@ -174,57 +317,120 @@ def main() -> None:
     if args.sim_batch is not None:
         common += ["--sim-batch", str(args.sim_batch)]
 
-    def search_flags(cpuct, fpu, prior_temp):
+    def search_flags(cpuct, fpu, prior_temp, syzygy):
         """Per-side PUCT knobs, so a tuned config can be matched against an untuned one."""
         out = []
-        for flag, val in (("--c-puct", cpuct), ("--fpu", fpu), ("--prior-temp", prior_temp)):
+        for flag, val in (("--c-puct", cpuct), ("--fpu", fpu), ("--prior-temp", prior_temp),
+                          ("--syzygy-path", syzygy)):
             if val is not None:
                 out += [flag, str(val)]
         return out
 
-    A = (la, [args.bot, "uci", "--model", args.model_a, *common,
-              *search_flags(args.cpuct_a, args.fpu_a, args.prior_temp_a)], args.nodes_a)
-    B = (lb, [args.bot, "uci", "--model", args.model_b, *common,
-              *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b)], args.nodes_b)
-    book = OPENINGS[: args.openings]
+    # (label, command, per-move limit, UCI options set after the handshake)
+    A = (la, [args.bot_a or args.bot, "uci", "--model", args.model_a, *common,
+              *search_flags(args.cpuct_a, args.fpu_a, args.prior_temp_a, args.syzygy_a)],
+         chess.engine.Limit(nodes=args.nodes_a), {})
+    if args.stockfish_b:
+        B = (lb, [args.stockfish_b], chess.engine.Limit(time=args.sf_time),
+             {"UCI_LimitStrength": True, "UCI_Elo": args.sf_elo, "Threads": 1, "Hash": 16})
+    else:
+        B = (lb, [args.bot_b or args.bot, "uci", "--model", args.model_b, *common,
+                  *search_flags(args.cpuct_b, args.fpu_b, args.prior_temp_b, args.syzygy_b)],
+             chess.engine.Limit(nodes=args.nodes_b), {})
+    book = args.lines[: args.openings]
 
-    jobs = [(op, a_white) for op in book for a_white in (True, False)]
+    jobs = [(i, op, a_white) for i, op in enumerate(book) for a_white in (True, False)]
     workers = max(1, min(args.workers, len(jobs)))
 
-    print(f"{la}: {args.model_a} @ {args.nodes_a} nodes")
-    print(f"{lb}: {args.model_b} @ {args.nodes_b} nodes")
-    print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)\n", flush=True)
+    print(f"{la}: {args.bot_a or args.bot} {args.model_a} @ {args.nodes_a} nodes")
+    if args.stockfish_b:
+        print(f"{lb}: {args.stockfish_b} at UCI_Elo {args.sf_elo}, {args.sf_time} s a move")
+    else:
+        print(f"{lb}: {args.bot_b or args.bot} {args.model_b} @ {args.nodes_b} nodes")
+    print(f"{len(book)} openings x 2 colours = {len(jobs)} games, {workers} worker(s)"
+          f"{f', tablebase adjudication ({args.adjudicate_syzygy})' if args.adjudicate_syzygy else ''}\n",
+          flush=True)
 
     lock = threading.Lock()
+    stop = threading.Event()
+    decided = {}  # SPRT state at the moment it stopped the match
     done = [0]
+    results: dict[tuple[int, bool], float] = {}
+    records: list[dict] = []  # every game of this run, for --blunder-nodes
+    games_out = args.games_out.open("a") if args.games_out else None
 
     def run_shard(shard):
         """Play a slice of the job list with a private pair of engine processes."""
         ea = chess.engine.SimpleEngine.popen_uci(A[1])
         eb = chess.engine.SimpleEngine.popen_uci(B[1])
+        eb.configure(B[3])
+        tb = None  # one handle per worker thread
+        if args.adjudicate_syzygy:
+            tb = chess.syzygy.Tablebase()
+            for d in args.adjudicate_syzygy.split(":"):
+                tb.add_directory(d)
         out = []
         try:
-            for op, a_white in shard:
+            for idx, op, a_white in shard:
+                if stop.is_set():
+                    break
                 if a_white:
-                    white, wn, black, bn = ea, A[2], eb, B[2]
+                    white, wl, black, bl = ea, A[2], eb, B[2]
                 else:
-                    white, wn, black, bn = eb, B[2], ea, A[2]
-                r = play(white, wn, black, bn, op, args.max_plies)
+                    white, wl, black, bl = eb, B[2], ea, A[2]
+                r, plies, min_men, end, fen, moves = play(white, wl, black, bl, op,
+                                                          args.max_plies, tb)
                 s = 0.5 if r == "1/2-1/2" else (1.0 if (r == "1-0") == a_white else 0.0)
                 tag = "=" if s == 0.5 else ("+" if s == 1.0 else "-")
                 out.append(s)
                 with lock:
+                    results[(idx, a_white)] = s
                     done[0] += 1
                     print(f"[{done[0]:3}/{len(jobs)}] {la if a_white else lb:10}=W  "
                           f"{op[:11]:11} -> {r:7} ({la} {tag})", flush=True)
+                    rec = {"idx": idx, "start": op, "a_white": a_white, "result": r,
+                           "score_a": s, "plies": plies, "min_men": min_men, "end": end,
+                           "fen": fen, **moves}
+                    records.append(rec)
+                    if games_out:
+                        games_out.write(json.dumps(rec) + "\n")
+                        games_out.flush()
+                    if args.sprt and not stop.is_set():
+                        pairs = pair_up(complete_prefix(results))
+                        llr = sprt_llr(pairs, args.elo0, args.elo1)
+                        verdict = sprt_decision(llr, args.alpha, args.beta,
+                                                min_pairs_met=len(pairs) >= args.min_pairs)
+                        if verdict:
+                            print(f"  SPRT decided {verdict} after {len(pairs)} pairs "
+                                  f"(LLR {llr:+.2f}); finishing games in flight", flush=True)
+                            decided.update(llr=llr, pairs=len(pairs))
+                            stop.set()
         finally:
             ea.quit()
             eb.quit()
+            if tb:
+                tb.close()
         return out
 
     shards = [jobs[i::workers] for i in range(workers)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         scores = [s for shard in pool.map(run_shard, shards) for s in shard]
+    if games_out:
+        games_out.close()
+
+    # Pair-scored (pentanomial) report: each opening's two games form one sample,
+    # so the opening's own bias cancels instead of widening the interval.
+    pairs = pair_up(results)
+    # A sequential test reports the decision it stopped on. Games still in flight at that
+    # moment are kept in the Elo estimate but must not re-open the verdict.
+    llr = None
+    if args.sprt:
+        llr = decided.get("llr", sprt_llr(pairs, args.elo0, args.elo1))
+    print("\n" + format_report(summarize(pairs, scores), la, lb, llr, args.elo0, args.elo1,
+                               args.alpha, args.beta))
+    if decided:
+        print(f"  (SPRT verdict taken at {decided['pairs']} pairs; the estimate above also "
+              f"counts the {len(pairs) - decided['pairs']} pair(s) that finished after it)")
 
     n = len(scores)
     wa = sum(1 for s in scores if s == 1.0)
@@ -234,6 +440,8 @@ def main() -> None:
     print(f"\n{la} vs {lb}: {wa}W {d}D {wb}L / {n}  |  {la} score {score:.3f}")
     if not 0.0 < score < 1.0:
         print(f"{la} - {lb} = decisive")
+        if args.blunder_nodes > 0:
+            report_blunders(args, records, la, lb)
         return
 
     # 95% CI from the per-game score variance (draws count as 0.5, so this is the
@@ -245,6 +453,8 @@ def main() -> None:
           f"(95% CI {elo(lo):+.0f} .. {elo(hi):+.0f}, +/-{1.96 * se * 100:.1f}pp on score)")
     if lo < 0.5 < hi:
         print(f"NOT SIGNIFICANT: the interval spans 0 Elo. {n} games cannot separate these two.")
+    if args.blunder_nodes > 0:
+        report_blunders(args, records, la, lb)
 
 
 if __name__ == "__main__":

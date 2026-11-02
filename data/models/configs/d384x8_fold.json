@@ -1,0 +1,17 @@
+{
+  "vocab_size": 13,
+  "embed_dim": 384,
+  "nb_transformer_layers": 8,
+  "num_heads": 12,
+  "dropout": 0.05,
+  "kvq_bias": false,
+  "layer_drop": 0.1,
+  "value_head_type": "wdl",
+  "value_pool": "attn",
+  "state_relation": false,
+  "value_elo_offset": true,
+  "head_tower_layers": 1,
+  "attn_bias": "full",
+  "smolgen": true,
+  "state_tokens": "fold"
+}

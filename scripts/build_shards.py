@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 import chess
+import chess.syzygy
 import h5py
 import numpy as np
 from tqdm import tqdm
@@ -65,6 +66,8 @@ from chesstransformer.models.tokenizer.position_tokenizer import PostionTokenize
 _TOKEN_TO_MOVE: list = []
 _POS_TOKENIZER: PostionTokenizer = None
 _CFG: dict = {}
+_TB: chess.syzygy.Tablebase | None = None
+_TB_MEN = 0  # most men the loaded tables cover
 
 
 def _worker_init(cfg: dict):
@@ -74,7 +77,7 @@ def _worker_init(cfg: dict):
     hot path with a list index. It is exactly equivalent — the same two calls, hoisted out
     of the loop — and the UCI parse is a meaningful share of a 2,000-ply-per-second budget.
     """
-    global _TOKEN_TO_MOVE, _POS_TOKENIZER, _CFG
+    global _TOKEN_TO_MOVE, _POS_TOKENIZER, _CFG, _TB, _TB_MEN
     mt = MoveTokenizer()
     _TOKEN_TO_MOVE = [None] * mt.vocab_size
     for uci, tok in mt.vocab.items():
@@ -84,6 +87,36 @@ def _worker_init(cfg: dict):
             _TOKEN_TO_MOVE[tok] = None
     _POS_TOKENIZER = PostionTokenizer()
     _CFG = cfg
+    if cfg.get("syzygy"):
+        # Opened per process: the handles are file descriptors plus an LRU of mmaps.
+        _TB = chess.syzygy.open_tablebase(cfg["syzygy"])
+        _TB_MEN = max(len(name) - 1 for name in _TB.wdl)  # "KRPvKR" -> 5
+
+
+def _tb_result(board: chess.Board):
+    """Result under perfect play and the 50-move rule, coded like the HDF5's ``result``
+    (0 draw, 1 white win, 2 black win). ``None`` when the tables cannot answer.
+
+    A win counts only if it can be converted before the 50-move counter runs out, so
+    cursed wins and blessed losses are draws. At halfmove 0 -- every first <=5-man
+    position, since only a capture removes a man -- WDL alone says that; later in a
+    sequence it takes DTZ plus the clock.
+    """
+    if board.castling_rights:
+        return None
+    try:
+        wdl = _TB.probe_wdl(board)  # side-to-move POV; a checkmated side reads -2
+        if abs(wdl) <= 1:
+            stm = 0
+        elif board.halfmove_clock == 0:
+            stm = 1 if wdl > 0 else -1
+        else:
+            dtz = _TB.probe_dtz(board)
+            stm = (1 if wdl > 0 else -1) if abs(dtz) + board.halfmove_clock <= 100 else 0
+    except KeyError:  # MissingTableError
+        return None
+    white = stm if board.turn == chess.WHITE else -stm
+    return 1 if white > 0 else (2 if white < 0 else 0)
 
 
 def sample_plies(num_moves: int, k: int, rng: np.random.Generator, cfg: dict) -> np.ndarray:
@@ -198,13 +231,15 @@ def build_shard(task: dict) -> dict:
         moves_ds = f["moves"]
         num_moves = f["num_moves"][g0:g1].astype(np.int64)
         results = f["result"][g0:g1].astype(np.int8)
+        white_elo = f["white_elo"][g0:g1].astype(np.int64)
+        black_elo = f["black_elo"][g0:g1].astype(np.int64)
 
         # ELO filter, applied to games exactly as HDF5ChessDataset.__init__ does. It has to
         # happen here rather than in the loader: the shard freezes the game population the
         # same way it freezes the ply sampling.
         min_elo, max_elo = _CFG["min_elo"], _CFG["max_elo"]
         if min_elo is not None or max_elo is not None:
-            avg_elo = (f["white_elo"][g0:g1].astype(np.float64) + f["black_elo"][g0:g1]) / 2
+            avg_elo = (white_elo + black_elo).astype(np.float64) / 2
             keep = np.ones(g1 - g0, dtype=bool)
             if min_elo is not None:
                 keep &= avg_elo >= min_elo
@@ -219,6 +254,7 @@ def build_shard(task: dict) -> dict:
         n_bad_push = 0
         n_skipped_games = 0
         n_filtered_games = 0
+        n_tb_games = n_tb_disagree = n_relabelled = n_exact = 0
 
         for local_g in range(g1 - g0):
             nm = int(num_moves[local_g])
@@ -238,9 +274,25 @@ def build_shard(task: dict) -> dict:
                 continue
 
             result = results[local_g]
+            gap = int(white_elo[local_g]) - int(black_elo[local_g])
             board = chess.Board()
             next_wanted = 0
-            for ply in range(int(plies[-1]) + 1):
+            last_sampled = int(plies[-1])
+            # Without tables the replay stops at the last sampled ply, as it always has.
+            # With them it runs on, because the first <=5-man position -- whose verdict
+            # relabels every earlier sample -- usually comes after it.
+            end = len(game_moves) if _TB is not None else last_sampled + 1
+            game_rows = []  # (row, ply) of samples that take the game's TB verdict
+            tb_verdict = tb_ply = None
+            for ply in range(end + 1):
+                if (_TB is not None and tb_verdict is None
+                        and chess.popcount(board.occupied) <= _TB_MEN):
+                    tb_verdict = _tb_result(board)
+                    if tb_verdict is not None:
+                        tb_ply = ply
+                if ply == end:
+                    break  # the position after the last move only feeds the verdict
+
                 while next_wanted < len(plies) and plies[next_wanted] == ply:
                     target = _TOKEN_TO_MOVE[int(game_moves[ply])]
                     if target is not None and board.is_legal(target):
@@ -249,6 +301,16 @@ def build_shard(task: dict) -> dict:
                             n_overflow += 1
                         rec["result"] = result
                         rec["move_number"] = ply
+                        rec["elo_gap"] = gap if board.turn else -gap
+                        rec["result_tb"] = result
+                        own = (_tb_result(board) if _TB is not None
+                               and chess.popcount(board.occupied) <= _TB_MEN else None)
+                        if own is not None:
+                            rec["result_tb"] = own
+                            rec["value_exact"] = 1
+                            n_exact += 1
+                        else:
+                            game_rows.append((n_written, ply))
                         n_written += 1
                     next_wanted += 1
 
@@ -256,9 +318,21 @@ def build_shard(task: dict) -> dict:
                 if mv is None or not board.is_legal(mv):
                     # HDF5ChessDataset swallows an unpushable move and carries on; the
                     # rest of the replay is then meaningless, so drop the game instead.
-                    n_bad_push += 1
+                    # Past the last sampled ply it only ends the tablebase search.
+                    if ply <= last_sampled:
+                        n_bad_push += 1
                     break
                 board.push(mv)
+
+            if tb_verdict is not None:
+                n_tb_games += 1
+                n_tb_disagree += int(tb_verdict != result)
+                for row, ply in game_rows:
+                    # Only samples before the verdict's position take it: a later one
+                    # that could not be probed may come from a different line.
+                    if ply < tb_ply and tb_verdict != result:
+                        records[row]["result_tb"] = tb_verdict
+                        n_relabelled += 1
 
         records = records[:n_written]
         np.save(out_path, records)
@@ -273,6 +347,10 @@ def build_shard(task: dict) -> dict:
         "num_bad_push": int(n_bad_push),
         "num_skipped_games": int(n_skipped_games),
         "num_filtered_games": int(n_filtered_games),
+        "num_tb_games": int(n_tb_games),
+        "num_tb_disagree": int(n_tb_disagree),
+        "num_tb_relabelled": int(n_relabelled),
+        "num_tb_exact": int(n_exact),
     }
 
 
@@ -313,6 +391,11 @@ def main():
     ap.add_argument("--sample-mode", choices=["unique", "iid"], default="unique",
                     help="'unique' draws K distinct plies per game; 'iid' reproduces the "
                          "online sampler's marginal exactly but writes duplicate rows")
+    ap.add_argument("--syzygy", default=None,
+                    help="Syzygy tables dir. Fills result_tb: a game that reaches a position "
+                         "the tables cover is relabelled with their verdict there, and samples "
+                         "the tables cover get their own exact result (value_exact). Without "
+                         "it result_tb is a copy of result.")
     ap.add_argument("--limit-games", type=int, default=0, help="smoke-test on the first N games")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
@@ -351,6 +434,7 @@ def main():
         "sample_mode": args.sample_mode,
         "min_elo": args.min_elo,
         "max_elo": args.max_elo,
+        "syzygy": str(Path(args.syzygy).resolve()) if args.syzygy else None,
     }
 
     est_samples = min(args.positions_per_game * n_games, int((num_moves_all - 1).clip(min=0).sum()))
@@ -361,6 +445,7 @@ def main():
     print(f"output        : {out_dir}")
     print(f"K             : {args.positions_per_game} positions/game  ({args.sample_mode})")
     print(f"elo filter    : {args.min_elo or 'none'} - {args.max_elo or 'none'}")
+    print(f"tablebases    : {args.syzygy or 'none (result_tb = result)'}")
     print(f"shards        : {len(tasks)}  (train {len(train_shards)} / val {val_shards} / test {test_shards})")
     print(f"record        : {RECORD_BYTES} B  (legal cap C={LEGAL_CAP})")
     print(f"estimated     : <= {est_samples:,} samples, {est_samples * RECORD_BYTES / 1e9:.2f} GB")
@@ -381,6 +466,8 @@ def main():
     bad_push = sum(m["num_bad_push"] for m in shard_meta)
     skipped = sum(m["num_skipped_games"] for m in shard_meta)
     filtered = sum(m["num_filtered_games"] for m in shard_meta)
+    tb = {key: sum(m[key] for m in shard_meta)
+          for key in ("num_tb_games", "num_tb_disagree", "num_tb_relabelled", "num_tb_exact")}
 
     try:
         git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -401,7 +488,9 @@ def main():
         "skip_opening_plies": args.skip_opening_plies,
         "min_elo": args.min_elo,
         "max_elo": args.max_elo,
+        "syzygy": cfg["syzygy"],
         "num_samples": int(total),
+        **{key: int(v) for key, v in tb.items()},
         "splits": {"train": train_shards, "val": val_shards, "test": test_shards},
         "shards": shard_meta,
         "git_sha": git_sha,
@@ -421,6 +510,12 @@ def main():
     print(f"legal cap hits: {overflow:,}  ({100 * overflow / max(total, 1):.4f} % — raise C if > 0.01 %)")
     print(f"games dropped : {skipped:,} too short, {bad_push:,} unreplayable, "
           f"{filtered:,} outside ELO range")
+    if args.syzygy:
+        print(f"tablebases    : {tb['num_tb_games']:,} games reach the tables, "
+              f"{tb['num_tb_disagree']:,} with a result they contradict; "
+              f"{tb['num_tb_relabelled']:,} samples relabelled "
+              f"({100 * tb['num_tb_relabelled'] / max(total, 1):.2f} %), "
+              f"{tb['num_tb_exact']:,} exact ({100 * tb['num_tb_exact'] / max(total, 1):.2f} %)")
     print(f"build time    : {elapsed / 60:.1f} min on {args.workers} workers "
           f"({total / max(elapsed, 1e-9):,.0f} samples/s)")
     print(f"meta          : {out_dir / 'meta.json'}")

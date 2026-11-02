@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 shakmaty = { workspace = true }
+shakmaty-syzygy = "0.25.3"
+rand = { workspace = true }
+anyhow = "1"

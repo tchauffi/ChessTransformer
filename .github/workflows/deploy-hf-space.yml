@@ -1,10 +1,13 @@
 name: Deploy HF Space
 
-# Pushes the assembled Gradio Space (hf_space/) to a Hugging Face Space using an
+# Pushes the assembled Docker Space (hf_space/: Rust engine + static Next.js
+# frontend, built by HF from the Dockerfile) to a Hugging Face Space using an
 # OIDC "trusted publisher" — no HF_TOKEN secret stored in GitHub.
 #
 # One-time setup (see hf_space/DEPLOY.md):
-#   1. Create the Space on HF: spaces/<you>/chesstransformer (SDK: Gradio, CPU).
+#   1. Create the Space on HF: spaces/<you>/chesstransformer (SDK: Docker, CPU).
+#      An existing Gradio Space switches over on its own: the uploaded
+#      README.md declares `sdk: docker`.
 #   2. On that Space → Settings → Trusted Publishers, add provider GitHub Actions:
 #        repository = tchauffi/ChessTransformer
 #        ref        = refs/heads/main
@@ -18,8 +21,9 @@ on:
     branches: [main]
     paths:
       - "hf_space/**"
-      - "src/chesstransformer/**"
-      - "data/models/pos2move_v2.1/**"
+      - "frontend/**"
+      - "rust/**"
+      - "data/models/pos2move_v2.1/model.int8.onnx"
       - ".github/workflows/deploy-hf-space.yml"
   workflow_dispatch:
 
@@ -83,8 +87,11 @@ jobs:
             echo "$DELIM"
           } >> "$GITHUB_ENV"
 
+      # --delete "*" removes Space files the bundle no longer has (e.g. the old
+      # Gradio app), so the Space mirrors space_build/ exactly.
       - name: Upload to the Space
         run: |
           hf upload "$HF_SPACE_REPO" hf_space/space_build . \
             --repo-type space \
+            --delete "*" \
             --commit-message "Deploy from ${GITHUB_SHA::7}"

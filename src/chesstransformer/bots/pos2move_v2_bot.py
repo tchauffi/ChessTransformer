@@ -87,6 +87,9 @@ class Pos2MoveV2Bot:
 
         model.eval()
         self.model = model.bfloat16().to(device)
+        # Bound to the uncompiled module: torch.compile proxies attribute lookups,
+        # but keeping a direct handle means the reduction never depends on that.
+        self._value_scalar = model.value_scalar
 
         self._buf_board = torch.zeros(1, 64, dtype=torch.long, device=device)
         self._buf_player = torch.zeros(1, dtype=torch.long, device=device)
@@ -221,6 +224,7 @@ class Pos2MoveV2Bot:
         move_logits, value_t = self.model(
             self._buf_board, self._buf_player, self._buf_castling, self._buf_ep
         )
+        value_t = self._value_scalar(value_t)
 
         logits = move_logits[0].float().cpu().numpy()
         value = float(value_t.item())
@@ -273,6 +277,7 @@ class Pos2MoveV2Bot:
             ep_arr[i] = ep
 
         move_logits, value_t = self.model(board_arr, player_arr, castling_arr, ep_arr)
+        value_t = self._value_scalar(value_t)
         # Slice off padding before the host copy.
         logits_np = move_logits[:n].float().cpu().numpy()
         values_np = value_t[:n].float().cpu().numpy()

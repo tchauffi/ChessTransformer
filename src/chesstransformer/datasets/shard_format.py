@@ -56,7 +56,16 @@ PAD_ACTION = NUM_SQUARES * NUM_ACTION_PLANES
 #: 198         i1      result            0 = draw, 1 = white win, 2 = black win (as in the HDF5)
 #: 199         u1      (pad)             keeps move_number 2-byte aligned
 #: 200-201     u2      move_number       ply index, max observed 601
+#: 202-203     i2      elo_gap           side to move's rating minus the opponent's (v2)
+#: 204         i1      result_tb         ``result`` adjudicated by Syzygy, same coding (v2)
+#: 205         u1      value_exact       1 = result_tb is this position's own TB result (v2)
 #: ==========  ======  =========================================================
+#:
+#: The three v2 fields are value-target corrections; see ``scripts/build_shards.py``.
+#: ``result_tb`` equals ``result`` unless the game reached a <=5-man position, in which
+#: case it is the tablebase verdict at the first such position (for samples before it)
+#: or the sample's own tablebase result (``value_exact``). Without ``--syzygy`` at build
+#: time it is a copy of ``result``.
 RECORD_DTYPE = np.dtype(
     {
         "names": [
@@ -70,6 +79,9 @@ RECORD_DTYPE = np.dtype(
             "is_white",
             "result",
             "move_number",
+            "elo_gap",
+            "result_tb",
+            "value_exact",
         ],
         "formats": [
             (np.uint8, NUM_SQUARES),
@@ -82,17 +94,22 @@ RECORD_DTYPE = np.dtype(
             np.uint8,
             np.int8,
             np.uint16,
+            np.int16,
+            np.int8,
+            np.uint8,
         ],
-        "offsets": [0, 64, 192, 193, 194, 195, 196, 197, 198, 200],
-        "itemsize": 202,
+        "offsets": [0, 64, 192, 193, 194, 195, 196, 197, 198, 200, 202, 204, 205],
+        "itemsize": 206,
     }
 )
 
 RECORD_BYTES = RECORD_DTYPE.itemsize
 
-#: Bumped whenever the layout above changes in a way that makes old shards unreadable.
-#: ``FlatShardDataset`` refuses to load a directory built by a different version.
-FORMAT_VERSION = 1
+#: Bumped whenever the layout above changes. v2 appended the three value-target fields;
+#: the fields v1 has sit at the same offsets, and readers rebuild the dtype from
+#: ``meta.json``, so v1 directories stay readable -- they just lack the v2 fields.
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
 
 
 def dtype_to_meta() -> dict:

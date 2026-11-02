@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 chess-core = { path = "../chess-core" }
 shakmaty = { workspace = true }
+shakmaty-syzygy = "0.25.3"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,7 +20,7 @@ futures-util = "0.3"
 env_logger = "0.11"
 log = "0.4"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 [features]
 cuda = ["ort/cuda", "ort/load-dynamic"]

@@ -109,19 +109,61 @@ pub fn zobrist(pos: &Chess) -> u64 {
     h.0
 }
 
+/// The draw-rule state a network with rule-state inputs reads: the halfmove clock
+/// capped at 100, and how often `key` (the position's zobrist) already occurs in
+/// `prior_keys` -- the game history and search path *before* this position -- capped
+/// at 2. Mirrors the Python side (`scripts/backfill_rule_state.py`).
+pub fn rule_state(pos: &Chess, prior_keys: &[u64], key: u64) -> (u8, u8) {
+    let rule50 = pos.halfmoves().min(100) as u8;
+    let repetition = prior_keys.iter().filter(|&&k| k == key).count().min(2) as u8;
+    (rule50, repetition)
+}
+
+/// Cache key of an evaluation by a network that reads the rule state: the same board
+/// under another halfmove clock or repetition count is a different network input.
+pub fn rule_key(key: u64, rule50: u8, repetition: u8) -> u64 {
+    key ^ (u64::from(rule50) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (u64::from(repetition) + 1).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+}
+
 /// Terminal value from the side-to-move POV, or None. `keys` is the sequence
 /// of zobrist keys of all positions seen (game history + search path),
 /// including the current position — mirrors python-chess is_repetition(3)
 /// seeing the search pushes on the shared board.
 pub fn terminal_value(pos: &Chess, keys: &[u64], current: u64) -> Option<f32> {
+    terminal(pos, keys, current).map(|(t, _)| t)
+}
+
+/// `terminal_value`, and whether it is a rule draw: repetition or the 50-move rule,
+/// which a side avoids by playing on, unlike stalemate or insufficient material.
+fn terminal(pos: &Chess, keys: &[u64], current: u64) -> Option<(f32, bool)> {
     if pos.legal_moves().is_empty() {
-        return Some(if pos.is_check() { -1.0 } else { 0.0 });
+        return Some((if pos.is_check() { -1.0 } else { 0.0 }, false));
     }
-    if pos.is_insufficient_material() || pos.halfmoves() >= 100 {
-        return Some(0.0);
+    if pos.is_insufficient_material() {
+        return Some((0.0, false));
     }
-    if keys.iter().filter(|&&k| k == current).count() >= 3 {
-        return Some(0.0);
+    if pos.halfmoves() >= 100 || keys.iter().filter(|&&k| k == current).count() >= 3 {
+        return Some((0.0, true));
+    }
+    None
+}
+
+/// `terminal` for a position inside a search tree (Lc0's two-fold rule).
+/// A position that repeats one already on the search path — root included,
+/// i.e. `keys[root_idx..]` — is a draw at its second occurrence: whoever could
+/// have deviated chose to repeat, and can keep repeating. Without this the
+/// search sees perpetuals and repetition draws only once the cycle comes
+/// round a third time, 4+ plies deeper than it needs to. Repetitions that
+/// reach back into the pre-root game history still need the full threefold,
+/// unless the caller passes `root_idx` 0 (`SearchParams::twofold_history`).
+pub fn search_terminal(pos: &Chess, keys: &[u64], current: u64, root_idx: usize) -> Option<(f32, bool)> {
+    if let Some(t) = terminal(pos, keys, current) {
+        return Some(t);
+    }
+    let prior = &keys[..keys.len().saturating_sub(1)];
+    if prior.len() > root_idx && prior[root_idx..].contains(&current) {
+        return Some((0.0, true));
     }
     None
 }
